@@ -130,15 +130,17 @@ gate_scale: 1.0
 gate_height: 2.5 
 gate_width: 2.5 
 
-# ---- STUDENT EDIT: reward hyperparameters --------------------------------
-# Add one line per reward scale you define in drone_race.py __init__.
-# They are read via cfg.task.get("key", default). Rename / extend as needed.
-#
-reward_example: 0.5          # <-- EDIT or replace with your own reward scales
-# reward_progress_scale: 1.0
-# reward_gate_passage: 10.0
-# reward_crash_scale: 5.0
-# --------------------------------------------------------------------------
+# ---- Reward hyperparameters (MonoRace/Swift/SPIRAL-inspired, 2025 SotA) ----
+reward_progress_scale: 1.5        # dense: distance-to-gate improvement per step
+reward_velocity_scale: 1.0        # velocity component toward gate (drives high-speed flight)
+reward_gate_passage: 10.0         # sparse bonus per gate passed (SPIRAL: Gt component)
+reward_lap_completion: 50.0       # bonus for completing full lap
+reward_angular_penalty: 0.1       # penalize squared angular rates (Agile Flight 2025)
+reward_action_smooth_scale: 0.1   # penalize large action changes (Swift: lambda_5)
+reward_crash_scale: 10.0          # terminal crash penalty (MonoRace: lambda_crash=10)
+crash_dist_threshold: 10.0        # max distance from gate before out-of-bounds reset
+crash_z_min: 0.15                 # minimum altitude (ground crash)
+# ---------------------------------------------------------------------------
 
 debug_gate_origins: false
 debug_axis_length: 0.5

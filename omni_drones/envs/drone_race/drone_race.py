@@ -21,7 +21,6 @@
 # SOFTWARE.
 
 
-import imp
 import torch
 import torch.distributions as D
 from tensordict.tensordict import TensorDict, TensorDictBase
@@ -96,7 +95,15 @@ class DroneRaceEnv(IsaacEnv):
         # -----------------------------------------------------------------------
         # ----- ADD YOUR REWARD CONFIG LINES BELOW (replace / extend the example) -----
 
-        self.reward_example = cfg.task.get("reward_example", 0.5)
+        self.reward_progress_scale      = cfg.task.get("reward_progress_scale", 1.5)
+        self.reward_velocity_scale      = cfg.task.get("reward_velocity_scale", 1.0)
+        self.reward_gate_passage        = cfg.task.get("reward_gate_passage", 10.0)
+        self.reward_lap_completion      = cfg.task.get("reward_lap_completion", 50.0)
+        self.reward_angular_penalty     = cfg.task.get("reward_angular_penalty", 0.1)
+        self.reward_action_smooth_scale = cfg.task.get("reward_action_smooth_scale", 0.1)
+        self.reward_crash_scale         = cfg.task.get("reward_crash_scale", 10.0)
+        self.crash_dist_threshold       = cfg.task.get("crash_dist_threshold", 10.0)
+        self.crash_z_min                = cfg.task.get("crash_z_min", 0.15)
 
         # ----- END STUDENT CODE -----
 
@@ -375,7 +382,7 @@ class DroneRaceEnv(IsaacEnv):
         return ["/World/defaultGroundPlane"]
 
     def _set_specs(self):
-        # Custom robot state: linear_vel(3) + rotation_matrix_flat(9) + angular_vel(3) = 18
+        # Custom robot state: linear_vel(3) + rotation_matrix_flat(9) + angular_vel(3) = 15
         robot_state_dim = 3 + 9 + 3  # 15
         # Observation: robot_state(15) + next_gate_rpos_local(3) + next_to_next_gate_pos(3)
         observation_dim = robot_state_dim + 3 + 3
@@ -539,16 +546,16 @@ class DroneRaceEnv(IsaacEnv):
         Calls ``drone.get_state()`` to refresh all cached kinematics, then
         concatenates along the feature dimension:
 
-            [position (3) | linear_velocity (3) | rotation_matrix_flat (9) | angular_velocity (3)]
+            [linear_velocity (3) | rotation_matrix_flat (9) | angular_velocity (3)]
 
         Returns:
-            Tensor of shape (N, 1, 18).
+            Tensor of shape (N, 1, 15).
         """
         self.drone.get_state()  # refresh pos, rot, vel_w, vel_b caches
         lin_vel = self.drone.get_linear_velocity()   # (N, 1, 3)
         rot_mat = self.drone.get_rotation_matrix()   # (N, 1, 9)
         ang_vel = self.drone.get_angular_velocity()  # (N, 1, 3)
-        return torch.cat([lin_vel, rot_mat, ang_vel], dim=-1)  # (N, 1, 18)
+        return torch.cat([lin_vel, rot_mat, ang_vel], dim=-1)  # (N, 1, 15)
         
     def get_relative_gate_position(self, gate_indices, gate_env_pos, gate_env_rot, drone_pos, drone_rot):
         """Return gate position/rotation relative to each drone, both in world and drone-local frames.
@@ -621,7 +628,7 @@ class DroneRaceEnv(IsaacEnv):
         import sys
         
         try:
-            # Build custom state: [pos(3) | lin_vel(3) | rot_mat_flat(9) | ang_vel(3)] -> (N, 1, 18)
+            # Build custom state: [lin_vel(3) | rot_mat_flat(9) | ang_vel(3)] -> (N, 1, 15)
             # Also refreshes drone.pos / drone.rot caches used below for gate computations.
             self.drone_state = self._build_robot_state()
             drone_pos = self.drone.pos   # (N, 1, 3) refreshed by _build_robot_state
@@ -765,7 +772,11 @@ class DroneRaceEnv(IsaacEnv):
         # Type: bool is preferred (True/False); equivalent to 1/0 when cast to int/float.
         # Gate width and height can be accessed by using self.gate_width and self.gate_height.
         # ----- ADD YOUR GATE-CROSSING MASK CODE BELOW (replace the placeholder) -----
-        gates_passed_successfully = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # curr_in_gate: (N, 3) drone position in gate local frame centered at gate_center.
+        # x=forward through gate, y=lateral, z=up. Bounding box check in y and z.
+        in_bounds_y = curr_in_gate[..., 1].abs() < (self.gate_width / 2.0)
+        in_bounds_z = curr_in_gate[..., 2].abs() < (self.gate_height / 2.0)
+        gates_passed_successfully = crossed_plane & in_bounds_y & in_bounds_z
         # ----- END STUDENT CODE -----
         
         gate_passed_this_step = gates_passed_successfully & (~self.gate_passed)
@@ -864,7 +875,40 @@ class DroneRaceEnv(IsaacEnv):
         # -----------------------------------------------------------------------
         # ----- ADD YOUR REWARD CODE BELOW (replace the placeholder) -----
 
-        reward = torch.zeros(self.num_envs, device=self.device)  # (N,) ← replace this
+        # 1. Dense progress: reward improvement in distance toward gate each step.
+        #    Prevents stationary policies; provides dense learning signal.
+        #    (Swift λ1, Environment-as-Policy r_prog)
+        progress = self.prev_distance_to_gate - distance_to_gate  # (N,) positive = closer
+        self.prev_distance_to_gate = distance_to_gate.clone()
+        reward = self.reward_progress_scale * progress
+
+        # 2. Velocity-toward-gate: reward speed in direction of target gate.
+        #    Single most effective term for driving high-speed flight.
+        #    (SPIRAL α·Δdt, MonoRace velocity-capped progress)
+        # Note: self.drone.vel = vel_w (world frame), confirmed in multirotor.py:296.
+        lin_vel_world = self.drone.vel[:, 0, :3]  # (N, 3) linear velocity in world frame
+        gate_dir = new_gate_center - drone_pos_flat  # (N, 3) vector toward current target gate
+        gate_dir_norm = gate_dir / (gate_dir.norm(dim=-1, keepdim=True) + 1e-6)
+        vel_toward_gate = (lin_vel_world * gate_dir_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
+        reward += self.reward_velocity_scale * vel_toward_gate
+
+        # 3. Sparse gate passage bonus. (SPIRAL: Gt component; MonoRace: λgate)
+        reward += self.reward_gate_passage * gate_passed_this_step.float()
+
+        # 4. Lap completion bonus.
+        reward += self.reward_lap_completion * self.track_completed.float()
+
+        # 5. Angular rate penalty: discourage spinning/tumbling.
+        #    (Agile Flight 2025: -0.15ωroll² - 0.15ωpitch² - 0.05ωyaw²)
+        ang_vel = self.drone.vel[:, 0, 3:]  # (N, 3) angular velocity in world frame
+        ang_penalty = ang_vel.pow(2).sum(dim=-1)  # (N,)
+        reward -= self.reward_angular_penalty * ang_penalty
+
+        # 6. Action smoothness: penalize large throttle changes between steps. (Swift: λ5)
+        # throttle_difference is computed inside RotorGroup.apply_action each step as
+        # norm(throttle_t - throttle_{t-1}), shape (N, 1). Already properly reset on episode reset.
+        action_diff = self.drone.throttle_difference.squeeze(-1)  # (N,)
+        reward -= self.reward_action_smooth_scale * action_diff
 
         # ----- END STUDENT CODE -----
 
@@ -874,7 +918,22 @@ class DroneRaceEnv(IsaacEnv):
         # -----------------------------------------------------------------------
         # ----- ADD YOUR CRASH CONDITION BELOW (replace the placeholder) -----
 
-        crashed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)  # (N,) ← replace this
+        # Physical collision detected via base_link contact forces.
+        # drone.base_link is tracked with track_contact_forces=True (initialized at line 143).
+        contact_forces = self.drone.base_link.get_net_contact_forces()  # (N, 1, 3)
+        phys_crash = contact_forces.norm(dim=-1).squeeze(-1) > 0.1  # (N,)
+
+        # Ground crash: altitude below minimum threshold.
+        ground_crash = drone_pos_flat[:, 2] < self.crash_z_min  # (N,)
+
+        # Out-of-bounds: drone is too far from its target gate (lost / diverged).
+        # (Environment-as-Policy: prevents wasted episode time)
+        dist_crash = distance_to_gate > self.crash_dist_threshold  # (N,)
+
+        crashed = phys_crash | ground_crash | dist_crash
+
+        # Apply crash penalty to reward.
+        reward -= self.reward_crash_scale * crashed.float()
 
         # ----- END STUDENT CODE -----
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
@@ -888,7 +947,14 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["return"].add_(reward.unsqueeze(-1))
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
         self.stats["gates_passed"][:] = (self.gate_indices + self.track_completed.long()).float().unsqueeze(1)
-        # (optional) add extra stat tracking lines here if you add new metrics
+        # Granular crash diagnostics
+        self.stats["crashed_z"].add_(ground_crash.float().unsqueeze(-1))
+        self.stats["crashed_z_gate"].add_(phys_crash.float().unsqueeze(-1))
+        self.stats["crashed_distance"].add_(dist_crash.float().unsqueeze(-1))
+        # Uprightness: exponential moving average of the drone's up-vector z-component.
+        # 1.0 = perfectly level, ~0 = horizontal, -1.0 = inverted.
+        # self.drone.up: (N, 1, 3) → [..., 2] gives (N, 1) z-component.
+        self.stats["drone_uprightness"].lerp_(self.drone.up[..., 2], 1 - self.alpha)
 
         return TensorDict(
             {

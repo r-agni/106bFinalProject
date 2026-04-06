@@ -295,8 +295,11 @@ def main(cfg):
         logging.info("Collector iteration ended normally.")
         logging.info(f"Final Eval at {collector._frames} steps.")
         info = {"env_frames": collector._frames}
-        # info.update(evaluate())
-        # run.log(info)
+        try:
+            info.update(evaluate(seed=cfg.seed))
+            run.log(info)
+        except Exception as eval_error:
+            logging.warning(f"Final evaluation/video logging failed: {eval_error}")
 
         try:
             ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")

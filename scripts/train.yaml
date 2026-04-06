@@ -4,7 +4,7 @@ hydra:
     # see https://hydra.cc/docs/advanced/search_path/
     - file://../cfg
   run:
-    dir: /workspace/omni_drones/.hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ~/.hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 headless: true
 

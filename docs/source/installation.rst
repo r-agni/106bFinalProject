@@ -18,7 +18,7 @@ Set the following environment variables to your ``~/.bashrc`` or ``~/.zshrc`` fi
 
 where ``*`` corresponds to the Isaac Sim version. Remember to run `source ~/.bashrc` before you proceed.
 
-Although Isaac Sim comes with a built-in Python environment, we recommend using a seperate conda environment which is more flexible. We provide scripts to automate environment setup when activating/deactivating a conda environment at ``OmniDrones/conda_setup``.
+Although Isaac Sim comes with a built-in Python environment, we recommend using a seperate conda environment which is more flexible. We provide scripts to automate environment setup when activating/deactivating a conda environment at ``EECS106B/conda_setup``.
 
 .. seealso::
 
@@ -30,7 +30,7 @@ Although Isaac Sim comes with a built-in Python environment, we recommend using 
     conda activate sim
 
     # make sure the conda environment is activated by checking $CONDA_PREFIX
-    # then, at OmniDrones/
+    # then, at EECS106B/
     cp -r conda_setup/etc $CONDA_PREFIX
     # re-activate the environment
     conda activate sim
@@ -63,12 +63,12 @@ The next step is to install `Isaac Lab <https://github.com/isaac-sim/IsaacLab>`_
     # at IsaacLab/
     ./isaaclab.sh --install
 
-Finally, install **OmniDrones** in editable mode (which automatically installs other
+Finally, install **EECS106B** in editable mode (which automatically installs other
 required dependencies):
 
 .. code-block:: bash
 
-    # at OmniDrones/
+    # at EECS106B/
     pip install -e .
 
 To verify the installation, run

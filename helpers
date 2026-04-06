@@ -32,11 +32,11 @@ function docker_build_omni() {
         --build-arg HOST_GID="$(id -g)" \
         --build-context isaacsim="$isaacsim_context" \
         --target "$target" \
-        -f "$OMNI_DRONES_DIR"/docker/Dockerfile \
+        -f "$EECS106B_DIR"/docker/Dockerfile \
         -t "$tag" \
         --progress=plain \
         "${build_args[@]}" \
-        "$OMNI_DRONES_DIR"
+        "$EECS106B_DIR"
 
     if [[ "$target" == "eecs" ]]; then
       rm -rf "$isaacsim_context"
@@ -48,13 +48,13 @@ function docker_run_omni() {
   local isaacsim_cache_dir
   local cache_dir
 
-  if [[ -z "${OMNI_DRONES_DIR:-}" ]]; then
-    echo "ERROR: OMNI_DRONES_DIR is not set." >&2
+  if [[ -z "${EECS106B_DIR:-}" ]]; then
+    echo "ERROR: EECS106B_DIR is not set." >&2
     return 1
   fi
 
-  isaacsim_cache_dir="${OMNI_DRONES_DIR}/cache_sim"
-  cache_dir="${OMNI_DRONES_DIR}/.cache"
+  isaacsim_cache_dir="${EECS106B_DIR}/cache_sim"
+  cache_dir="${EECS106B_DIR}/.cache"
 
   # GPU selection priority:
   # 1) Slurm-assigned GPU(s)
@@ -101,9 +101,9 @@ function docker_run_omni() {
     fi
   fi
 
-  mkdir -p "$OMNI_DRONES_DIR/docker/.home"
-  mkdir -p "$OMNI_DRONES_DIR/.outputs"
-  mkdir -p "$OMNI_DRONES_DIR/.tmp_wandb"
+  mkdir -p "$EECS106B_DIR/docker/.home"
+  mkdir -p "$EECS106B_DIR/.outputs"
+  mkdir -p "$EECS106B_DIR/.tmp_wandb"
   mkdir -p "$isaacsim_cache_dir"
   mkdir -p "$cache_dir"
 
@@ -171,11 +171,11 @@ function docker_run_omni() {
     --gpus "device=${assigned_gpus}" \
     --network=host \
     "${xauth_args[@]}" \
-    -v "$OMNI_DRONES_DIR:/workspace/omni_drones:rw" \
+    -v "$EECS106B_DIR:/workspace/omni_drones:rw" \
     -v "$venv_dir:/opt/venv:rw" \
-    -v "$OMNI_DRONES_DIR/docker/.home:/home/$(id -un)" \
-    -v "$OMNI_DRONES_DIR/.hydra_outputs:/workspace/omni_drones/.hydra_outputs:rw" \
-    -v "$OMNI_DRONES_DIR/.tmp_wandb:/tmp/wandb:rw" \
+    -v "$EECS106B_DIR/docker/.home:/home/$(id -un)" \
+    -v "$EECS106B_DIR/.hydra_outputs:/workspace/omni_drones/.hydra_outputs:rw" \
+    -v "$EECS106B_DIR/.tmp_wandb:/tmp/wandb:rw" \
     -v "$isaacsim_cache_dir:/workspace/isaacsim/kit/cache:rw" \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     -v "$runtime_dir:$runtime_dir:rw" \
@@ -235,7 +235,7 @@ function distrobox_create() {
   fi
   
   echo "Creating distrobox container"
-  local host_omni_dir="${OMNI_DRONES_DIR}"
+  local host_omni_dir="${EECS106B_DIR}"
   local venv_dir="${host_omni_dir}/.venv"
   local isaacsim_cache_dir="${host_omni_dir}/cache_sim"
   mkdir -p "$venv_dir"
@@ -245,7 +245,7 @@ function distrobox_create() {
   distrobox create --verbose --hostname omnidrones -n omnidrones -i docker.io/mjsucb/omnidrones:eecs \
     --additional-flags "--userns=keep-id" \
     --volume /var/lib/sss/pipes:/var/lib/sss/pipes \
-    --volume $OMNI_DRONES_DIR:/workspace/omni_drones:rw \
+    --volume $EECS106B_DIR:/workspace/omni_drones:rw \
     --volume "$venv_dir":/opt/venv:rw \
     --nvidia \
     -a "--device /dev/dri" \
@@ -271,12 +271,12 @@ function podman_omnidrones_create() {
     return 1
   fi
 
-  if [[ -z "${OMNI_DRONES_DIR:-}" ]]; then
-    echo "ERROR: OMNI_DRONES_DIR is not set." >&2
+  if [[ -z "${EECS106B_DIR:-}" ]]; then
+    echo "ERROR: EECS106B_DIR is not set." >&2
     return 1
   fi
 
-  local host_omni_dir="${OMNI_DRONES_DIR}"
+  local host_omni_dir="${EECS106B_DIR}"
   local venv_dir="${host_omni_dir}/.venv"
   local isaacsim_cache_dir="${host_omni_dir}/cache_sim"
   local cache_dir="${host_omni_dir}/.cache"

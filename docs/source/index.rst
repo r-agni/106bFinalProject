@@ -1,19 +1,18 @@
-.. OmniDrones documentation master file, created by
-   sphinx-quickstart on Wed Jul 26 19:36:56 2023.
+.. EECS106B documentation master file, based on OmniDrones.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Welcome to OmniDrones's documentation!
-======================================
+Welcome to EECS106B's documentation!
+=====================================
 
-**OmniDrones** is an open-source platform designed for reinforcement learning research on multi-rotor drone systems.
+**EECS106B** is based on `OmniDrones <https://github.com/btx0424/OmniDrones>`__, an open-source platform designed for reinforcement learning research on multi-rotor drone systems.
 Built on `Nvidia Isaac Sim <https://docs.omniverse.nvidia.com/app_isaacsim/app_isaacsim/overview.html>`__,
-**OmniDrones** features highly efficient and flxeible simulation that can be adopted for various research purposes.
+it features highly efficient and flexible simulation that can be adopted for various research purposes.
 
 .. image:: _static/visualization.jpg
    :align: center
 
-The platform, as released with `our paper <https://arxiv.org/abs/2309.12825>`__, currently focus on end-to-end
+The platform, as released with `the OmniDrones paper <https://arxiv.org/abs/2309.12825>`__, currently focuses on end-to-end
 learning of agile controllers for drones. It offers a suite of benchmark tasks and algorithm baselines to provide
 preliminary results for subsequent works.
 
@@ -22,7 +21,7 @@ An overview of the platform is shown below:
 .. image:: _static/overview.png
 
 
-If you use **OmniDrones** in your research, please cite the paper with the following bibtex entry:
+If you use this platform in your research, please cite the original OmniDrones paper:
 
 .. code-block:: bibtex
 

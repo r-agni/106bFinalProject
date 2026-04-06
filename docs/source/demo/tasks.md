@@ -2,7 +2,7 @@
 
 ## How to run demo task with trained model
 
-Open [demo_task.yaml](https://github.com/btx0424/OmniDrones/blob/main/examples/demo_task.yaml) and change the parameters in wandb field.
+Open [demo_task.yaml](https://github.com/arplaboratory/EECS106B/blob/main/examples/demo_task.yaml) and change the parameters in wandb field.
 
 ```bash
 ...

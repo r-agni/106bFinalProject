@@ -11,7 +11,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath("../../"))
 
-project = 'OmniDrones'
+project = 'EECS106B'
 copyright = '2023, btx0424'
 author = 'btx0424'
 release = '0.1.1'
@@ -47,7 +47,7 @@ import sphinx_book_theme
 html_theme_path = [sphinx_book_theme.get_html_theme_path()]
 html_theme = 'sphinx_book_theme'
 html_theme_options = {
-    "repository_url": "https://github.com/btx0424/OmniDrones",
+    "repository_url": "https://github.com/arplaboratory/EECS106B",
     "use_repository_button": True,
 }
 

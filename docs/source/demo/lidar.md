@@ -8,7 +8,7 @@ The agent utilizes Lidar sensors to perceive its surroundings and make informed 
 
 To simulate the Lidar sensors, we use ray-cast utilities from [Nvidia Warp](https://github.com/NVIDIA/warp).
 
-For a more detailed understanding of the implementation, please refer to the source code located at `OmniDrones/scripts/train_lidar.py`.
+For a more detailed understanding of the implementation, please refer to the source code located at `EECS106B/scripts/train_lidar.py`.
 
 ## Visualization
 
@@ -26,7 +26,7 @@ We visualize all the parallel environments. Note that drones from different (log
 ## Quick Start
 
 ```{code-block} bash
-:caption: OmniDrones/scripts/
+:caption: EECS106B/scripts/
 
 python train_lidar.py headless=true eval_interval=200 task=Forest task.lidar_range=4. task.lidar_vfov=[-10., 20.]
 

@@ -1,8 +1,6 @@
-# OmniDrones
+# EECS106B
 
-[![Docs status](https://img.shields.io/badge/docs-passing-brightgreen.svg)](https://omnidrones.readthedocs.io/en/latest/)
-
-## How to generate md files from omnidrones
+## How to generate md files from EECS106B
 
 1. Activate conda environment including omnidrones
 

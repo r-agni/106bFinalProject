@@ -1,4 +1,4 @@
-## Distrobox Setup (OmniDrones)
+## Distrobox Setup (EECS106B)
 
 This codebase is based on Distrobox, [Docker](https://docs.docker.com/get-started/docker-overview/) and Podman. We abstract away most of their inner workings, but it is recommended to have a preliminary understanding of each of these packages by looking at their official documentations. 
 
@@ -17,24 +17,24 @@ Then clone this repo, point it at your new private remote, and initialize submod
 - Make sure you can authenticate with GitHub (preferably set up SSH keys).
 - Add these to your host `~/.bashrc` (or `~/.zshrc`) (replace with your paths):
   ```
-  export OMNI_DRONES_DIR="/path/to/OmniDrones"
-  source "$OMNI_DRONES_DIR/helpers"
+  export EECS106B_DIR="/path/to/EECS106B"
+  source "$EECS106B_DIR/helpers"
   ```
   Or run this code to append them to `~/.bashrc`:
   ```
   if [[ "$(pwd)" == */EECS106B ]]; then
     cat <<EOF >> ~/.bashrc
-  export OMNI_DRONES_DIR="$(pwd)"
-  source "\$OMNI_DRONES_DIR/helpers"
+  export EECS106B_DIR="$(pwd)"
+  source "\$EECS106B_DIR/helpers"
   EOF
   else
-    echo "ERROR: run this from your OmniDrones repo directory." >&2
+    echo "ERROR: run this from your EECS106B repo directory." >&2
     return 1
   fi
   ```
-- Setup [wandb](https://docs.wandb.ai/models/quickstart) to visualize training statistics. Once you have your WANDB_API_KEY, add it to the  `.bashrc` file in the `EEECS106` git folder. Alternatively, run the following command
+- Setup [wandb](https://docs.wandb.ai/models/quickstart) to visualize training statistics. Once you have your WANDB_API_KEY, add it to the  `.bashrc` file in the `EECS106B` git folder. Alternatively, run the following command
   ```
-  cat <<EOF >> "$OMNI_DRONES_DIR/.bashrc"
+  cat <<EOF >> "$EECS106B_DIR/.bashrc"
 
 
   export WANDB_API_KEY="<your_api_key>"
@@ -43,52 +43,22 @@ Then clone this repo, point it at your new private remote, and initialize submod
 - Make sure to re-source using `source ~/.bashrc`
 
 ### Step 2: Create the distrobox
-
-Run the helper function:
-
-```
-distrobox_create
-```
-
-This can take a while on first run (>= 30 minutes). If prompted to download an image from `docker.io`, answer "yes".
-This pulls the `omnidrones:eecs` image (built from the Dockerfile) and creates the container with GPU/Vulkan passthrough. It also:
-
-- Mounts your repo into `/workspace/omni_drones`
-- Mounts a persistent venv from `"$OMNI_DRONES_DIR/.venv"` to `/opt/venv`
-- Sets `HOME=/workspace/omni_drones` so the repo’s `.bashrc` is used inside the container
-
-### Step 3: Enter the distrobox
+Luckily, we can re-use the grasping distrobox
+Re-enter the distrobox:
 
 ```
-distrobox_enter
+distrobox enter grasping
 ```
-
-This will move you inside the distrobox container. 
-
-The first time you enter, you will need to install the required packages. Run
+We set up a virtual environment, that you can source with 
 
 ```
-omni_drones_install
+source /opt/venv/drone_venv/bin/activate
 ```
 
-to install the packages. **Note:** Expect some red warnings related to pip not respecting dependencies. This is expected, however you should not see any other errors.
-
-#### What happens on entry (from repo `.bashrc`)
-
-When you enter, `distrobox_enter` runs `bash -i`, which reads the repo’s `.bashrc`
-because `HOME` is set to `/workspace/omni_drones`. That script:
-
-- Exports `OMNI_DRONES_DIR` and `ISAACSIM_PATH`
-- Sources `"$ISAACSIM_PATH/setup_conda_env.sh"`
-- Activates `/opt/venv` if it exists, or creates it if missing
-- Checks whether the required packages are installed and prints a reminder if not
-
-#### Technical background (for people who care)
-
-- The venv is **bind-mounted** from the host directory at `"$OMNI_DRONES_DIR/.venv"`
-into `/opt/venv` inside the container, so any pip installs persist across sessions.
-- Because `HOME` points at `/workspace/omni_drones`, the repo’s `.bashrc` becomes the
-interactive shell config used on container entry.
+You will also need to source the isaac lab venv as the same in project 4b
+```
+source /workspace/isaacsim/setup_conda_env.sh
+```
 
 ### Step 4: Train a hover policy
 
@@ -99,8 +69,7 @@ The `drone_model["controller"]` field in `cfg/task/Hover.yaml`, specifies the co
 Inside distrobox,
 
 ```
-cd /workspace/omni_drones/scripts
-python train.py algo=ppo headless=true
+python3 scripts/train.py algo=ppo headless=true
 ```
 
 If you haven't setup wandb, run `python train.py algo=ppo headless=true wandb.mode=disabled` instead. If you see PPO training logs (e.g., average reward metrics), your setup is working.

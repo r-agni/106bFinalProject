@@ -36,6 +36,6 @@ and observation to better account for real-world conditions.
 ## Quick Start
 
 ```{code-block} bash
-:caption: OmniDrones/scripts/
+:caption: EECS106B/scripts/
 python train.py headless=true eval_interval=200 task=TrackRand task.drone_model=crazyflie task.action_transform=rate
 ```

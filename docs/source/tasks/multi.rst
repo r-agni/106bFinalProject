@@ -65,7 +65,7 @@ Quick Start
 -----------
 
 .. code-block:: bash
-  :caption: OmniDrones/scripts/
+  :caption: EECS106B/scripts/
 
   python train.py task=PlatformHover algo=mappo headless=true eval_interval=300 total_frames=150_000_000
 

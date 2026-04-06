@@ -54,8 +54,13 @@ class DroneRaceEnv(IsaacEnv):
 
     ## Observation
 
-    - `drone_state`: The basic information of the drone returned by `MultirotorSimple.get_state`.
+    - `drone_state` (15): Custom state vector `[lin_vel(3) | rot_mat_flat(9) | ang_vel(3)]`. Note that
+      position is **not** included.
     - `next_gate_rpos` (3): The relative position of the next gate to the drone in the drone's local frame.
+    - `next_to_next_gate_pos` (3): The position of the gate after the immediate next gate, expressed in
+      the next gate's local frame. Clamped at the last gate (no wrap-around).
+    - `next_gate_rot_mat_2col` (6): The first two columns of the next gate's rotation matrix in the world frame
+      (i.e. the gate's local x- and y-axes expressed in world coordinates), flattened to a 6-vector.
 
     ## Reward  *(student implementation required)*
 
@@ -378,7 +383,8 @@ class DroneRaceEnv(IsaacEnv):
         # Custom robot state: linear_vel(3) + rotation_matrix_flat(9) + angular_vel(3) = 18
         robot_state_dim = 3 + 9 + 3  # 15
         # Observation: robot_state(15) + next_gate_rpos_local(3) + next_to_next_gate_pos(3)
-        observation_dim = robot_state_dim + 3 + 3
+        #              + next_gate_rot_mat_2col(6)
+        observation_dim = robot_state_dim + 3 + 3 + 6
         self.observation_spec = Composite({
             "agents": {
                 "observation": Unbounded((1, observation_dim), device=self.device),
@@ -687,12 +693,23 @@ class DroneRaceEnv(IsaacEnv):
         gate_progress = self.gate_indices.float() / self.num_gates  # (N,)
         gate_progress = torch.where(track_completed, torch.ones_like(gate_progress), gate_progress)
         
+        # Next gate orientation: first 2 columns of its rotation matrix in the world frame.
+        # Rotate the gate-local x- and y-axes into world coordinates via quat_rotate,
+        # then concatenate to a 6-vector per environment.
+        next_gate_rot_flat = next_gate_rot.squeeze(1)  # (N, 4)
+        e_x = torch.tensor([1., 0., 0.], device=self.device).unsqueeze(0).expand(self.num_envs, -1)  # (N, 3)
+        e_y = torch.tensor([0., 1., 0.], device=self.device).unsqueeze(0).expand(self.num_envs, -1)  # (N, 3)
+        gate_col0 = quat_rotate(next_gate_rot_flat, e_x)  # (N, 3) - gate x-axis in world frame
+        gate_col1 = quat_rotate(next_gate_rot_flat, e_y)  # (N, 3) - gate y-axis in world frame
+        next_gate_rot_mat_2col = torch.cat([gate_col0, gate_col1], dim=-1).unsqueeze(1)  # (N, 1, 6)
+
         # Build observation
         # All components need to have the agent dimension (middle dimension) to match spec (N, 1, obs_dim)
         obs = [
             self.drone_state,  # (N, 1, state_dim) - already has agent dimension
             next_gate_rpos_local,  # (N, 1, 3) - already has agent dimension
             next_to_next_gate_pos.unsqueeze(1),  # (N, 1, 3)
+            next_gate_rot_mat_2col,  # (N, 1, 6)
         ]
         
         # Concatenate along last dimension: (N, 1, obs_dim)

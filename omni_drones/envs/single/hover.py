@@ -139,10 +139,6 @@ class Hover(IsaacEnv):
                 shape=(-1, self.drone.n)
             )
             self.payload.initialize()
-            # Pre-store joint index for efficient resets
-            self.payload_z_joint_idx = torch.tensor(
-                [self.drone._view._dof_indices["PrismaticJoint"]], device=self.device
-            )
 
         self.target_vis = ArticulationView(
             "/World/envs/env_*/target",
@@ -253,10 +249,10 @@ class Hover(IsaacEnv):
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
-    # Made changes to this function.
+
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids, self.training)
-        # Sample initial positions and orientations with proper shapes: (num_envs, 1, 3) for positions and (num_envs, 1, 3) for RPY
+
         pos = self.init_pos_dist.sample((*env_ids.shape, 1))
         rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
         rot = euler_to_quaternion(rpy)
@@ -266,15 +262,16 @@ class Hover(IsaacEnv):
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
 
         if self.has_payload:
-            # Sample payload z position with proper shape: (num_envs, 1)
-            payload_z = self.payload_z_dist.sample((*env_ids.shape, 1))
+            # TODO@btx0424: workout a better way
+            payload_z = self.payload_z_dist.sample(env_ids.shape)
+            joint_indices = torch.tensor([self.drone._view._dof_indices["PrismaticJoint"]], device=self.device)
             self.drone._view.set_joint_positions(
-                payload_z, env_indices=env_ids, joint_indices=self.payload_z_joint_idx)
+                payload_z, env_indices=env_ids, joint_indices=joint_indices)
             self.drone._view.set_joint_position_targets(
-                payload_z, env_indices=env_ids, joint_indices=self.payload_z_joint_idx)
+                payload_z, env_indices=env_ids, joint_indices=joint_indices)
             self.drone._view.set_joint_velocities(
                 torch.zeros(len(env_ids), 1, device=self.device),
-                env_indices=env_ids, joint_indices=self.payload_z_joint_idx)
+                env_indices=env_ids, joint_indices=joint_indices)
 
             payload_mass = self.payload_mass_dist.sample(env_ids.shape+(1,)) * self.drone.masses[env_ids]
             self.payload.set_masses(payload_mass, env_indices=env_ids)
@@ -285,7 +282,7 @@ class Hover(IsaacEnv):
         self.target_vis.set_world_poses(orientations=target_rot, env_indices=env_ids)
 
         self.stats[env_ids] = 0.
-    # Made changes to this function.
+
     def _pre_sim_step(self, tensordict: TensorDictBase):
         '''
         Input actions are in scaled units 
@@ -297,10 +294,9 @@ class Hover(IsaacEnv):
             rotor_cmds = self.controller(root_state, *self.controller.scaled_to_raw(actions))            
             self.effort = self.drone.apply_action(rotor_cmds)
         else:
-            # Without a controller, treat actions as direct per-rotor commands
-            # Actions are already in normalized [-1, 1] range
-            rotor_cmds = actions.clamp(-1.0, 1.0)
-            self.effort = self.drone.apply_action(rotor_cmds)
+            print("Warning: No controller found, using default action space.")
+            # TODO need to scale to raw units 
+            self.effort = self.drone.apply_action(actions)        
 
     def _compute_state_and_obs(self):
         self.drone_state = self.drone.get_state()

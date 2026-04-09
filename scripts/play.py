@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 from omni_drones import init_simulation_app
 from torchrl.data import CompositeSpec
 from torchrl.envs.utils import set_exploration_type, ExplorationType
-from omni_drones.utils.torchrl import SyncDataCollector
+from omni_drones.utils.torchrl import SyncDataCollector, RenderCallback
 from omni_drones.utils.torchrl.transforms import (
     FromMultiDiscreteAction,
     FromDiscreteAction,
@@ -33,6 +33,14 @@ def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+
+    record_video = bool(cfg.get("record_video", False))
+    if record_video:
+        cfg.sim.enable_replicator = True
+        if cfg.get("headless", True):
+            logging.warning("record_video=True: forcing headless=false (required for RGB capture).")
+        cfg.headless = False
+
     simulation_app = init_simulation_app(cfg)
 
     setproctitle(cfg.task.name)
@@ -129,6 +137,10 @@ def main(cfg):
         if isinstance(k, tuple) and k[0]=="stats"
     ]
     episode_stats = EpisodeStats(stats_keys)
+    # Default SyncDataCollector exploration is RANDOM (stochastic actions). For playback,
+    # MODE uses the policy distribution's mode (Gaussian mean), which looks like a stable hover.
+    exploration_name = str(cfg.get("play_exploration", "MODE")).upper()
+    exploration = getattr(ExplorationType, exploration_name, ExplorationType.MODE)
     collector = SyncDataCollector(
         env,
         policy=policy,
@@ -136,10 +148,12 @@ def main(cfg):
         total_frames=cfg.total_frames,
         device=cfg.sim.device,
         return_same_td=True,
+        exploration_type=exploration,
     )
 
     pbar = tqdm(collector)
-    env.train()
+    base_env.eval()
+    env.eval()
     for i, data in enumerate(pbar):
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
         episode_stats.add(data.to_tensordict())
@@ -154,6 +168,62 @@ def main(cfg):
         print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
 
         pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
+
+    if record_video:
+        video_path = cfg.get("video_path", "hover_playback.mp4")
+        if not os.path.isabs(video_path):
+            video_path = os.path.join(os.getcwd(), video_path)
+        vdir = os.path.dirname(video_path)
+        if vdir:
+            os.makedirs(vdir, exist_ok=True)
+
+        max_steps = int(cfg.get("record_video_max_steps", 800))
+        if cfg.get("total_frames", 0) and cfg.total_frames > 0:
+            max_steps = min(max_steps, int(cfg.total_frames))
+
+        base_env.enable_render(True)
+        base_env.eval()
+        env.eval()
+        env.set_seed(cfg.seed)
+        frame_interval = max(1, int(cfg.get("video_frame_interval", 2)))
+        render_cb = RenderCallback(interval=frame_interval)
+        fps = float(cfg.get("video_fps", 30))
+
+        logging.info(
+            f"Recording video: max_steps={max_steps}, frame_interval={frame_interval}, fps={fps} -> {video_path}"
+        )
+        with set_exploration_type(ExplorationType.MODE):
+            env.rollout(
+                max_steps=max_steps,
+                policy=policy,
+                callback=render_cb,
+                auto_reset=True,
+                break_when_any_done=False,
+                return_contiguous=False,
+            )
+
+        base_env.enable_render(not cfg.headless)
+        base_env.train()
+        env.train()
+
+        frames = render_cb.get_video_array(axes="t h w c")
+        if frames is None or frames.size == 0:
+            logging.error(
+                "No video frames captured. Ensure viewport + Replicator (enable_replicator) work on your machine."
+            )
+        else:
+            try:
+                import imageio.v2 as imageio
+
+                imageio.mimsave(video_path, frames, fps=fps, codec="libx264")
+            except Exception as e:
+                logging.warning("MP4 save failed (%s); trying GIF fallback.", e)
+                gif_path = os.path.splitext(video_path)[0] + ".gif"
+                import imageio.v2 as imageio
+
+                imageio.mimsave(gif_path, frames, fps=min(fps, 20))
+                video_path = gif_path
+            logging.info("Saved recording to %s (%d frames)", video_path, len(frames))
 
     simulation_app.close()
 

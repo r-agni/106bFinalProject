@@ -162,3 +162,5 @@ docker/.home
 cache_sim/
 .hydra_outputs/
 .tmp_wandb/
+
+hover_playback.mp4

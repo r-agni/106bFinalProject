@@ -8,7 +8,6 @@ import math
 from typing import Optional, Sequence
 
 import carb
-import isaacsim.core.utils.nucleus as nucleus_utils
 import isaacsim.core.utils.prims as prim_utils
 import omni.kit
 from isaacsim.core.api.materials.physics_material import PhysicsMaterial

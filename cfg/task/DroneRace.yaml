@@ -11,7 +11,7 @@ ppo_cfg: DroneRace.yaml
 
 env:
   num_envs: 500            # <-- EDIT: number of parallel environments
-  max_episode_length: 500 # <-- EDIT: max steps per episode before truncation
+  max_episode_length: 1000 # 10 seconds — gives slow early-training policies time to reach gates
 
 sim:
   substeps: 5   # overrides the default of 5
@@ -131,14 +131,14 @@ gate_height: 2.5
 gate_width: 2.5 
 
 # ---- Reward hyperparameters (MonoRace/Swift/SPIRAL-inspired, 2025 SotA) ----
-reward_progress_scale: 1.5        # dense: distance-to-gate improvement per step
-reward_velocity_scale: 1.0        # velocity component toward gate (drives high-speed flight)
-reward_gate_passage: 10.0         # sparse bonus per gate passed (SPIRAL: Gt component)
+reward_progress_scale: 4.0        # dense: path-projection progress along racing line (Song et al. 2021)
+reward_velocity_scale: 0.0        # velocity toward gate — disabled (conflicts with corner-cutting; not used in Swift/Song/Wang)
+reward_gate_passage: 15.0         # sparse bonus per gate passed
 reward_lap_completion: 50.0       # bonus for completing full lap
-reward_angular_penalty: 0.1       # penalize squared angular rates (Agile Flight 2025)
-reward_action_smooth_scale: 0.1   # penalize large action changes (Swift: lambda_5)
-reward_crash_scale: 10.0          # terminal crash penalty (MonoRace: lambda_crash=10)
-crash_dist_threshold: 10.0        # max distance from gate before out-of-bounds reset
+reward_angular_penalty: 0.03      # penalize squared angular rates (decays to 0 over 50M frames)
+reward_action_smooth_scale: 0.03  # penalize large action changes
+reward_crash_scale: 40.0          # terminal crash penalty — must dominate expected episode return (~40 dense reward over 100 steps)
+crash_dist_threshold: 5.5         # ~0.8x gate spacing (7.07m) — kills off-track episodes quickly without being too tight
 crash_z_min: 0.15                 # minimum altitude (ground crash)
 # ---------------------------------------------------------------------------
 

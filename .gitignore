@@ -162,3 +162,7 @@ docker/.home
 cache_sim/
 .hydra_outputs/
 .tmp_wandb/
+
+# Claude Code local config
+.claude/
+hover_playback.mp4

@@ -4,7 +4,8 @@ hydra:
     # see https://hydra.cc/docs/advanced/search_path/
     - file://../cfg
   run:
-    dir: /workspace/omni_drones/.hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    # Relative to cwd (works on Windows and Linux; avoids hard-coded /workspace paths)
+    dir: .hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 headless: true
 
@@ -32,6 +33,16 @@ wandb:
   run_id:
   monitor_gym: True
   tags:
+
+# play.py: ExplorationType name (MODE = deterministic-ish mean action; RANDOM = noisy sampling)
+play_exploration: MODE
+
+# play.py only: saves MP4 after rollout (sets headless=false and sim.enable_replicator)
+record_video: false
+video_path: hover_playback.mp4
+record_video_max_steps: 800
+video_frame_interval: 2
+video_fps: 30
 
 defaults:
   - task: Hover

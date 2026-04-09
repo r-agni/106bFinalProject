@@ -1,13 +1,13 @@
 name: ppo
 
 # PPO training schedule (tuned for drone racing based on Swift/MonoRace/SPIRAL papers)
-train_every: 32   # collect this many env steps per env before each update
+train_every: 128  # gate-to-gate ~70 steps at 10m/s; 128 guarantees at least 1 gate crossing per rollout
 ppo_epochs: 8     # gradient epochs per update
 num_minibatches: 5
 clip_param: 0.2
 entropy_coef: 0.003   # low entropy encourages exploitation; drone racing converges quickly
 gae_lambda: 0.95
-gamma: 0.99
+gamma: 0.995  # longer effective horizon (200 steps) — better credit-assignment for lap bonus at step 300+
 max_grad_norm: 5.0
 
 # whether to use privileged information

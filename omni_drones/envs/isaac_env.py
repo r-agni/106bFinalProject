@@ -403,9 +403,13 @@ class IsaacEnv(EnvBase):
                 )
             # obtain the rgb data
             rgb_data = self._rgb_annotator.get_data()
-            # convert to numpy array
+            # Isaac Sim / Replicator may return ndarray or a buffer-like object
+            if isinstance(rgb_data, np.ndarray):
+                if rgb_data.dtype != np.uint8:
+                    rgb_data = np.clip(rgb_data, 0, 255).astype(np.uint8)
+                h, w = rgb_data.shape[0], rgb_data.shape[1]
+                return np.ascontiguousarray(rgb_data.reshape(h, w, -1)[:, :, :3])
             rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
-            # return the rgb data
             return rgb_data[:, :, :3]
         else:
             raise NotImplementedError(

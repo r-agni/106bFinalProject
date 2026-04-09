@@ -24,7 +24,6 @@
 import torch
 
 from omni_drones.views import RigidPrimView
-from isaacsim.core.utils.nucleus import get_assets_root_path
 from torchrl.data import Bounded, Unbounded
 
 from omni_drones.robots import ASSET_PATH

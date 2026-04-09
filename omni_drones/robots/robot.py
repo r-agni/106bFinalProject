@@ -33,6 +33,7 @@ import omni.timeline
 import torch
 from omni_drones.views import ArticulationView, RigidPrimView
 from isaacsim.core.api.simulation_context import SimulationContext
+from isaacsim.core.simulation_manager import SimulationManager
 from torchrl.data import TensorSpec
 
 import omni_drones.utils.kit as kit_utils
@@ -99,7 +100,7 @@ class RobotBase(abc.ABC):
         prim_paths: Sequence[str] = None
     ):
         _sim = SimulationContext.instance()
-        if hasattr(_sim, "_physics_sim_view") and _sim._physics_sim_view is not None:
+        if SimulationManager.get_physics_sim_view() is not None:
             raise RuntimeError(
                 "Cannot spawn robots after simulation_context.reset() is called."
             )
@@ -162,7 +163,7 @@ class RobotBase(abc.ABC):
         prim_paths_expr: str = None,
     ):
         _sim = SimulationContext.instance()
-        if hasattr(_sim, "_physics_sim_view") and _sim._physics_sim_view is None:
+        if SimulationManager.get_physics_sim_view() is None:
             raise RuntimeError(
                 f"Cannot initialize {self.__class__.__name__} before the simulation context resets."
                 "Call simulation_context.reset() first."

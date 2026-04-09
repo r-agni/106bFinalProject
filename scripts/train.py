@@ -260,11 +260,78 @@ def main(cfg):
             episode_stats.add(data.to_tensordict())
 
             if len(episode_stats) >= base_env.num_envs:
+                raw_stats = episode_stats.pop()
                 stats = {
                     "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
-                    for k, v in episode_stats.pop().items(True, True)
+                    for k, v in raw_stats.items(True, True)
                 }
                 info.update(stats)
+
+                # --- derived / renamed metrics for easier W&B dashboard reading ---
+                def _mean(key):
+                    v = raw_stats.get(("stats", key), None)
+                    return torch.mean(v.float()).item() if v is not None else None
+
+                # Racing performance
+                mean_speed   = _mean("mean_speed")
+                max_speed    = _mean("max_speed")
+                gates_passed = _mean("gates_passed")
+                success_rate = _mean("success")
+                ep_len       = _mean("episode_len")
+                lap_time     = _mean("lap_time_steps")  # 0 for non-completions
+
+                # Crash breakdown
+                crash_total    = _mean("collision")
+                crash_ground   = _mean("crashed_z")
+                crash_contact  = _mean("crashed_z_gate")
+                crash_distance = _mean("crashed_distance")
+
+                # Reward components
+                rew_progress  = _mean("reward_progress")
+                rew_gates     = _mean("reward_gates")
+                rew_penalties = _mean("reward_penalties")
+                rew_return    = _mean("return")
+
+                # Behaviour diagnostics
+                ang_rate    = _mean("mean_ang_rate")
+                decay_frac  = _mean("ang_penalty_decay_frac")
+                uprightness = _mean("drone_uprightness")
+                truncated   = _mean("truncated")
+
+                derived = {}
+
+                # Racing metrics
+                if mean_speed   is not None: derived["race/mean_speed_ms"]       = mean_speed
+                if max_speed    is not None: derived["race/max_speed_ms"]         = max_speed
+                if gates_passed is not None: derived["race/gates_passed_per_ep"]  = gates_passed
+                if success_rate is not None: derived["race/lap_completion_rate"]  = success_rate
+                if ep_len       is not None: derived["race/episode_len_steps"]    = ep_len
+                if ep_len       is not None: derived["race/episode_len_sec"]      = ep_len * cfg.sim.dt * cfg.sim.substeps
+                if lap_time     is not None and success_rate and success_rate > 0:
+                    derived["race/lap_time_steps"] = lap_time
+                    derived["race/lap_time_sec"]   = lap_time * cfg.sim.dt * cfg.sim.substeps
+
+                # Crash breakdown (fraction of episodes)
+                if crash_total    is not None: derived["crash/total_rate"]     = crash_total
+                if crash_ground   is not None: derived["crash/ground_rate"]    = crash_ground
+                if crash_contact  is not None: derived["crash/contact_rate"]   = crash_contact
+                if crash_distance is not None: derived["crash/distance_rate"]  = crash_distance
+
+                # Reward components (useful for spotting imbalances)
+                if rew_progress  is not None: derived["reward/progress_cumul"]  = rew_progress
+                if rew_gates     is not None: derived["reward/gates_cumul"]     = rew_gates
+                if rew_penalties is not None: derived["reward/penalties_cumul"] = rew_penalties
+                if rew_return    is not None: derived["reward/total_return"]    = rew_return
+                if rew_progress is not None and rew_return is not None and abs(rew_return) > 1e-6:
+                    derived["reward/progress_fraction"] = rew_progress / rew_return
+
+                # Behaviour diagnostics
+                if ang_rate    is not None: derived["behaviour/mean_ang_rate_rads"]   = ang_rate
+                if decay_frac  is not None: derived["behaviour/ang_penalty_decay_frac"] = decay_frac
+                if uprightness is not None: derived["behaviour/drone_uprightness"]    = uprightness
+                if truncated   is not None: derived["behaviour/truncated_rate"]       = truncated
+
+                info.update(derived)
 
             info.update(policy.train_op(data.to_tensordict()))
 

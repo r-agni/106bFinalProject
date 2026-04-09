@@ -169,7 +169,10 @@ class DroneRaceEnv(IsaacEnv):
         self.gate_width = cfg.task.get("gate_width", 1.0)
         self.prev_drone_in_gate_frame = torch.zeros(self.num_envs, 3, device=self.device)
         self.last_action = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device)
-        self.effort = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device) 
+        self.effort = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device)
+        self.prev_drone_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self.total_frames_counter = 0
+        self.angular_penalty_decay_frames = 50_000_000  # decay angular penalty to 0 over first 50M frames
 
         # Use a single view with wildcard pattern to access all gates
         try:
@@ -384,8 +387,8 @@ class DroneRaceEnv(IsaacEnv):
     def _set_specs(self):
         # Custom robot state: linear_vel(3) + rotation_matrix_flat(9) + angular_vel(3) = 15
         robot_state_dim = 3 + 9 + 3  # 15
-        # Observation: robot_state(15) + next_gate_rpos_local(3) + next_to_next_gate_pos(3)
-        observation_dim = robot_state_dim + 3 + 3
+        # Observation: robot_state(15) + next_gate_rpos_local(3) + next_to_next_gate_pos(3) + prev_action(4)
+        observation_dim = robot_state_dim + 3 + 3 + self.drone.action_spec.shape[-1]  # 25
         self.observation_spec = Composite({
             "agents": {
                 "observation": Unbounded((1, observation_dim), device=self.device),
@@ -422,61 +425,71 @@ class DroneRaceEnv(IsaacEnv):
             "crashed_z_gate": Unbounded(1),
             "crashed_distance": Unbounded(1),
             "success": BinaryDiscreteTensorSpec(1, dtype=bool),
-            "truncated":  Unbounded(1),
+            "truncated": Unbounded(1),
+            # Speed tracking
+            "mean_speed": Unbounded(1),       # mean linear speed (m/s) over episode
+            "max_speed": Unbounded(1),        # max linear speed (m/s) seen in episode
+            # Lap time (steps) — only meaningful when success=True
+            "lap_time_steps": Unbounded(1),   # steps to complete lap (0 if no lap completed)
+            # Reward component breakdown
+            "reward_progress": Unbounded(1),  # cumulative progress reward
+            "reward_gates": Unbounded(1),     # cumulative gate passage reward
+            "reward_penalties": Unbounded(1), # cumulative angular + smoothness penalties
+            # Angular rate magnitude
+            "mean_ang_rate": Unbounded(1),    # mean ||ang_vel|| over episode
+            # Angular penalty decay (scalar, same for all envs)
+            "ang_penalty_decay_frac": Unbounded(1),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
 
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids)
-        
+
+        n = len(env_ids)
+
+        # --- Distributed initialization (Song et al. 2021) ---
+        # 30% start at gate 0, 70% start at a random gate [0, num_gates-2].
+        # Gate num_gates-1 is excluded because it duplicates gate 0 (lap close).
+        always_gate0 = torch.rand(n, device=self.device) < 0.30
+        random_gates = torch.randint(0, self.num_gates - 1, (n,), device=self.device)
+        start_gates = torch.where(always_gate0, torch.zeros(n, device=self.device, dtype=torch.long), random_gates)
+
         # Reset gate progress
-        self.gate_indices[env_ids] = 0
+        self.gate_indices[env_ids] = start_gates
         self.gate_passed[env_ids] = False
         self.track_completed[env_ids] = False
         self.last_action[env_ids] = 0.0
-        self.effort[env_ids] = 0.0 # Adding this line changes the result
+        self.effort[env_ids] = 0.0
 
-        # Reset gate velocities to prevent drift (gates are static, so we just zero velocities)
-        # Set velocities to zero for all gates in reset environments
-        num_gates_to_reset = len(env_ids) * self.num_gates
-        gate_velocities = torch.zeros(num_gates_to_reset, 6, device=self.device)
-        
-        # Reshape to match gate view shape: (num_envs, num_gates, 6)
-        gate_velocities = gate_velocities.reshape(len(env_ids), self.num_gates, 6)
+        # Reset gate velocities to prevent drift
+        gate_velocities = torch.zeros(n, self.num_gates, 6, device=self.device)
         self.gates.set_velocities(gate_velocities, env_indices=env_ids)
 
         # Reset drone position and orientation
         drone_rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
         drone_rot = euler_to_quaternion(drone_rpy)
         try:
-        
-            # Position drone near the first gate
-            # Get gate positions from views - get all gates first, then select the ones we need
-            # This avoids the unflatten issue when using env_indices
-            gate_world_pos, gate_world_rot = self.gates.get_world_poses()  # (num_envs, num_gates, 3), (num_envs, num_gates, 4)
-            # Select only the environments we're resetting
-            gate_env_pos, gate_env_rot = self.get_env_poses((gate_world_pos, gate_world_rot))  # (N, num_gates, 3), (N, num_gates, 4)
-            gate_env_pos = gate_env_pos[env_ids]  # (len(env_ids), num_gates, 3)
-            gate_env_rot = gate_env_rot[env_ids]  # (len(env_ids), num_gates, 4)
-            first_gate_pos = gate_env_pos[:, 0]  # (N, 3)
-            first_gate_rot = gate_env_rot[:, 0]  # (N, 4)
-            
-            # Calculate offset in gate's local frame (behind the gate)
-            # Gate's local x-axis points in the forward direction 
-            
-            # Rotate offset to world frame using gate's orientation
-            # Expand offset_local to match batch size
-            offset_local_expanded = self.offset_local.unsqueeze(0).expand(len(env_ids), -1)  # (N, 3)
-            offset_world = quat_rotate(first_gate_rot, offset_local_expanded)  # (len(env_ids), 3)
+            gate_world_pos, gate_world_rot = self.gates.get_world_poses()
+            gate_env_pos, gate_env_rot = self.get_env_poses((gate_world_pos, gate_world_rot))
+            gate_env_pos_reset = gate_env_pos[env_ids]   # (n, num_gates, 3)
+            gate_env_rot_reset = gate_env_rot[env_ids]   # (n, num_gates, 4)
 
-            # TODO You can comment out lines below for random drone start position
-            # pos_perturbation = self.init_pos_dist.sample(env_ids.shape) - self.init_pos_dist.mean
-            # drone_start_pos = first_gate_pos + offset_world + pos_perturbation  # (len(env_ids), 3)
-            drone_start_pos = first_gate_pos + offset_world  # (len(env_ids), 3)
-            
-            drone_start_pos_with_agent = drone_start_pos.unsqueeze(1)  # (len(env_ids), 1, 3)
-            env_positions_with_agent = self.envs_positions[env_ids].unsqueeze(1)  # (len(env_ids), 1, 3)
+            # Select the start gate per environment
+            batch_local = torch.arange(n, device=self.device)
+            start_gate_pos = gate_env_pos_reset[batch_local, start_gates]  # (n, 3)
+            start_gate_rot = gate_env_rot_reset[batch_local, start_gates]  # (n, 4)
+
+            # Spawn drone 1.5m behind the start gate in gate-local frame
+            offset_local_expanded = self.offset_local.unsqueeze(0).expand(n, -1)  # (n, 3)
+            offset_world = quat_rotate(start_gate_rot, offset_local_expanded)     # (n, 3)
+            drone_start_pos = start_gate_pos + offset_world                        # (n, 3)
+
+            # Store prev_drone_pos for path-projection reward
+            self.prev_drone_pos[env_ids] = drone_start_pos
+
+            drone_start_pos_with_agent = drone_start_pos.unsqueeze(1)             # (n, 1, 3)
+            env_positions_with_agent = self.envs_positions[env_ids].unsqueeze(1)  # (n, 1, 3)
 
             self.drone.set_world_poses(
                 drone_start_pos_with_agent + env_positions_with_agent,
@@ -497,32 +510,38 @@ class DroneRaceEnv(IsaacEnv):
             ) from e
 
         self.drone.set_velocities(
-            torch.zeros(len(env_ids), 1, 6, device=self.device), env_ids
+            torch.zeros(n, 1, 6, device=self.device), env_ids
         )
+        self.drone.set_joint_positions(torch.zeros(n, 1, 4, device=self.device), env_ids)
+        self.drone.set_joint_velocities(torch.zeros(n, 1, 4, device=self.device), env_ids)
 
-        self.drone.set_joint_positions(torch.zeros(len(env_ids), 1, 4, device=self.device), env_ids)
-        self.drone.set_joint_velocities(torch.zeros(len(env_ids), 1, 4, device=self.device), env_ids)
+        # Compute start gate center for prev_distance_to_gate and crossing detection init
+        gate_center_offset_local = torch.tensor([0.0, 0.0, self.gate_height / 2.0], device=self.device)
+        gate_center_offset_local_expanded = gate_center_offset_local.unsqueeze(0).expand(n, -1)
+        gate_center_offset_world = quat_rotate(start_gate_rot, gate_center_offset_local_expanded)
+        start_gate_center = start_gate_pos + gate_center_offset_world
 
-        gate_center_offset_local = torch.tensor(
-            [0.0, 0.0, self.gate_height / 2.0],
-            device=self.device
-        )
-        gate_center_offset_local_expanded = gate_center_offset_local.unsqueeze(0).expand(len(env_ids), -1)
-        gate_center_offset_world = quat_rotate(first_gate_rot, gate_center_offset_local_expanded)
-        first_gate_center = first_gate_pos + gate_center_offset_world
         self.prev_distance_to_gate[env_ids] = torch.norm(
-            first_gate_center - drone_start_pos,
-            dim=-1
+            start_gate_center - drone_start_pos, dim=-1
         )
 
         # Initialise drone position in gate frame for crossing detection
-        drone_to_first_gate_center = drone_start_pos - first_gate_center  # (len(env_ids), 3)
+        drone_to_gate_center = drone_start_pos - start_gate_center
         self.prev_drone_in_gate_frame[env_ids] = quat_rotate_inverse(
-            first_gate_rot, drone_to_first_gate_center
-        )  # (len(env_ids), 3)
+            start_gate_rot, drone_to_gate_center
+        )
 
         self.stats.exclude("success")[env_ids] = 0.
         self.stats["success"][env_ids] = False
+        # New stats — zero on reset
+        self.stats["mean_speed"][env_ids] = 0.
+        self.stats["max_speed"][env_ids] = 0.
+        self.stats["lap_time_steps"][env_ids] = 0.
+        self.stats["reward_progress"][env_ids] = 0.
+        self.stats["reward_gates"][env_ids] = 0.
+        self.stats["reward_penalties"][env_ids] = 0.
+        self.stats["mean_ang_rate"][env_ids] = 0.
+        self.stats["ang_penalty_decay_frac"][env_ids] = 0.
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         '''
@@ -539,6 +558,7 @@ class DroneRaceEnv(IsaacEnv):
 
     def _post_sim_step(self, tensordict: TensorDictBase):
         self.effort = tensordict[("agents", "action")].clone()
+        self.last_action = tensordict[("agents", "action")].clone()
 
     def _build_robot_state(self) -> torch.Tensor:
         """Builds the custom robot state vector used for observations.
@@ -697,13 +717,14 @@ class DroneRaceEnv(IsaacEnv):
         # Build observation
         # All components need to have the agent dimension (middle dimension) to match spec (N, 1, obs_dim)
         obs = [
-            self.drone_state,  # (N, 1, state_dim) - already has agent dimension
-            next_gate_rpos_local,  # (N, 1, 3) - already has agent dimension
+            self.drone_state,  # (N, 1, 15)
+            next_gate_rpos_local,  # (N, 1, 3)
             next_to_next_gate_pos.unsqueeze(1),  # (N, 1, 3)
+            self.last_action,  # (N, 1, 4) — previous action (Swift 2023)
         ]
-        
-        # Concatenate along last dimension: (N, 1, obs_dim)
-        obs = torch.cat(obs, dim=-1)  # (N, 1, obs_dim)
+
+        # Concatenate along last dimension: (N, 1, 25)
+        obs = torch.cat(obs, dim=-1)
 
         return TensorDict(
             {
@@ -875,38 +896,47 @@ class DroneRaceEnv(IsaacEnv):
         # -----------------------------------------------------------------------
         # ----- ADD YOUR REWARD CODE BELOW (replace the placeholder) -----
 
-        # 1. Dense progress: reward improvement in distance toward gate each step.
-        #    Prevents stationary policies; provides dense learning signal.
-        #    (Swift λ1, Environment-as-Policy r_prog)
-        progress = self.prev_distance_to_gate - distance_to_gate  # (N,) positive = closer
-        self.prev_distance_to_gate = distance_to_gate.clone()
+        # 1. Path-projection progress reward (Song et al. 2021).
+        #    Projects the drone's step displacement onto the unit vector from the previous
+        #    gate center to the current target gate center. This is smooth across gate
+        #    transitions (no discontinuity when the target switches) and rewards forward
+        #    movement along the racing line rather than distance to a point.
+        #    Placed AFTER _detect_gate_crossings so self.gate_indices is already updated.
+        prev_gate_indices = (self.gate_indices - 1) % (self.num_gates - 1)  # (N,) — wraps at track
+        prev_gate_pos_env = gate_env_pos[batch_indices, prev_gate_indices]   # (N, 3)
+        prev_gate_rot_env = gate_env_rot[batch_indices, prev_gate_indices]   # (N, 4)
+        prev_gate_center_proj = self._get_gate_center(prev_gate_pos_env, prev_gate_rot_env)  # (N, 3)
+        gate_to_gate_vec = new_gate_center - prev_gate_center_proj           # (N, 3)
+        gate_to_gate_norm = gate_to_gate_vec / (gate_to_gate_vec.norm(dim=-1, keepdim=True) + 1e-6)
+
+        displacement = drone_pos_flat - self.prev_drone_pos                  # (N, 3)
+        progress = (displacement * gate_to_gate_norm).sum(dim=-1)            # (N,)
+        self.prev_drone_pos = drone_pos_flat.clone()
+
         reward = self.reward_progress_scale * progress
 
-        # 2. Velocity-toward-gate: reward speed in direction of target gate.
-        #    Single most effective term for driving high-speed flight.
-        #    (SPIRAL α·Δdt, MonoRace velocity-capped progress)
-        # Note: self.drone.vel = vel_w (world frame), confirmed in multirotor.py:296.
+        # 2. Velocity-toward-gate (scale set to 0.0 in config — kept for easy re-enabling).
         lin_vel_world = self.drone.vel[:, 0, :3]  # (N, 3) linear velocity in world frame
-        gate_dir = new_gate_center - drone_pos_flat  # (N, 3) vector toward current target gate
+        gate_dir = new_gate_center - drone_pos_flat
         gate_dir_norm = gate_dir / (gate_dir.norm(dim=-1, keepdim=True) + 1e-6)
         vel_toward_gate = (lin_vel_world * gate_dir_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
         reward += self.reward_velocity_scale * vel_toward_gate
 
-        # 3. Sparse gate passage bonus. (SPIRAL: Gt component; MonoRace: λgate)
+        # 3. Sparse gate passage bonus.
         reward += self.reward_gate_passage * gate_passed_this_step.float()
 
         # 4. Lap completion bonus.
         reward += self.reward_lap_completion * self.track_completed.float()
 
-        # 5. Angular rate penalty: discourage spinning/tumbling.
-        #    (Agile Flight 2025: -0.15ωroll² - 0.15ωpitch² - 0.05ωyaw²)
+        # 5. Angular rate penalty with linear decay (Song et al.: used only in early training).
+        #    Decays from reward_angular_penalty → 0 over angular_penalty_decay_frames steps.
+        self.total_frames_counter += self.num_envs
+        ang_decay_frac = max(0.0, 1.0 - self.total_frames_counter / self.angular_penalty_decay_frames)
         ang_vel = self.drone.vel[:, 0, 3:]  # (N, 3) angular velocity in world frame
         ang_penalty = ang_vel.pow(2).sum(dim=-1)  # (N,)
-        reward -= self.reward_angular_penalty * ang_penalty
+        reward -= (self.reward_angular_penalty * ang_decay_frac) * ang_penalty
 
-        # 6. Action smoothness: penalize large throttle changes between steps. (Swift: λ5)
-        # throttle_difference is computed inside RotorGroup.apply_action each step as
-        # norm(throttle_t - throttle_{t-1}), shape (N, 1). Already properly reset on episode reset.
+        # 6. Action smoothness penalty.
         action_diff = self.drone.throttle_difference.squeeze(-1)  # (N,)
         reward -= self.reward_action_smooth_scale * action_diff
 
@@ -952,9 +982,30 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["crashed_z_gate"].add_(phys_crash.float().unsqueeze(-1))
         self.stats["crashed_distance"].add_(dist_crash.float().unsqueeze(-1))
         # Uprightness: exponential moving average of the drone's up-vector z-component.
-        # 1.0 = perfectly level, ~0 = horizontal, -1.0 = inverted.
-        # self.drone.up: (N, 1, 3) → [..., 2] gives (N, 1) z-component.
         self.stats["drone_uprightness"].lerp_(self.drone.up[..., 2], 1 - self.alpha)
+
+        # --- extended stats for tuning ---
+        # Speed: running mean and max of linear speed magnitude
+        speed = lin_vel_world.norm(dim=-1)  # (N,)
+        ep_len = self.progress_buf.float().clamp_min(1)  # avoid div-by-zero on step 0
+        # Incremental mean: mean_n = mean_{n-1} + (x - mean_{n-1}) / n
+        self.stats["mean_speed"].add_((speed.unsqueeze(-1) - self.stats["mean_speed"]) / ep_len.unsqueeze(-1))
+        self.stats["max_speed"] = torch.maximum(self.stats["max_speed"], speed.unsqueeze(-1))
+        # Lap time: record step count when lap is first completed
+        just_completed = completed_task & (self.stats["lap_time_steps"].squeeze(-1) == 0)
+        self.stats["lap_time_steps"][just_completed] = self.progress_buf[just_completed].float().unsqueeze(-1)
+        # Reward component breakdown (cumulative)
+        progress_reward = self.reward_progress_scale * progress  # (N,)
+        gate_reward = self.reward_gate_passage * gate_passed_this_step.float()  # (N,)
+        penalty_reward = (self.reward_angular_penalty * ang_decay_frac) * ang_penalty + self.reward_action_smooth_scale * action_diff  # (N,)
+        self.stats["reward_progress"].add_(progress_reward.unsqueeze(-1))
+        self.stats["reward_gates"].add_(gate_reward.unsqueeze(-1))
+        self.stats["reward_penalties"].add_(penalty_reward.unsqueeze(-1))
+        # Angular rate magnitude (incremental mean)
+        ang_rate_mag = ang_vel.norm(dim=-1)  # (N,)
+        self.stats["mean_ang_rate"].add_((ang_rate_mag.unsqueeze(-1) - self.stats["mean_ang_rate"]) / ep_len.unsqueeze(-1))
+        # Angular penalty decay fraction (same scalar for all envs)
+        self.stats["ang_penalty_decay_frac"][:] = ang_decay_frac
 
         return TensorDict(
             {

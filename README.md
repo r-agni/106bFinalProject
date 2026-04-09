@@ -1,132 +1,165 @@
-## Distrobox Setup (OmniDrones)
+# OmniDrones on your PC: Isaac Sim, playback, and recording
 
-This codebase is based on Distrobox, [Docker](https://docs.docker.com/get-started/docker-overview/) and Podman. We abstract away most of their inner workings, but it is recommended to have a preliminary understanding of each of these packages by looking at their official documentations. 
+This guide is for running this repo **on your own Windows machine** with a **local NVIDIA GPU**, using **Isaac Sim** (pip install) and saving **MP4** recordings of the trained hover policy.
 
-### Step 1: Prereqs (host)
+---
 
-- On your personal github accounnt, create a **private** GitHub repository named `EECS106B` (do not fork this repo). On [github.com](https://github.com), click "New repository", name it `EECS106B`, set visibility to **Private**, and create it **without** initializing with a README, .gitignore, or license (leave all unchecked). You must create this empty repo on GitHub first before you can push to it.
-Then clone this repo, point it at your new private remote, and initialize submodules. The git submodule command can take a while:
+## 1. Prerequisites
+
+- **Windows** with an **NVIDIA GPU** and current **Game Ready / Studio** drivers.
+- **Python 3.12** (this project was verified with **Anaconda** base).
+- **Isaac Sim** available to that same Python, e.g. NVIDIA’s **pip** workflow so that:
+
+  ```bash
+  python -c "from isaacsim import SimulationApp; print('ok')"
   ```
-  git clone git@github.com:arplaboratory/EECS106B.git
-  cd EECS106B
-  git remote set-url origin git@github.com:<your-username>/EECS106B.git
-  git push -u origin main
-  git submodule update --init --recursive
-  ```
-  Replace `<your-username>` with your GitHub username. **Keep your repository private.** All development should happen in your private repo.
-- Make sure you can authenticate with GitHub (preferably set up SSH keys).
-- Add these to your host `~/.bashrc` (or `~/.zshrc`) (replace with your paths):
-  ```
-  export OMNI_DRONES_DIR="/path/to/OmniDrones"
-  source "$OMNI_DRONES_DIR/helpers"
-  ```
-  Or run this code to append them to `~/.bashrc`:
-  ```
-  if [[ "$(pwd)" == */EECS106B ]]; then
-    cat <<EOF >> ~/.bashrc
-  export OMNI_DRONES_DIR="$(pwd)"
-  source "\$OMNI_DRONES_DIR/helpers"
-  EOF
-  else
-    echo "ERROR: run this from your OmniDrones repo directory." >&2
-    return 1
-  fi
-  ```
-- Setup [wandb](https://docs.wandb.ai/models/quickstart) to visualize training statistics. Once you have your WANDB_API_KEY, add it to the  `.bashrc` file in the `EEECS106` git folder. Alternatively, run the following command
-  ```
-  cat <<EOF >> "$OMNI_DRONES_DIR/.bashrc"
 
+  runs without errors (first import can take ~20s).
 
-  export WANDB_API_KEY="<your_api_key>"
-  EOF
-  ```
-- Make sure to re-source using `source ~/.bashrc`
+If `import isaacsim` fails, install or repair Isaac Sim using [NVIDIA Isaac Sim documentation](https://docs.isaacsim.omniverse.nvidia.com/) for your version before continuing.
 
-### Step 2: Create the distrobox
+### Local Isaac Sim path (pip install on this machine)
 
-Run the helper function:
+With **Isaac Sim 6.x installed via pip** into **Anaconda**, the Python package and Kit runtime live under **`site-packages`**, not under Omniverse Launcher’s `%LOCALAPPDATA%\ov\pkg\...` tree.
 
-```
-distrobox_create
+| What | Path on this PC |
+|------|-----------------|
+| **`isaacsim` Python package** | `C:\Users\agni_\anaconda3\Lib\site-packages\isaacsim` |
+| **Kit / binaries / exts** (typical) | `C:\Users\agni_\anaconda3\Lib\site-packages\isaacsim\kit` |
+
+To **print the folder for whatever `python` you use**:
+
+```bash
+python -c "import isaacsim, os; print(os.path.dirname(isaacsim.__file__))"
 ```
 
-This can take a while on first run (>= 30 minutes). If prompted to download an image from `docker.io`, answer "yes".
-This pulls the `omnidrones:eecs` image (built from the Dockerfile) and creates the container with GPU/Vulkan passthrough. It also:
+To see pip metadata (version, declared `Location`):
 
-- Mounts your repo into `/workspace/omni_drones`
-- Mounts a persistent venv from `"$OMNI_DRONES_DIR/.venv"` to `/opt/venv`
-- Sets `HOME=/workspace/omni_drones` so the repo’s `.bashrc` is used inside the container
-
-### Step 3: Enter the distrobox
-
-```
-distrobox_enter
+```bash
+pip show isaacsim
 ```
 
-This will move you inside the distrobox container. 
+If you use another conda env or venv, run those commands **after** `conda activate ...` so the path matches that environment.
 
-The first time you enter, you will need to install the required packages. Run
+---
 
-```
-omni_drones_install
-```
+## 2. Install this package (editable)
 
-to install the packages. **Note:** Expect some red warnings related to pip not respecting dependencies. This is expected, however you should not see any other errors.
+From the **repository root** (folder that contains `setup.py` and `omni_drones/`):
 
-#### What happens on entry (from repo `.bashrc`)
-
-When you enter, `distrobox_enter` runs `bash -i`, which reads the repo’s `.bashrc`
-because `HOME` is set to `/workspace/omni_drones`. That script:
-
-- Exports `OMNI_DRONES_DIR` and `ISAACSIM_PATH`
-- Sources `"$ISAACSIM_PATH/setup_conda_env.sh"`
-- Activates `/opt/venv` if it exists, or creates it if missing
-- Checks whether the required packages are installed and prints a reminder if not
-
-#### Technical background (for people who care)
-
-- The venv is **bind-mounted** from the host directory at `"$OMNI_DRONES_DIR/.venv"`
-into `/opt/venv` inside the container, so any pip installs persist across sessions.
-- Because `HOME` points at `/workspace/omni_drones`, the repo’s `.bashrc` becomes the
-interactive shell config used on container entry.
-
-### Step 4: Train a hover policy
-
-Let's train a simple drone hover controller using the task defined in `cfg/task/Hover.yaml`. This will train a policy that outputs thrust and bodyrate commands to hover in a static position. The number of envs are specified in the yaml file's `num_envs` argument. The environment observation space, and rewards are defined in `EECS106B/omni_drones/envs/single/hover.py`. Make sure you understand these two files, since you will have to create similar files for a drone racing task.
-
-The `drone_model["controller"]` field in `cfg/task/Hover.yaml`, specifies the controller type and therefore the action space of the policy. `RateController` is a body rate controller, so the drone accepts thrust and body rates commands. Therefore the policy will output 4 values. 
-
-Inside distrobox,
-
-```
-cd /workspace/omni_drones/scripts
-python train.py algo=ppo headless=true
+```bash
+cd c:/Users/agni_/Documents/106bFinalProject
+pip install -e .
 ```
 
-If you haven't setup wandb, run `python train.py algo=ppo headless=true wandb.mode=disabled` instead. If you see PPO training logs (e.g., average reward metrics), your setup is working.
+That pulls dependencies from `setup.py` (Hydra, TorchRL, wandb, imageio, etc.).
 
-After training is complete, visualize the results. You should see the drone reach the goal state. 
+### Broken editable install (`egg-link` pointing at WSL or old path)
 
+If `pip install -e .` fails with a missing path (often a `\\wsl.localhost\...` or old clone location), remove the stale link in your environment’s `site-packages`:
+
+- Delete **`omni-drones.egg-link`** (name may vary) under  
+  `C:\Users\<you>\anaconda3\Lib\site-packages\`  
+  then run `pip install -e .` again from this repo.
+
+---
+
+## 3. Checkpoint
+
+Put your trained policy next to the repo or pass an absolute path:
+
+- Example: `c:/Users/agni_/Documents/106bFinalProject/checkpoint_final.pt`  
+- This must be a **PPO `state_dict`** saved the same way as `scripts/train.py` (e.g. `checkpoint_final.pt`).
+
+Playback uses the **Hover** task and **ppo** config unless you override Hydra (`task=...`, `algo=...`). If you trained with extra overrides, use the **same** overrides for `play.py`.
+
+---
+
+## 4. Run policy in Isaac Sim (no video file)
+
+`play.py` uses Hydra with [`scripts/train.yaml`](scripts/train.yaml). Defaults include **`headless: true`** and a large `total_frames` from the task YAML—override them for a short demo.
+
+```bash
+cd c:/Users/agni_/Documents/106bFinalProject/scripts
+python play.py headless=true task.env.num_envs=1 total_frames=2048 ^
+  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/checkpoint_final.pt ^
+  wandb.mode=disabled
 ```
-python play.py task.env.num_envs=1 algo.checkpoint_path=</tmp/wandb/run--runid/files/checkpoint_final.pt>
+
+(Bash: use `\` line continuations instead of `^`.)
+
+- **`task.env.num_envs=1`**: one drone, easier to watch or record.
+- **`play_exploration`**: defaults to **`MODE`** (mean / mode action—stable hover). Use `play_exploration=RANDOM` only if you want deliberate noise.
+
+---
+
+## 5. Record an MP4 on disk
+
+Recording needs a **viewport** and **Omniverse Replicator** RGB. With **`record_video=true`**, `play.py` sets **`sim.enable_replicator=True`** and forces **`headless=false`**.
+
+```bash
+cd c:/Users/agni_/Documents/106bFinalProject/scripts
+python play.py record_video=true task.env.num_envs=1 total_frames=2048 ^
+  record_video_max_steps=800 video_frame_interval=2 ^
+  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/checkpoint_final.pt ^
+  wandb.mode=disabled ^
+  video_path=c:/Users/agni_/Documents/106bFinalProject/hover_playback.mp4
 ```
 
-If you haven't configured wandb, the checkpoint files will be saved in  `/tmp/wandb/`.
+| Override | Meaning |
+|----------|---------|
+| `video_path` | Output file (use an **absolute** path if you do not want it under Hydra’s run directory). |
+| `record_video_max_steps` | Length of the **extra** rollout used only for frames (after the main collector loop). |
+| `video_frame_interval` | Save one frame every **N** env steps during that rollout. |
+| `video_fps` | Encoder FPS (default **30** in [`scripts/train.yaml`](scripts/train.yaml)). |
 
-### Step 5: Racing environment
+Defaults for these live in [`scripts/train.yaml`](scripts/train.yaml) (`record_video`, `video_path`, `play_exploration`, etc.).
 
-The racing environment is defined in `envs/drone_race/drone_race.py`. We provide the user with code for extracting the relevant observations. You must design the reward function in `_compute_reward_and_done`. The environment configuration in defined in `cfg/task/DroneRace.yaml` and the ppo parameters are in `cfg/algo/DroneRace.yaml`. Feel free to change any other parts of the pipeline, this is simply a good starting point. 
+**Where is the video?** Exactly where you set `video_path`—e.g. repo root `hover_playback.mp4`. If MP4 encoding fails, the code may fall back to a **GIF** with the same base name.
 
-**What you should not change:** Drone dynamics including the drone's physical parameters and constraints. Gate design and gate locations.
+**Time:** First launch loads Kit and extensions; a full run can take **many minutes** (simulation + encoding).
 
-### How to stop and remove the container
+### Helper scripts (same idea, fixed paths)
 
-You can run `exit` inside a distrobox container to exit the container. This will bring you back into the host system's bash.
+- [`scripts/run_hover_playback.bat`](scripts/run_hover_playback.bat)  
+- [`scripts/run_hover_playback.ps1`](scripts/run_hover_playback.ps1)  
 
-If you'd like to end the container (in case you want to reset the container, etc), run 
+They assume `checkpoint_final.pt` at the **repo root** and write **`hover_playback.mp4`** there.
 
+---
+
+## 6. Hydra output directory
+
+[`scripts/train.yaml`](scripts/train.yaml) sets:
+
+```yaml
+hydra.run.dir: .hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
 ```
-distrobox_end
-```
 
-from the host environment to stop and remove the distrobox container.
+Logs and Hydra artifacts go under **`scripts/.hydra_outputs/...`** when you run from `scripts/`. This avoids Linux-only `/workspace/...` paths.
+
+---
+
+## 7. What you see in the Hover scene
+
+- **Two drone-shaped meshes:** The second is a **static target marker** at the goal pose (same USD as the robot, **no collision**, **no gravity**). Only one is the controlled agent. See [`omni_drones/envs/single/hover.py`](omni_drones/envs/single/hover.py) (`target_vis_prim`).
+- **Aggressive motion after resets:** Each episode the drone is **respawned randomly** in a large box (`init_pos_dist` in the same file), so it may **move hard** to rejoin the target—that is training-style randomization, not a “hold still forever” spawn.
+
+---
+
+## 8. Optional: screen recording instead of Replicator
+
+If `record_video` or Replicator causes issues, run with **`headless=false`** and **`record_video=false`**, then capture the Isaac Sim window with **OBS Studio** or **Win+G (Game Bar)**.
+
+---
+
+## 9. Repo changes relevant to Isaac Sim 6 (pip)
+
+This codebase was adjusted for **Isaac Sim 6.x** style APIs, for example:
+
+- Removed deprecated **`isaacsim.core.utils.nucleus`** usage in [`omni_drones/utils/kit.py`](omni_drones/utils/kit.py).
+- **`ArticulationView.initialize`** delegates to the upstream Isaac implementation using **`SimulationManager`** ([`omni_drones/views/__init__.py`](omni_drones/views/__init__.py)).
+- **`IsaacEnv.render`** accepts Replicator **`get_data()`** returning a **NumPy array** ([`omni_drones/envs/isaac_env.py`](omni_drones/envs/isaac_env.py)).
+
+If you use an older Isaac layout, you may need a branch or version matched to your install.
+

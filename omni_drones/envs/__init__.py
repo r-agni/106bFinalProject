@@ -37,7 +37,7 @@ from .isaac_env import IsaacEnv
 
 try:
     from .single import Forest, Pinball, DepthNav
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     print(
         "To run the environments which use `ContactSensor` and `RayCaster`,"
         "please install Isaac Lab (https://github.com/isaac-sim/IsaacLab)."

@@ -138,7 +138,8 @@ reward_lap_completion: 50.0       # bonus for completing full lap
 reward_angular_penalty: 0.03      # penalize squared angular rates (decays to 0 over 50M frames)
 reward_action_smooth_scale: 0.03  # penalize large action changes
 reward_crash_scale: 40.0          # terminal crash penalty — must dominate expected episode return (~40 dense reward over 100 steps)
-crash_dist_threshold: 5.5         # ~0.8x gate spacing (7.07m) — kills off-track episodes quickly without being too tight
+reward_speed_scale: 0.05          # speed along gate-to-gate racing line (clamped ≥0; rewards fast forward flight)
+crash_dist_threshold: 8.0         # > gate spacing (7.07m) + margin; grace period handles post-crossing false alarms
 crash_z_min: 0.15                 # minimum altitude (ground crash)
 # ---------------------------------------------------------------------------
 

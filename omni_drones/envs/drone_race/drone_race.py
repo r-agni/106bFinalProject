@@ -53,8 +53,13 @@ class DroneRaceEnv(IsaacEnv):
 
     ## Observation
 
-    - `drone_state`: The basic information of the drone returned by `MultirotorSimple.get_state`.
+    - `drone_state` (15): Custom state vector `[lin_vel(3) | rot_mat_flat(9) | ang_vel(3)]`. Note that
+      position is **not** included.
     - `next_gate_rpos` (3): The relative position of the next gate to the drone in the drone's local frame.
+    - `next_to_next_gate_pos` (3): The position of the gate after the immediate next gate, expressed in
+      the next gate's local frame. Clamped at the last gate (no wrap-around).
+    - `next_gate_rot_mat_2col` (6): The first two columns of the next gate's rotation matrix in the world frame
+      (i.e. the gate's local x- and y-axes expressed in world coordinates), flattened to a 6-vector.
 
     ## Reward  *(student implementation required)*
 
@@ -102,6 +107,7 @@ class DroneRaceEnv(IsaacEnv):
         self.reward_angular_penalty     = cfg.task.get("reward_angular_penalty", 0.1)
         self.reward_action_smooth_scale = cfg.task.get("reward_action_smooth_scale", 0.1)
         self.reward_crash_scale         = cfg.task.get("reward_crash_scale", 10.0)
+        self.reward_speed_scale         = cfg.task.get("reward_speed_scale", 0.0)
         self.crash_dist_threshold       = cfg.task.get("crash_dist_threshold", 10.0)
         self.crash_z_min                = cfg.task.get("crash_z_min", 0.15)
 
@@ -173,6 +179,8 @@ class DroneRaceEnv(IsaacEnv):
         self.prev_drone_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.total_frames_counter = 0
         self.angular_penalty_decay_frames = 50_000_000  # decay angular penalty to 0 over first 50M frames
+        self.gate_just_passed_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.crash_grace_steps = 15  # steps after gate crossing before dist_crash re-enables
 
         # Use a single view with wildcard pattern to access all gates
         try:
@@ -387,8 +395,9 @@ class DroneRaceEnv(IsaacEnv):
     def _set_specs(self):
         # Custom robot state: linear_vel(3) + rotation_matrix_flat(9) + angular_vel(3) = 15
         robot_state_dim = 3 + 9 + 3  # 15
-        # Observation: robot_state(15) + next_gate_rpos_local(3) + next_to_next_gate_pos(3) + prev_action(4)
-        observation_dim = robot_state_dim + 3 + 3 + self.drone.action_spec.shape[-1]  # 25
+        # Observation: robot_state(15) + next_gate_rpos_local(3) + next_to_next_gate_pos(3)
+        #              + next_gate_rot_mat_2col(6)
+        observation_dim = robot_state_dim + 3 + 3 + 6  # 27
         self.observation_spec = Composite({
             "agents": {
                 "observation": Unbounded((1, observation_dim), device=self.device),
@@ -461,6 +470,7 @@ class DroneRaceEnv(IsaacEnv):
         self.track_completed[env_ids] = False
         self.last_action[env_ids] = 0.0
         self.effort[env_ids] = 0.0
+        self.gate_just_passed_steps[env_ids] = 0
 
         # Reset gate velocities to prevent drift
         gate_velocities = torch.zeros(n, self.num_gates, 6, device=self.device)
@@ -714,16 +724,26 @@ class DroneRaceEnv(IsaacEnv):
         gate_progress = self.gate_indices.float() / self.num_gates  # (N,)
         gate_progress = torch.where(track_completed, torch.ones_like(gate_progress), gate_progress)
         
+        # Next gate orientation: first 2 columns of its rotation matrix in world frame.
+        # Encodes the gate's local x- and y-axes in world coordinates (6-vector).
+        # Avoids quaternion discontinuities and gives the policy an explicit sense of gate facing.
+        next_gate_rot_flat = next_gate_rot.squeeze(1)  # (N, 4)
+        e_x = torch.tensor([1., 0., 0.], device=self.device).unsqueeze(0).expand(self.num_envs, -1)  # (N, 3)
+        e_y = torch.tensor([0., 1., 0.], device=self.device).unsqueeze(0).expand(self.num_envs, -1)  # (N, 3)
+        gate_col0 = quat_rotate(next_gate_rot_flat, e_x)  # (N, 3) — gate x-axis in world frame
+        gate_col1 = quat_rotate(next_gate_rot_flat, e_y)  # (N, 3) — gate y-axis in world frame
+        next_gate_rot_mat_2col = torch.cat([gate_col0, gate_col1], dim=-1).unsqueeze(1)  # (N, 1, 6)
+
         # Build observation
         # All components need to have the agent dimension (middle dimension) to match spec (N, 1, obs_dim)
         obs = [
-            self.drone_state,  # (N, 1, 15)
-            next_gate_rpos_local,  # (N, 1, 3)
+            self.drone_state,           # (N, 1, 15)
+            next_gate_rpos_local,       # (N, 1, 3)
             next_to_next_gate_pos.unsqueeze(1),  # (N, 1, 3)
-            self.last_action,  # (N, 1, 4) — previous action (Swift 2023)
+            next_gate_rot_mat_2col,     # (N, 1, 6)
         ]
 
-        # Concatenate along last dimension: (N, 1, 25)
+        # Concatenate along last dimension: (N, 1, 27)
         obs = torch.cat(obs, dim=-1)
 
         return TensorDict(
@@ -870,6 +890,13 @@ class DroneRaceEnv(IsaacEnv):
             gate_env_pos, gate_env_rot, batch_indices,
         )
 
+        # Grace period after gate crossing: reset counter for envs that just advanced,
+        # then decrement all. Dist-crash is disabled during the grace window so the drone
+        # isn't immediately killed when the target gate jumps to the next gate (7.07m away).
+        self.gate_just_passed_steps[gate_index_changed] = self.crash_grace_steps
+        self.gate_just_passed_steps = (self.gate_just_passed_steps - 1).clamp(min=0)
+        in_grace = self.gate_just_passed_steps > 0
+
         # -----------------------------------------------------------------------
         # STUDENT TODO (2/3): Implement your reward function.
         #
@@ -882,7 +909,7 @@ class DroneRaceEnv(IsaacEnv):
         #   gate_index_changed    (N,)      bool – True when target gate index advanced
         #   new_gate_center       (N, 3)    centre of the (possibly new) target gate
         #   crashed_collision     (N,)      bool – True when contact forces are detected
-        #   self.drone.vel        (N, 1, 6) [lin_vel(3) | ang_vel(3)] in body frame
+        #   self.drone.vel        (N, 1, 6) [lin_vel(3) | ang_vel(3)] in world frame
         #   self.gate_indices     (N,)      index of current target gate (0…num_gates-1)
         #   self.track_completed  (N,)      bool – True when the full lap is done
         #
@@ -915,8 +942,15 @@ class DroneRaceEnv(IsaacEnv):
 
         reward = self.reward_progress_scale * progress
 
-        # 2. Velocity-toward-gate (scale set to 0.0 in config — kept for easy re-enabling).
+        # 2. Speed-along-racing-line reward (replaces disabled velocity-toward-gate term).
+        #    Projects current velocity onto the gate-to-gate unit vector — same direction used
+        #    for progress reward. Clamped to ≥0 so only forward speed is rewarded, preventing
+        #    the policy from gaming it by flying backward.
         lin_vel_world = self.drone.vel[:, 0, :3]  # (N, 3) linear velocity in world frame
+        speed_along_racing_line = (lin_vel_world * gate_to_gate_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
+        reward += self.reward_speed_scale * speed_along_racing_line
+
+        # (velocity-toward-gate kept at 0.0; superseded by speed_along_racing_line above)
         gate_dir = new_gate_center - drone_pos_flat
         gate_dir_norm = gate_dir / (gate_dir.norm(dim=-1, keepdim=True) + 1e-6)
         vel_toward_gate = (lin_vel_world * gate_dir_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
@@ -957,8 +991,9 @@ class DroneRaceEnv(IsaacEnv):
         ground_crash = drone_pos_flat[:, 2] < self.crash_z_min  # (N,)
 
         # Out-of-bounds: drone is too far from its target gate (lost / diverged).
-        # (Environment-as-Policy: prevents wasted episode time)
-        dist_crash = distance_to_gate > self.crash_dist_threshold  # (N,)
+        # Grace period suppresses this check for crash_grace_steps steps after a gate crossing,
+        # preventing false terminations when the target gate index just advanced (~7m away).
+        dist_crash = (distance_to_gate > self.crash_dist_threshold) & (~in_grace)  # (N,)
 
         crashed = phys_crash | ground_crash | dist_crash
 

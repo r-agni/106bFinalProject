@@ -178,9 +178,9 @@ class DroneRaceEnv(IsaacEnv):
         self.effort = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device)
         self.prev_drone_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.total_frames_counter = 0
-        self.angular_penalty_decay_frames = 50_000_000  # decay angular penalty to 0 over first 50M frames
+        self.angular_penalty_decay_frames = 5_000_000   # decay angular penalty to 0 over first 5M frames (was 50M — unlock fast flight sooner)
         self.gate_just_passed_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.crash_grace_steps = 15  # steps after gate crossing before dist_crash re-enables
+        self.crash_grace_steps = 30  # steps after gate crossing before dist_crash re-enables (was 15 — more reorientation time)
 
         # Use a single view with wildcard pattern to access all gates
         try:
@@ -457,12 +457,16 @@ class DroneRaceEnv(IsaacEnv):
 
         n = len(env_ids)
 
-        # --- Distributed initialization (Song et al. 2021) ---
-        # 30% start at gate 0, 70% start at a random gate [0, num_gates-2].
+        # --- Curriculum distributed initialization ---
+        # First 10M frames: always start at gate 0 so the policy learns gate crossing before generalizing.
+        # After 10M frames: 30% gate 0, 70% random gate [0, num_gates-2] (Song et al. 2021).
         # Gate num_gates-1 is excluded because it duplicates gate 0 (lap close).
-        always_gate0 = torch.rand(n, device=self.device) < 0.30
-        random_gates = torch.randint(0, self.num_gates - 1, (n,), device=self.device)
-        start_gates = torch.where(always_gate0, torch.zeros(n, device=self.device, dtype=torch.long), random_gates)
+        if self.total_frames_counter < 10_000_000:
+            start_gates = torch.zeros(n, device=self.device, dtype=torch.long)
+        else:
+            always_gate0 = torch.rand(n, device=self.device) < 0.30
+            random_gates = torch.randint(0, self.num_gates - 1, (n,), device=self.device)
+            start_gates = torch.where(always_gate0, torch.zeros(n, dtype=torch.long, device=self.device), random_gates)
 
         # Reset gate progress
         self.gate_indices[env_ids] = start_gates

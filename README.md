@@ -1,6 +1,78 @@
-# OmniDrones on your PC: Isaac Sim, playback, and recording
+# OmniDrones on your PC: Drone Racing RL Training and Playback
 
-This guide is for running this repo **on your own Windows machine** with a **local NVIDIA GPU**, using **Isaac Sim** (pip install) and saving **MP4** recordings of the trained hover policy.
+This guide covers **training** a drone racing policy from scratch and **playing back** a trained checkpoint, on a Windows machine with a local NVIDIA GPU.
+
+---
+
+## Training the Drone Racing Policy
+
+### Quick start
+
+```bash
+cd c:/Users/agni_/Documents/106bFinalProject/scripts
+python train.py task=DroneRace wandb.mode=disabled
+```
+
+This uses all defaults from `cfg/task/DroneRace.yaml` and `cfg/algo/DroneRace.yaml`:
+- **500 parallel environments**, 100 Hz policy rate
+- **400 million frames** total (`total_frames: 400_000_000`)
+- Checkpoints saved every 100 rollouts (~6.4 M frames) under the W&B run directory
+- Expected wall-clock time: **~6–8 hours** on a modern GPU (RTX 3090/4090 class)
+
+> **Why 400 M frames?** A pilot run at 200 M frames showed the policy still improving with no lap completions. The drone needs roughly:
+> - **0–10 M frames** to learn basic gate-crossing (curriculum phase)
+> - **10–50 M frames** to chain gates reliably
+> - **50–150 M frames** to push speed and reduce crashes
+> - **150–400 M frames** to optimise lap times and achieve consistent completions
+>
+> Running fewer than ~300 M frames will likely produce a drone that navigates toward gates but rarely completes a full lap.
+
+### With W&B logging (recommended)
+
+Set your W&B credentials in `.env` at the repo root:
+
+```bash
+WANDB_API_KEY=<your_key>
+WANDB_PROJECT=droneRacing
+```
+
+Then train:
+
+```bash
+cd c:/Users/agni_/Documents/106bFinalProject/scripts
+python train.py task=DroneRace
+```
+
+Key metrics to watch during training:
+| Metric | Healthy sign |
+|--------|-------------|
+| `reward/gates_cumul` | Must be > 0 by 5 M frames |
+| `crash/distance_rate` | Should not spike above 50% |
+| `race/gates_passed_per_ep` | > 2.0 by 50 M frames |
+| `race/mean_speed_ms` | > 4.0 m/s by 100 M frames |
+| `race/lap_completion_rate` | > 0 by 150 M frames |
+
+If `reward/gates_cumul` is still 0 at 5 M frames, something is wrong with gate detection — stop and debug before continuing.
+
+### Resume a stopped run
+
+```bash
+cd c:/Users/agni_/Documents/106bFinalProject/scripts
+python train.py task=DroneRace \
+  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/wandb/run-<id>/files/checkpoint_<frames>.pt
+```
+
+### Faster experiment (reduced environments, fewer frames)
+
+For a quick sanity check that training is working (not expected to produce a racing policy):
+
+```bash
+cd c:/Users/agni_/Documents/106bFinalProject/scripts
+python train.py task=DroneRace \
+  task.env.num_envs=100 \
+  total_frames=50_000_000 \
+  wandb.mode=disabled
+```
 
 ---
 
@@ -66,65 +138,64 @@ If `pip install -e .` fails with a missing path (often a `\\wsl.localhost\...` o
 
 ## 3. Checkpoint
 
-Put your trained policy next to the repo or pass an absolute path:
+After training, your checkpoint will be at:
 
-- Example: `c:/Users/agni_/Documents/106bFinalProject/checkpoint_final.pt`  
-- This must be a **PPO `state_dict`** saved the same way as `scripts/train.py` (e.g. `checkpoint_final.pt`).
+```
+wandb/run-<date>_<time>-<run_id>/files/checkpoint_final.pt
+```
 
-Playback uses the **Hover** task and **ppo** config unless you override Hydra (`task=...`, `algo=...`). If you trained with extra overrides, use the **same** overrides for `play.py`.
+or at intermediate saves:
+
+```
+wandb/run-<date>_<time>-<run_id>/files/checkpoint_<frames>.pt
+```
+
+A well-trained checkpoint requires at least **~300 M frames** of `DroneRace` training before you can expect to see lap completions. The final checkpoint from a 400 M frame run is recommended.
 
 ---
 
 ## 4. Run policy in Isaac Sim (no video file)
 
-`play.py` uses Hydra with [`scripts/train.yaml`](scripts/train.yaml). Defaults include **`headless: true`** and a large `total_frames` from the task YAML—override them for a short demo.
+`play.py` uses Hydra with [`scripts/train.yaml`](scripts/train.yaml). Use `task=DroneRace` to match the training task.
 
 ```bash
 cd c:/Users/agni_/Documents/106bFinalProject/scripts
-python play.py headless=true task.env.num_envs=1 total_frames=2048 ^
-  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/checkpoint_final.pt ^
+python play.py task=DroneRace headless=false task.env.num_envs=1 \
+  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/wandb/run-<id>/files/checkpoint_final.pt \
   wandb.mode=disabled
 ```
 
-(Bash: use `\` line continuations instead of `^`.)
-
-- **`task.env.num_envs=1`**: one drone, easier to watch or record.
-- **`play_exploration`**: defaults to **`MODE`** (mean / mode action—stable hover). Use `play_exploration=RANDOM` only if you want deliberate noise.
+- **`task.env.num_envs=1`**: single drone — easier to observe the racing behaviour.
+- **`headless=false`**: opens the Isaac Sim viewport so you can watch the drone fly.
+- **`play_exploration=MODE`** (default): uses the deterministic mean action — the cleanest racing behaviour.
 
 ---
 
-## 5. Record an MP4 on disk
+## 5. Record an MP4 of a race
 
-Recording needs a **viewport** and **Omniverse Replicator** RGB. With **`record_video=true`**, `play.py` sets **`sim.enable_replicator=True`** and forces **`headless=false`**.
+Recording needs a **viewport** and **Omniverse Replicator** RGB. With **`record_video=true`**, `play.py` forces **`headless=false`**.
 
 ```bash
 cd c:/Users/agni_/Documents/106bFinalProject/scripts
-python play.py record_video=true task.env.num_envs=1 total_frames=2048 ^
-  record_video_max_steps=800 video_frame_interval=2 ^
-  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/checkpoint_final.pt ^
-  wandb.mode=disabled ^
-  video_path=c:/Users/agni_/Documents/106bFinalProject/hover_playback.mp4
+python play.py task=DroneRace record_video=true task.env.num_envs=1 \
+  record_video_max_steps=3000 video_frame_interval=2 \
+  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/wandb/run-<id>/files/checkpoint_final.pt \
+  wandb.mode=disabled \
+  video_path=c:/Users/agni_/Documents/106bFinalProject/race_playback.mp4
 ```
+
+`record_video_max_steps=3000` captures about 30 seconds at 100 Hz — enough to show several gate crossings and at least one full lap from a well-trained policy.
 
 | Override | Meaning |
 |----------|---------|
-| `video_path` | Output file (use an **absolute** path if you do not want it under Hydra’s run directory). |
-| `record_video_max_steps` | Length of the **extra** rollout used only for frames (after the main collector loop). |
-| `video_frame_interval` | Save one frame every **N** env steps during that rollout. |
+| `video_path` | Output file — use an **absolute** path. |
+| `record_video_max_steps` | Steps in the recording rollout. 3000 ≈ 30 s at 100 Hz. |
+| `video_frame_interval` | Save one frame every **N** env steps (2 = 50 fps output). |
 | `video_fps` | Encoder FPS (default **30** in [`scripts/train.yaml`](scripts/train.yaml)). |
 
-Defaults for these live in [`scripts/train.yaml`](scripts/train.yaml) (`record_video`, `video_path`, `play_exploration`, etc.).
+**Where is the video?** Exactly where you set `video_path`. If MP4 encoding fails the code may fall back to a **GIF** with the same base name.
 
-**Where is the video?** Exactly where you set `video_path`—e.g. repo root `hover_playback.mp4`. If MP4 encoding fails, the code may fall back to a **GIF** with the same base name.
-
-**Time:** First launch loads Kit and extensions; a full run can take **many minutes** (simulation + encoding).
-
-### Helper scripts (same idea, fixed paths)
-
-- [`scripts/run_hover_playback.bat`](scripts/run_hover_playback.bat)  
-- [`scripts/run_hover_playback.ps1`](scripts/run_hover_playback.ps1)  
-
-They assume `checkpoint_final.pt` at the **repo root** and write **`hover_playback.mp4`** there.
+**Time:** First launch loads Kit and extensions — allow several minutes before the drone appears.
 
 ---
 
@@ -140,10 +211,11 @@ Logs and Hydra artifacts go under **`scripts/.hydra_outputs/...`** when you run 
 
 ---
 
-## 7. What you see in the Hover scene
+## 7. What you see in the DroneRace scene
 
-- **Two drone-shaped meshes:** The second is a **static target marker** at the goal pose (same USD as the robot, **no collision**, **no gravity**). Only one is the controlled agent. See [`omni_drones/envs/single/hover.py`](omni_drones/envs/single/hover.py) (`target_vis_prim`).
-- **Aggressive motion after resets:** Each episode the drone is **respawned randomly** in a large box (`init_pos_dist` in the same file), so it may **move hard** to rejoin the target—that is training-style randomization, not a “hold still forever” spawn.
+- **One Iris quadrotor** flying a four-gate diamond circuit. Gates are 2.5 m × 2.5 m at 1 m altitude, spaced 7.07 m apart with 90° turn angles between them.
+- **Episode resets:** The drone spawns 1.5 m behind gate 0 (during bootstrap) or behind a random gate (after 10 M frames). After each episode end the drone snaps back to its start position — this is normal.
+- **A well-trained policy** (300 M+ frames) should visibly bank through corners, maintain ~4–6 m/s, and complete full laps. An undertrained policy may hover near a gate or crash frequently.
 
 ---
 

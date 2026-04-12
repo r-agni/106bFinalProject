@@ -21,7 +21,7 @@ drone_model:
   name: Iris
   controller: RateController
 
-total_frames: 200_000_000
+total_frames: 400_000_000
 save_interval: 100 
 # seed: 0
 
@@ -131,14 +131,14 @@ gate_height: 2.5
 gate_width: 2.5 
 
 # ---- Reward hyperparameters (MonoRace/Swift/SPIRAL-inspired, 2025 SotA) ----
-reward_progress_scale: 4.0        # dense: path-projection progress along racing line (Song et al. 2021)
+reward_progress_scale: 5.0        # dense: path-projection progress along racing line (Song et al. 2021)
 reward_velocity_scale: 0.0        # velocity toward gate — disabled (conflicts with corner-cutting; not used in Swift/Song/Wang)
-reward_gate_passage: 15.0         # sparse bonus per gate passed
+reward_gate_passage: 20.0         # sparse bonus per gate passed
 reward_lap_completion: 50.0       # bonus for completing full lap
 reward_angular_penalty: 0.03      # penalize squared angular rates (decays to 0 over 50M frames)
-reward_action_smooth_scale: 0.03  # penalize large action changes
-reward_crash_scale: 40.0          # terminal crash penalty — must dominate expected episode return (~40 dense reward over 100 steps)
-reward_speed_scale: 0.05          # speed along gate-to-gate racing line (clamped ≥0; rewards fast forward flight)
+reward_action_smooth_scale: 0.005  # penalize large action changes (weakened from 0.03 — was suppressing aggressive throttle)
+reward_crash_scale: 60.0          # terminal crash penalty — must dominate expected episode return (scaled up with higher progress/speed rewards)
+reward_speed_scale: 0.2           # speed along gate-to-gate racing line (clamped ≥0; rewards fast forward flight)
 crash_dist_threshold: 8.0         # > gate spacing (7.07m) + margin; grace period handles post-crossing false alarms
 crash_z_min: 0.15                 # minimum altitude (ground crash)
 # ---------------------------------------------------------------------------

@@ -14,8 +14,6 @@ max_grad_norm: 5.0
 priv_actor: false
 priv_critic: false
 
-checkpoint_path:
-
 actor:
   # 2-layer 256-unit network with LeakyReLU (slope 0.2) — proven in Swift (Nature 2023).
   # Agile Flight 2025 used [512,512,256,128] ELU but Swift's 2x128 also champion-level.

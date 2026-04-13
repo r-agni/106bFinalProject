@@ -5,6 +5,13 @@ defaults:
   - /base/env_base@_here_
   - /base/sim_base@_here_
 
+# Viewer camera aimed at the center of the square track.
+# Gates: (0,0,1), (5,5,1), (10,0,1), (5,-5,1) → center ≈ (5, 0, 1).
+viewer:
+  resolution: [960, 720]
+  eye: [5.0, -18.0, 16.0]
+  lookat: [5.0, 0.0, 1.0]
+
 # Task-specific PPO overrides. Points to a file in cfg/algo/ that is merged
 # over the default ppo.yaml when this task is loaded.
 ppo_cfg: DroneRace.yaml
@@ -143,5 +150,6 @@ crash_dist_threshold: 8.0         # > gate spacing (7.07m) + margin; grace perio
 crash_z_min: 0.15                 # minimum altitude (ground crash)
 # ---------------------------------------------------------------------------
 
+# If gates are hard to see, set debug_gate_origins: true for thick RGB axes at each gate.
 debug_gate_origins: false
 debug_axis_length: 0.5

@@ -5,20 +5,20 @@ defaults:
   - /base/env_base@_here_
   - /base/sim_base@_here_
 
-# Viewer camera aimed at the center of the square track.
-# Gates: (0,0,1), (5,5,1), (10,0,1), (5,-5,1) → center ≈ (5, 0, 1).
+# Viewer camera aimed at the center of the race track.
+# Track spans X: 2.5–20.5, Y: 2–30 → center ≈ (11.5, 16, 1.5).
 viewer:
   resolution: [960, 720]
-  eye: [5.0, -18.0, 16.0]
-  lookat: [5.0, 0.0, 1.0]
+  eye: [11.5, -5.0, 30.0]
+  lookat: [11.5, 16.0, 1.5]
 
 # Task-specific PPO overrides. Points to a file in cfg/algo/ that is merged
 # over the default ppo.yaml when this task is loaded.
 ppo_cfg: DroneRace.yaml
 
 env:
-  num_envs: 500            # <-- EDIT: number of parallel environments
-  max_episode_length: 1000 # 10 seconds — gives slow early-training policies time to reach gates
+  num_envs: 512            # power-of-2 for minibatch alignment
+  max_episode_length: 2000 # 20 seconds — race track is 3x longer; early policies need time to reach more gates
 
 sim:
   substeps: 5   # overrides the default of 5
@@ -28,7 +28,7 @@ drone_model:
   name: Iris
   controller: RateController
 
-total_frames: 400_000_000
+total_frames: 800_000_000
 save_interval: 100 
 # seed: 0
 
@@ -36,25 +36,25 @@ save_interval: 100
 # Gate's local x axis is perpendicular to surface. Center is on the bottom middle. 
 # IMPORTANT: The last gate should be the exact same pos and yaw as the first gate. 
 
-# Circular track 
-track_config:
-  "1":
-    pos: [0.0, 0.0, 1.0]
-    yaw: 1.57
-  "2":
-    pos: [5.0, 5.0, 1.0]
-    yaw: 0
-  "3":
-    pos: [10.0, 0.0, 1.0]
-    yaw: -1.57
-  "4":
-    pos: [5.0, -5.0, 1.0]
-    yaw: 3.14  # pi
-  "5":
-    pos: [0.0, 0.0, 1.0]
-    yaw: 1.57
+# Circular track (disabled — using Race track below)
+# track_config:
+#   "1":
+#     pos: [0.0, 0.0, 1.0]
+#     yaw: 1.57
+#   "2":
+#     pos: [5.0, 5.0, 1.0]
+#     yaw: 0
+#   "3":
+#     pos: [10.0, 0.0, 1.0]
+#     yaw: -1.57
+#   "4":
+#     pos: [5.0, -5.0, 1.0]
+#     yaw: 3.14  # pi
+#   "5":
+#     pos: [0.0, 0.0, 1.0]
+#     yaw: 1.57
 
-# Figure 8 
+# Figure 8
 # track_config:
 #   "1":
 #     pos: [0.0, 0.0, 1.0]
@@ -78,75 +78,78 @@ track_config:
 #     pos: [0.0, 0.0, 1.0]
 #     yaw: 1.57
 
-# Race track
-# track_config:
-#   "1":
-#     pos: [12.5, 2.0, 1.0]
-#     yaw: 3.14
+# Race track — 13 gates, 88.7m serpentine, two altitude climb/drop pairs at gates 7-8 and 11-12
+# Gate 13 = Gate 1 (lap closure). Sharp turns at gates 4→5 (~100°) and 7→8 (180° reversal).
+track_config:
+  "1":
+    pos: [12.5, 2.0, 1.0]
+    yaw: 3.14
 
-#   "2":
-#     pos: [6.5, 6.0, 1.0]
-#     yaw: 2.36
+  "2":
+    pos: [6.5, 6.0, 1.0]
+    yaw: 2.36
 
-#   "3":
-#     pos: [5.5, 14.0, 1.0]
-#     yaw: 2.093
+  "3":
+    pos: [5.5, 14.0, 1.0]
+    yaw: 2.093
 
-#   "4":
-#     pos: [2.5, 24.0, 1.0]
-#     yaw: 1.57
+  "4":
+    pos: [2.5, 24.0, 1.0]
+    yaw: 1.57
 
-#   "5":
-#     pos: [7.5, 30.0, 1.0]
-#     yaw: 6.11
+  "5":
+    pos: [7.5, 30.0, 1.0]
+    yaw: 6.11
 
-#   "6":
-#     pos: [12.2, 22.0, 1.0]
-#     yaw: 6.28
+  "6":
+    pos: [12.2, 22.0, 1.0]
+    yaw: 6.28
 
-#   "7":
-#     pos: [17.5, 30.0, 3.0]
-#     yaw: 7.68
+  "7":
+    pos: [17.5, 30.0, 3.0]   # elevated gate — climb here
+    yaw: 7.68
 
-#   "8":
-#     pos: [17.5, 30.0, 1.0]
-#     yaw: 4.54
+  "8":
+    pos: [17.5, 30.0, 1.0]   # same XY as gate 7, drop back to z=1; 180° reversal
+    yaw: 4.54
 
-#   "9":
-#     pos: [18.0, 22.0, 1.0]
-#     yaw: 4.88
+  "9":
+    pos: [18.0, 22.0, 1.0]
+    yaw: 4.88
 
-#   "10":
-#     pos: [20.5, 14.0, 1.0]
-#     yaw: 4.54
+  "10":
+    pos: [20.5, 14.0, 1.0]
+    yaw: 4.54
 
-#   "11":
-#     pos: [18.5, 6.0, 3.0]
-#     yaw: 3.92
+  "11":
+    pos: [18.5, 6.0, 3.0]    # elevated gate — climb here
+    yaw: 3.92
 
-#   "12":
-#     pos: [18.5, 6.0, 1.0]
-#     yaw: 3.92
+  "12":
+    pos: [18.5, 6.0, 1.0]    # same XY as gate 11, drop back to z=1
+    yaw: 3.92
 
-#   "13":
-#     pos: [12.5, 2.0, 1.0]
-#     yaw: 3.14
+  "13":
+    pos: [12.5, 2.0, 1.0]    # lap closure = gate 1
+    yaw: 3.14
     
 # Gate settings
 gate_scale: 1.0
 gate_height: 2.5 
 gate_width: 2.5 
 
-# ---- Reward hyperparameters (MonoRace/Swift/SPIRAL-inspired, 2025 SotA) ----
-reward_progress_scale: 5.0        # dense: path-projection progress along racing line (Song et al. 2021)
-reward_velocity_scale: 0.0        # velocity toward gate — disabled (conflicts with corner-cutting; not used in Swift/Song/Wang)
-reward_gate_passage: 20.0         # sparse bonus per gate passed
-reward_lap_completion: 50.0       # bonus for completing full lap
-reward_angular_penalty: 0.03      # penalize squared angular rates (decays to 0 over 50M frames)
-reward_action_smooth_scale: 0.005  # penalize large action changes (weakened from 0.03 — was suppressing aggressive throttle)
-reward_crash_scale: 60.0          # terminal crash penalty — must dominate expected episode return (scaled up with higher progress/speed rewards)
-reward_speed_scale: 0.2           # speed along gate-to-gate racing line (clamped ≥0; rewards fast forward flight)
-crash_dist_threshold: 8.0         # > gate spacing (7.07m) + margin; grace period handles post-crossing false alarms
+# ---- Reward hyperparameters (tuned for 13-gate race track) ----
+reward_progress_scale: 6.0        # dense: path-projection progress along racing line (Song et al. 2021); increased for longer straights
+reward_velocity_scale: 0.0        # velocity toward gate — disabled (conflicts with corner-cutting)
+reward_gate_passage: 25.0         # sparse bonus per gate; increased because each of 13 gates is harder to earn
+reward_lap_completion: 100.0      # full lap bonus; increased — 13-gate lap is much harder than 5-gate diamond
+reward_angular_penalty: 0.05      # penalize squared angular rates; increased for early training stability at 180° reversal (gate 7→8)
+reward_action_smooth_scale: 0.003 # penalize large action changes; reduced slightly to allow sharper inputs for tight turns
+reward_crash_scale: 80.0          # terminal crash penalty; increased to dominate longer episode return
+reward_speed_scale: 0.3           # speed along racing line (clamped ≥0); increased for long straights (gate 3→4: 10.44m)
+reward_altitude_scale: 0.5        # bonus for matching altitude near elevated gates (z > 1.5m); helps gates 7 and 11 at z=3.0
+reward_approach_scale: 0.3        # bonus for reducing distance when within 4m of gate; aids 180° reversal at gate 7→8
+crash_dist_threshold: 12.0        # CRITICAL: must exceed max gate spacing of 10.44m (gate 3→4) + 1.5m margin
 crash_z_min: 0.15                 # minimum altitude (ground crash)
 # ---------------------------------------------------------------------------
 

@@ -298,6 +298,16 @@ def main(cfg):
                 uprightness = _mean("drone_uprightness")
                 truncated   = _mean("truncated")
 
+                # Additional raw stats
+                furthest_gate    = _mean("furthest_gate")
+                final_dist       = _mean("final_dist_to_gate")
+                mean_alt         = _mean("mean_altitude")
+                min_alt          = _mean("min_altitude")
+                mean_action_mag  = _mean("mean_action_magnitude")
+                rew_altitude     = _mean("reward_altitude")
+                rew_approach     = _mean("reward_approach")
+                curriculum_phase = _mean("curriculum_phase")
+
                 derived = {}
 
                 # Racing metrics
@@ -310,6 +320,12 @@ def main(cfg):
                 if lap_time     is not None and success_rate and success_rate > 0:
                     derived["race/lap_time_steps"] = lap_time
                     derived["race/lap_time_sec"]   = lap_time * cfg.sim.dt * cfg.sim.substeps
+                if furthest_gate is not None: derived["race/furthest_gate_reached"] = furthest_gate
+                if final_dist    is not None: derived["race/final_dist_to_gate_m"]  = final_dist
+                # Gates-per-second: how fast the drone is clearing gates
+                if gates_passed is not None and ep_len is not None and ep_len > 0:
+                    step_sec = cfg.sim.dt * cfg.sim.substeps
+                    derived["race/gates_per_second"] = gates_passed / max(ep_len * step_sec, 1e-6)
 
                 # Crash breakdown (fraction of episodes)
                 if crash_total    is not None: derived["crash/total_rate"]     = crash_total
@@ -321,15 +337,47 @@ def main(cfg):
                 if rew_progress  is not None: derived["reward/progress_cumul"]  = rew_progress
                 if rew_gates     is not None: derived["reward/gates_cumul"]     = rew_gates
                 if rew_penalties is not None: derived["reward/penalties_cumul"] = rew_penalties
+                if rew_altitude  is not None: derived["reward/altitude_cumul"]  = rew_altitude
+                if rew_approach  is not None: derived["reward/approach_cumul"]  = rew_approach
                 if rew_return    is not None: derived["reward/total_return"]    = rew_return
                 if rew_progress is not None and rew_return is not None and abs(rew_return) > 1e-6:
                     derived["reward/progress_fraction"] = rew_progress / rew_return
+                # Reward component fractions (diagnostic: which terms dominate)
+                if rew_return is not None and abs(rew_return) > 1e-6:
+                    if rew_gates     is not None: derived["reward/gates_fraction"]     = rew_gates / rew_return
+                    if rew_altitude  is not None: derived["reward/altitude_fraction"]  = rew_altitude / rew_return
+                    if rew_approach  is not None: derived["reward/approach_fraction"]  = rew_approach / rew_return
+                    if rew_penalties is not None: derived["reward/penalty_fraction"]   = rew_penalties / rew_return
 
                 # Behaviour diagnostics
-                if ang_rate    is not None: derived["behaviour/mean_ang_rate_rads"]   = ang_rate
-                if decay_frac  is not None: derived["behaviour/ang_penalty_decay_frac"] = decay_frac
-                if uprightness is not None: derived["behaviour/drone_uprightness"]    = uprightness
-                if truncated   is not None: derived["behaviour/truncated_rate"]       = truncated
+                if ang_rate         is not None: derived["behaviour/mean_ang_rate_rads"]     = ang_rate
+                if decay_frac       is not None: derived["behaviour/ang_penalty_decay_frac"] = decay_frac
+                if uprightness      is not None: derived["behaviour/drone_uprightness"]      = uprightness
+                if truncated        is not None: derived["behaviour/truncated_rate"]         = truncated
+                if mean_action_mag  is not None: derived["behaviour/mean_action_magnitude"]  = mean_action_mag
+
+                # Altitude behaviour
+                if mean_alt is not None: derived["behaviour/mean_altitude_m"]  = mean_alt
+                if min_alt  is not None: derived["behaviour/min_altitude_m"]   = min_alt
+
+                # Curriculum tracking
+                if curriculum_phase is not None: derived["curriculum/phase"] = curriculum_phase
+                # frames at curriculum transitions (for reference lines in WandB)
+                derived["curriculum/phase1_end_frames"] = 5_000_000
+                derived["curriculum/phase2_end_frames"] = 20_000_000
+                derived["curriculum/ang_decay_end_frames"] = 10_000_000
+
+                # Per-gate crossing heatmap data — log as individual metrics for WandB bar chart
+                for gi in range(12):
+                    v = _mean(f"gate_{gi}_crosses")
+                    if v is not None:
+                        derived[f"gates/gate_{gi:02d}_crosses"] = v
+
+                # WandB bar chart for per-gate distribution
+                gate_counts = [_mean(f"gate_{gi}_crosses") or 0.0 for gi in range(12)]
+                gate_labels = [f"G{gi}" for gi in range(12)]
+                gate_table = wandb.Table(columns=["gate", "mean_crosses"], data=[[label, val] for label, val in zip(gate_labels, gate_counts)])
+                derived["gates/crossing_distribution"] = wandb.plot.bar(gate_table, "gate", "mean_crosses", title="Gate Crossing Distribution")
 
                 info.update(derived)
 

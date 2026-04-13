@@ -13,9 +13,9 @@ total_frames: -1
 seed: 0
 
 viewer:
-  resolution: [960, 720]
-  eye: [8, 0., 6.]
-  lookat: [0., 0., 1.]
+  resolution: ${oc.select:task.viewer.resolution,[960,720]}
+  eye: ${oc.select:task.viewer.eye,[8,0.,6.]}
+  lookat: ${oc.select:task.viewer.lookat,[0.,0.,1.]}
 
 defaults:
   - task: Hover

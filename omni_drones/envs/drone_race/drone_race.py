@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 
+import numpy as np
 import torch
 import torch.distributions as D
 from tensordict.tensordict import TensorDict, TensorDictBase
@@ -181,6 +182,7 @@ class DroneRaceEnv(IsaacEnv):
         self.angular_penalty_decay_frames = 5_000_000   # decay angular penalty to 0 over first 5M frames (was 50M — unlock fast flight sooner)
         self.gate_just_passed_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.crash_grace_steps = 30  # steps after gate crossing before dist_crash re-enables (was 15 — more reorientation time)
+        self.gates_crossed_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
 
         # Use a single view with wildcard pattern to access all gates
         try:
@@ -194,6 +196,8 @@ class DroneRaceEnv(IsaacEnv):
             print(f"[DroneRaceEnv] RigidPrimView created, calling initialize()...")
             self.gates.initialize()
             print(f"[DroneRaceEnv] gates.initialize() completed")
+            if self.enable_viewport:
+                self._apply_track_viewport_camera()
         except Exception as e:
             print("=" * 80)
             print(f"ERROR: Failed to initialize gates view with num_envs={self.num_envs}, num_gates={self.num_gates}")
@@ -296,6 +300,25 @@ class DroneRaceEnv(IsaacEnv):
                     [3.0]  # Line width
                 )
 
+    def _apply_track_viewport_camera(self):
+        """Re-frame the Kit viewport on the gate course (see _design_scene track bounds)."""
+        if not getattr(self, "enable_viewport", False):
+            return
+        try:
+            from isaacsim.core.utils.viewports import set_camera_view
+        except ImportError:
+            return
+        if not hasattr(self, "_track_cam_center_local"):
+            return
+
+        central = self.envs_positions[self.central_env_idx].detach().cpu().numpy()
+        c = self._track_cam_center_local + central
+        span = float(self._track_cam_span)
+        # Isometric-style offset so a ~10 m square track stays in view.
+        eye = c + np.array([span * 1.15, -span * 1.05, span * 0.85], dtype=np.float64)
+        target = c + np.array([0.0, 0.0, 0.25 * span], dtype=np.float64)
+        set_camera_view(eye=eye, target=target)
+
     def _design_scene(self):
         print("Designing scene")
         drone_model_cfg = self.cfg.task.drone_model
@@ -371,8 +394,19 @@ class DroneRaceEnv(IsaacEnv):
                     child_prim.GetAttribute("physics:kinematicEnabled").Set(True)
                 all_prims += child_prim.GetChildren()
 
-        # Gate positions and orientations will be retrieved from views at runtime
-        # No need to store them manually since gates are static
+        # Gate positions and orientations will be retrieved from views at runtime.
+        # Store track bounds so we can aim the viewport at the whole course (default
+        # cfg.viewer lookat/eye target the origin and miss spread-out gates).
+        if gate_positions_list:
+            pts = torch.stack(gate_positions_list, dim=0).cpu()
+            self._track_cam_center_local = pts.mean(dim=0).numpy().astype("float64")
+            lo = torch.amin(pts, dim=0)
+            hi = torch.amax(pts, dim=0)
+            span = torch.linalg.norm(hi - lo).item()
+            self._track_cam_span = float(max(span, 6.0))
+        else:
+            self._track_cam_center_local = np.zeros(3, dtype=np.float64)
+            self._track_cam_span = 12.0
 
         # Spawn drone at start position (behind first gate, in gate's local frame)
         # The gate's local x-axis points in the tangent direction (for circular) or forward (for config)
@@ -475,6 +509,7 @@ class DroneRaceEnv(IsaacEnv):
         self.last_action[env_ids] = 0.0
         self.effort[env_ids] = 0.0
         self.gate_just_passed_steps[env_ids] = 0
+        self.gates_crossed_this_ep[env_ids] = 0
 
         # Reset gate velocities to prevent drift
         gate_velocities = torch.zeros(n, self.num_gates, 6, device=self.device)
@@ -894,6 +929,9 @@ class DroneRaceEnv(IsaacEnv):
             gate_env_pos, gate_env_rot, batch_indices,
         )
 
+        # Increment per-episode gate crossing counter (actual crossings, not init index).
+        self.gates_crossed_this_ep[gate_passed_this_step] += 1
+
         # Grace period after gate crossing: reset counter for envs that just advanced,
         # then decrement all. Dist-crash is disabled during the grace window so the drone
         # isn't immediately killed when the target gate jumps to the next gate (7.07m away).
@@ -954,12 +992,6 @@ class DroneRaceEnv(IsaacEnv):
         speed_along_racing_line = (lin_vel_world * gate_to_gate_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
         reward += self.reward_speed_scale * speed_along_racing_line
 
-        # (velocity-toward-gate kept at 0.0; superseded by speed_along_racing_line above)
-        gate_dir = new_gate_center - drone_pos_flat
-        gate_dir_norm = gate_dir / (gate_dir.norm(dim=-1, keepdim=True) + 1e-6)
-        vel_toward_gate = (lin_vel_world * gate_dir_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
-        reward += self.reward_velocity_scale * vel_toward_gate
-
         # 3. Sparse gate passage bonus.
         reward += self.reward_gate_passage * gate_passed_this_step.float()
 
@@ -1015,7 +1047,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["success"].bitwise_or_(completed_task.unsqueeze(-1))
         self.stats["return"].add_(reward.unsqueeze(-1))
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
-        self.stats["gates_passed"][:] = (self.gate_indices + self.track_completed.long()).float().unsqueeze(1)
+        self.stats["gates_passed"][:] = self.gates_crossed_this_ep.float().unsqueeze(1)
         # Granular crash diagnostics
         self.stats["crashed_z"].add_(ground_crash.float().unsqueeze(-1))
         self.stats["crashed_z_gate"].add_(phys_crash.float().unsqueeze(-1))

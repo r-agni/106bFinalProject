@@ -1,37 +1,41 @@
 name: ppo
 
 # PPO training schedule (tuned for drone racing based on Swift/MonoRace/SPIRAL papers)
-train_every: 128  # gate-to-gate ~70 steps at 10m/s; 128 guarantees at least 1 gate crossing per rollout
-ppo_epochs: 10    # gradient epochs per update (was 8; more passes per rollout)
-num_minibatches: 16   # was 5; 64k/16=4000 per minibatch — better gradient diversity
+train_every: 256  # race track avg gate spacing ~7.4m → ~74 steps at 10m/s; 256 ensures 3+ gate crossings per rollout
+ppo_epochs: 10    # gradient epochs per update
+num_minibatches: 16   # 512*256/16=8192 per minibatch — good gradient diversity
 clip_param: 0.2
-entropy_coef: 0.005   # was 0.003; slightly more exploration in early training
+entropy_coef: 0.01    # increased from 0.005 — more exploration needed for novel 13-gate geometry
 gae_lambda: 0.95
-gamma: 0.995  # longer effective horizon (200 steps) — better credit-assignment for lap bonus at step 300+
+gamma: 0.998  # increased from 0.995 — full lap at step ~1500 needs effective horizon >500 steps (0.998 → ~500; 0.995 → ~200)
 max_grad_norm: 5.0
 
-# whether to use privileged information
+# Privileged critic: during training the critic gets obs + intrinsics (mass, inertia, KF).
+# This gives much more accurate value estimates → better GAE advantages → faster policy learning.
+# The actor never sees intrinsics (it would have them at inference anyway since drone is fixed),
+# so this is a pure training acceleration exploit with no inference cost.
 priv_actor: false
-priv_critic: false
+priv_critic: true   # KEY SIM EXPLOIT: critic sees privileged physical parameters during training
 
 actor:
-  # 2-layer 256-unit network with LeakyReLU (slope 0.2) — proven in Swift (Nature 2023).
-  # Agile Flight 2025 used [512,512,256,128] ELU but Swift's 2x128 also champion-level.
+  # 2-layer 256-unit network with LeakyReLU (slope 0.2) — Swift (Nature 2023) architecture.
   lr: 0.0003               # 3e-4 Adam — standard across Swift, MonoRace, SPIRAL
   hidden_units: [256, 256]
-  activation: leaky_relu   # LeakyReLU(0.2) — Swift architecture; avoids dead neurons vs ReLU
+  activation: leaky_relu   # LeakyReLU(0.2) — avoids dead neurons vs ReLU
   lr_scheduler:
   lr_scheduler_kwargs:
   layer_norm: true
   weight_decay: 0.0
 
 critic:
+  # Wider critic: value estimation benefits from capacity since it sees obs + intrinsics.
+  # Actor stays [256,256] to avoid overfitting on the compact 27-dim obs.
   lr: 0.0003
-  hidden_units: [256, 256]
+  hidden_units: [256, 256, 128]  # extra layer: critic has more signal (obs + intrinsics) to process
   activation: leaky_relu
   lr_scheduler:
   lr_scheduler_kwargs:
   layer_norm: true
   weight_decay: 0.0
-  use_huber_loss: false
+  use_huber_loss: true   # Huber loss: more robust to outlier returns during early chaotic training
   huber_delta: 10.0

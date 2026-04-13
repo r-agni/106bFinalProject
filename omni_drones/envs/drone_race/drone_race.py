@@ -101,15 +101,17 @@ class DroneRaceEnv(IsaacEnv):
         # -----------------------------------------------------------------------
         # ----- ADD YOUR REWARD CONFIG LINES BELOW (replace / extend the example) -----
 
-        self.reward_progress_scale      = cfg.task.get("reward_progress_scale", 1.5)
-        self.reward_velocity_scale      = cfg.task.get("reward_velocity_scale", 1.0)
-        self.reward_gate_passage        = cfg.task.get("reward_gate_passage", 10.0)
-        self.reward_lap_completion      = cfg.task.get("reward_lap_completion", 50.0)
-        self.reward_angular_penalty     = cfg.task.get("reward_angular_penalty", 0.1)
-        self.reward_action_smooth_scale = cfg.task.get("reward_action_smooth_scale", 0.1)
-        self.reward_crash_scale         = cfg.task.get("reward_crash_scale", 10.0)
-        self.reward_speed_scale         = cfg.task.get("reward_speed_scale", 0.0)
-        self.crash_dist_threshold       = cfg.task.get("crash_dist_threshold", 10.0)
+        self.reward_progress_scale      = cfg.task.get("reward_progress_scale", 6.0)
+        self.reward_velocity_scale      = cfg.task.get("reward_velocity_scale", 0.0)
+        self.reward_gate_passage        = cfg.task.get("reward_gate_passage", 25.0)
+        self.reward_lap_completion      = cfg.task.get("reward_lap_completion", 100.0)
+        self.reward_angular_penalty     = cfg.task.get("reward_angular_penalty", 0.05)
+        self.reward_action_smooth_scale = cfg.task.get("reward_action_smooth_scale", 0.003)
+        self.reward_crash_scale         = cfg.task.get("reward_crash_scale", 80.0)
+        self.reward_speed_scale         = cfg.task.get("reward_speed_scale", 0.3)
+        self.reward_altitude_scale      = cfg.task.get("reward_altitude_scale", 0.5)
+        self.reward_approach_scale      = cfg.task.get("reward_approach_scale", 0.3)
+        self.crash_dist_threshold       = cfg.task.get("crash_dist_threshold", 12.0)
         self.crash_z_min                = cfg.task.get("crash_z_min", 0.15)
 
         # ----- END STUDENT CODE -----
@@ -179,10 +181,19 @@ class DroneRaceEnv(IsaacEnv):
         self.effort = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device)
         self.prev_drone_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.total_frames_counter = 0
-        self.angular_penalty_decay_frames = 5_000_000   # decay angular penalty to 0 over first 5M frames (was 50M — unlock fast flight sooner)
+        self.angular_penalty_decay_frames = 10_000_000  # race track has 180° reversal; keep angular damping longer before unleashing aggressive flight
         self.gate_just_passed_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.crash_grace_steps = 30  # steps after gate crossing before dist_crash re-enables (was 15 — more reorientation time)
+        self.crash_grace_steps = 45  # race track max gate spacing is 10.44m; 45 steps gives drone time to reorient toward new gate
         self.gates_crossed_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        # Per-gate crossing counters (12 gates, gate 12 = lap closure = same as gate 0)
+        self.per_gate_crosses = torch.zeros(self.num_envs, 12, device=self.device, dtype=torch.long)
+        # Furthest gate index reached this episode
+        self.furthest_gate_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        # Altitude tracking
+        self.min_altitude_this_ep = torch.full((self.num_envs,), float('inf'), device=self.device)
+        self.mean_altitude_acc = torch.zeros(self.num_envs, device=self.device)
+        # Action magnitude tracking
+        self.mean_action_mag_acc = torch.zeros(self.num_envs, device=self.device)
 
         # Use a single view with wildcard pattern to access all gates
         try:
@@ -470,18 +481,44 @@ class DroneRaceEnv(IsaacEnv):
             "success": BinaryDiscreteTensorSpec(1, dtype=bool),
             "truncated": Unbounded(1),
             # Speed tracking
-            "mean_speed": Unbounded(1),       # mean linear speed (m/s) over episode
-            "max_speed": Unbounded(1),        # max linear speed (m/s) seen in episode
+            "mean_speed": Unbounded(1),         # mean linear speed (m/s) over episode
+            "max_speed": Unbounded(1),          # max linear speed (m/s) seen in episode
             # Lap time (steps) — only meaningful when success=True
-            "lap_time_steps": Unbounded(1),   # steps to complete lap (0 if no lap completed)
+            "lap_time_steps": Unbounded(1),     # steps to complete lap (0 if no lap completed)
             # Reward component breakdown
-            "reward_progress": Unbounded(1),  # cumulative progress reward
-            "reward_gates": Unbounded(1),     # cumulative gate passage reward
-            "reward_penalties": Unbounded(1), # cumulative angular + smoothness penalties
+            "reward_progress": Unbounded(1),    # cumulative progress reward
+            "reward_gates": Unbounded(1),       # cumulative gate passage reward
+            "reward_penalties": Unbounded(1),   # cumulative angular + smoothness penalties
+            "reward_altitude": Unbounded(1),    # cumulative altitude alignment reward
+            "reward_approach": Unbounded(1),    # cumulative close-approach shaping reward
             # Angular rate magnitude
-            "mean_ang_rate": Unbounded(1),    # mean ||ang_vel|| over episode
+            "mean_ang_rate": Unbounded(1),      # mean ||ang_vel|| over episode
             # Angular penalty decay (scalar, same for all envs)
             "ang_penalty_decay_frac": Unbounded(1),
+            # Curriculum phase tracking
+            "curriculum_phase": Unbounded(1),   # 0=phase1, 1=phase2, 2=phase3
+            # Per-gate visit counts — how many times each gate was crossed in the episode
+            "gate_0_crosses": Unbounded(1),
+            "gate_1_crosses": Unbounded(1),
+            "gate_2_crosses": Unbounded(1),
+            "gate_3_crosses": Unbounded(1),
+            "gate_4_crosses": Unbounded(1),
+            "gate_5_crosses": Unbounded(1),
+            "gate_6_crosses": Unbounded(1),
+            "gate_7_crosses": Unbounded(1),
+            "gate_8_crosses": Unbounded(1),
+            "gate_9_crosses": Unbounded(1),
+            "gate_10_crosses": Unbounded(1),
+            "gate_11_crosses": Unbounded(1),
+            # Furthest gate reached (max gate index seen before crash/timeout)
+            "furthest_gate": Unbounded(1),
+            # Distance to gate at episode end (how close drone was when ep terminated)
+            "final_dist_to_gate": Unbounded(1),
+            # Action magnitude stats (how aggressively the drone is flying)
+            "mean_action_magnitude": Unbounded(1),
+            # Altitude stats
+            "mean_altitude": Unbounded(1),
+            "min_altitude": Unbounded(1),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
@@ -491,14 +528,22 @@ class DroneRaceEnv(IsaacEnv):
 
         n = len(env_ids)
 
-        # --- Curriculum distributed initialization ---
-        # First 10M frames: always start at gate 0 so the policy learns gate crossing before generalizing.
-        # After 10M frames: 30% gate 0, 70% random gate [0, num_gates-2] (Song et al. 2021).
-        # Gate num_gates-1 is excluded because it duplicates gate 0 (lap close).
-        if self.total_frames_counter < 10_000_000:
+        # --- Progressive curriculum for 13-gate race track ---
+        # Phase 1 (0–5M frames):   always gate 0 — learn basic gate crossing first
+        # Phase 2 (5M–20M frames): 20% gate 0, 80% random from first half of track — learn upstream gates
+        # Phase 3 (>20M frames):   15% gate 0, 85% uniform over full track — generalize to all gates
+        # Gate num_gates-1 is excluded (it duplicates gate 0 = lap closure).
+        if self.total_frames_counter < 5_000_000:
             start_gates = torch.zeros(n, device=self.device, dtype=torch.long)
+        elif self.total_frames_counter < 20_000_000:
+            # Phase 2: first half of track only
+            half = max(1, self.num_gates // 2)
+            always_gate0 = torch.rand(n, device=self.device) < 0.20
+            random_gates = torch.randint(0, half, (n,), device=self.device)
+            start_gates = torch.where(always_gate0, torch.zeros(n, dtype=torch.long, device=self.device), random_gates)
         else:
-            always_gate0 = torch.rand(n, device=self.device) < 0.30
+            # Phase 3: full track
+            always_gate0 = torch.rand(n, device=self.device) < 0.15
             random_gates = torch.randint(0, self.num_gates - 1, (n,), device=self.device)
             start_gates = torch.where(always_gate0, torch.zeros(n, dtype=torch.long, device=self.device), random_gates)
 
@@ -510,6 +555,11 @@ class DroneRaceEnv(IsaacEnv):
         self.effort[env_ids] = 0.0
         self.gate_just_passed_steps[env_ids] = 0
         self.gates_crossed_this_ep[env_ids] = 0
+        self.per_gate_crosses[env_ids] = 0
+        self.furthest_gate_this_ep[env_ids] = start_gates
+        self.min_altitude_this_ep[env_ids] = float('inf')
+        self.mean_altitude_acc[env_ids] = 0.0
+        self.mean_action_mag_acc[env_ids] = 0.0
 
         # Reset gate velocities to prevent drift
         gate_velocities = torch.zeros(n, self.num_gates, 6, device=self.device)
@@ -582,15 +632,25 @@ class DroneRaceEnv(IsaacEnv):
 
         self.stats.exclude("success")[env_ids] = 0.
         self.stats["success"][env_ids] = False
-        # New stats — zero on reset
+        # Reset all stats on episode start
         self.stats["mean_speed"][env_ids] = 0.
         self.stats["max_speed"][env_ids] = 0.
         self.stats["lap_time_steps"][env_ids] = 0.
         self.stats["reward_progress"][env_ids] = 0.
         self.stats["reward_gates"][env_ids] = 0.
         self.stats["reward_penalties"][env_ids] = 0.
+        self.stats["reward_altitude"][env_ids] = 0.
+        self.stats["reward_approach"][env_ids] = 0.
         self.stats["mean_ang_rate"][env_ids] = 0.
         self.stats["ang_penalty_decay_frac"][env_ids] = 0.
+        self.stats["curriculum_phase"][env_ids] = 0.
+        self.stats["furthest_gate"][env_ids] = 0.
+        self.stats["final_dist_to_gate"][env_ids] = 0.
+        self.stats["mean_altitude"][env_ids] = 0.
+        self.stats["min_altitude"][env_ids] = 0.
+        self.stats["mean_action_magnitude"][env_ids] = 0.
+        for gi in range(12):
+            self.stats[f"gate_{gi}_crosses"][env_ids] = 0.
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         '''
@@ -998,7 +1058,39 @@ class DroneRaceEnv(IsaacEnv):
         # 4. Lap completion bonus.
         reward += self.reward_lap_completion * self.track_completed.float()
 
-        # 5. Angular rate penalty with linear decay (Song et al.: used only in early training).
+        # 5. Altitude alignment bonus.
+        #    Race track has two elevated gates (z=3.0) at gates 7 and 11. The path-projection
+        #    reward gives near-zero signal on the purely-vertical 2m segments (gate 6→7, 10→11)
+        #    because gate_to_gate_norm points almost entirely in Z. This bonus rewards the drone
+        #    for matching the correct altitude when the target gate is elevated (z > 1.5m).
+        current_gate_z = current_gate_center[:, 2]  # (N,)
+        elevated_gate = current_gate_z > 1.5         # True for gates at z=3.0
+        drone_z = drone_pos_flat[:, 2]               # (N,)
+        altitude_error = (drone_z - current_gate_z).abs()
+        altitude_reward = torch.where(
+            elevated_gate,
+            self.reward_altitude_scale * torch.exp(-altitude_error),
+            torch.zeros_like(altitude_error)
+        )
+        reward += altitude_reward
+
+        # 6. Close-approach shaping bonus.
+        #    The 180° reversal at gate 7→8 (identical XY, only Z differs) causes path-projection
+        #    progress to break down because the gate-to-gate direction reverses mid-approach.
+        #    Within 4m of any gate, reward distance reduction so the policy always has a signal
+        #    to close on the gate regardless of the racing-line direction.
+        close_approach_mask = distance_to_gate < 4.0
+        dist_improvement = self.prev_distance_to_gate - distance_to_gate  # positive = approaching
+        approach_reward = torch.where(
+            close_approach_mask,
+            self.reward_approach_scale * dist_improvement.clamp(min=0.0),
+            torch.zeros_like(dist_improvement)
+        )
+        reward += approach_reward
+        # Update prev_distance_to_gate for next step's approach reward computation.
+        self.prev_distance_to_gate = distance_to_gate.clone()
+
+        # 7. Angular rate penalty with linear decay (Song et al.: used only in early training).
         #    Decays from reward_angular_penalty → 0 over angular_penalty_decay_frames steps.
         self.total_frames_counter += self.num_envs
         ang_decay_frac = max(0.0, 1.0 - self.total_frames_counter / self.angular_penalty_decay_frames)
@@ -1006,7 +1098,7 @@ class DroneRaceEnv(IsaacEnv):
         ang_penalty = ang_vel.pow(2).sum(dim=-1)  # (N,)
         reward -= (self.reward_angular_penalty * ang_decay_frac) * ang_penalty
 
-        # 6. Action smoothness penalty.
+        # 8. Action smoothness penalty.
         action_diff = self.drone.throttle_difference.squeeze(-1)  # (N,)
         reward -= self.reward_action_smooth_scale * action_diff
 
@@ -1072,11 +1164,57 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_progress"].add_(progress_reward.unsqueeze(-1))
         self.stats["reward_gates"].add_(gate_reward.unsqueeze(-1))
         self.stats["reward_penalties"].add_(penalty_reward.unsqueeze(-1))
+        self.stats["reward_altitude"].add_(altitude_reward.unsqueeze(-1))
+        self.stats["reward_approach"].add_(approach_reward.unsqueeze(-1))
         # Angular rate magnitude (incremental mean)
         ang_rate_mag = ang_vel.norm(dim=-1)  # (N,)
         self.stats["mean_ang_rate"].add_((ang_rate_mag.unsqueeze(-1) - self.stats["mean_ang_rate"]) / ep_len.unsqueeze(-1))
         # Angular penalty decay fraction (same scalar for all envs)
         self.stats["ang_penalty_decay_frac"][:] = ang_decay_frac
+
+        # --- new rich diagnostics ---
+        # Furthest gate reached this episode (max gate index seen)
+        self.furthest_gate_this_ep = torch.maximum(self.furthest_gate_this_ep, self.gate_indices)
+        self.stats["furthest_gate"][:] = self.furthest_gate_this_ep.float().unsqueeze(1)
+
+        # Per-gate crossing counts (gates 0–11, clamp index to valid range)
+        if gate_passed_this_step.any():
+            # gate_indices was already incremented by _detect_gate_crossings, so previous gate is (gate_indices - 1) % (num_gates - 1)
+            crossed_gate_idx = ((self.gate_indices - 1) % (self.num_gates - 1)).clamp(0, 11)
+            per_gate_update = torch.zeros(self.num_envs, 12, device=self.device)
+            per_gate_update.scatter_add_(
+                1,
+                crossed_gate_idx.unsqueeze(1),
+                gate_passed_this_step.float().unsqueeze(1)
+            )
+            self.per_gate_crosses += per_gate_update.long()
+        for gi in range(12):
+            self.stats[f"gate_{gi}_crosses"][:] = self.per_gate_crosses[:, gi].float().unsqueeze(1)
+
+        # Curriculum phase (0=phase1, 1=phase2, 2=phase3) — same scalar for all envs
+        if self.total_frames_counter < 5_000_000:
+            cur_phase = 0.0
+        elif self.total_frames_counter < 20_000_000:
+            cur_phase = 1.0
+        else:
+            cur_phase = 2.0
+        self.stats["curriculum_phase"][:] = cur_phase
+
+        # Distance to current gate at end of episode (meaningful when episode ends)
+        self.stats["final_dist_to_gate"][:] = distance_to_gate.unsqueeze(1)
+
+        # Altitude stats: min and incremental mean
+        self.min_altitude_this_ep = torch.minimum(self.min_altitude_this_ep, drone_z)
+        self.mean_altitude_acc.add_((drone_z - self.mean_altitude_acc) / ep_len)
+        min_alt_clamped = self.min_altitude_this_ep.clone()
+        min_alt_clamped[min_alt_clamped == float('inf')] = 0.0
+        self.stats["min_altitude"][:] = min_alt_clamped.unsqueeze(1)
+        self.stats["mean_altitude"][:] = self.mean_altitude_acc.unsqueeze(1)
+
+        # Action magnitude (incremental mean of L2 norm of action vector)
+        action_mag = self.effort.squeeze(1).norm(dim=-1)  # (N,)
+        self.mean_action_mag_acc.add_((action_mag - self.mean_action_mag_acc) / ep_len)
+        self.stats["mean_action_magnitude"][:] = self.mean_action_mag_acc.unsqueeze(1)
 
         return TensorDict(
             {

@@ -1064,7 +1064,10 @@ class DroneRaceEnv(IsaacEnv):
         #    because gate_to_gate_norm points almost entirely in Z. This bonus rewards the drone
         #    for matching the correct altitude when the target gate is elevated (z > 1.5m).
         current_gate_z = current_gate_center[:, 2]  # (N,)
-        elevated_gate = current_gate_z > 1.5         # True for gates at z=3.0
+        # Gate centers: normal gates (origin z=1.0) have center z=2.25m; elevated gates (origin z=3.0)
+        # have center z=4.25m. Threshold must be between these: > 3.25m selects only elevated gates.
+        # The original threshold of > 1.5 was wrong — it fired on ALL gates every step.
+        elevated_gate = current_gate_z > 3.25        # True only for elevated gates at origin z=3.0
         drone_z = drone_pos_flat[:, 2]               # (N,)
         altitude_error = (drone_z - current_gate_z).abs()
         altitude_reward = torch.where(

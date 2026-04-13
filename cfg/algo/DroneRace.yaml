@@ -5,9 +5,9 @@ train_every: 256  # race track avg gate spacing ~7.4m → ~74 steps at 10m/s; 25
 ppo_epochs: 10    # gradient epochs per update
 num_minibatches: 16   # 512*256/16=8192 per minibatch — good gradient diversity
 clip_param: 0.2
-entropy_coef: 0.01    # increased from 0.005 — more exploration needed for novel 13-gate geometry
+entropy_coef: 0.01    # higher entropy to keep exploring the large 13-gate track
 gae_lambda: 0.95
-gamma: 0.998  # increased from 0.995 — full lap at step ~1500 needs effective horizon >500 steps (0.998 → ~500; 0.995 → ~200)
+gamma: 0.998  # long effective horizon (~500 steps) needed for lap bonus credit assignment
 max_grad_norm: 5.0
 
 # Privileged critic: during training the critic gets obs + intrinsics (mass, inertia, KF).

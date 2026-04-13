@@ -1,5 +1,6 @@
 import logging
 import os
+import pathlib
 import time
 
 import hydra
@@ -33,6 +34,22 @@ def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+
+    # Match train.py: merge cfg/algo/<ppo_cfg> when the task specifies it (e.g. DroneRace).
+    ppo_cfg_name = cfg.task.get("ppo_cfg", None)
+    if ppo_cfg_name:
+        algo_dir = pathlib.Path(__file__).resolve().parent.parent / "cfg" / "algo"
+        ppo_cfg_path = algo_dir / ppo_cfg_name
+        if not ppo_cfg_path.suffix:
+            ppo_cfg_path = ppo_cfg_path.with_suffix(".yaml")
+        if ppo_cfg_path.exists():
+            logging.info("Loading task-specific PPO config: %s", ppo_cfg_path)
+            task_ppo_cfg = OmegaConf.load(ppo_cfg_path)
+            # Task yaml overrides base algo (e.g. hidden_units). Do not put empty
+            # checkpoint_path in task yaml — it would clear algo.checkpoint_path from CLI.
+            cfg.algo = OmegaConf.merge(cfg.algo, task_ppo_cfg)
+        else:
+            logging.warning("ppo_cfg '%s' not found at %s, using default.", ppo_cfg_name, ppo_cfg_path)
 
     record_video = bool(cfg.get("record_video", False))
     if record_video:
@@ -130,7 +147,7 @@ def main(cfg):
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
 
-    frames_per_batch = env.num_envs * 32
+    frames_per_batch = env.num_envs * int(cfg.algo.get("train_every", 32))
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)

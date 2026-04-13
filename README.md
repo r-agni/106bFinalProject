@@ -158,6 +158,8 @@ A well-trained checkpoint requires at least **~300 M frames** of `DroneRace` tra
 
 `play.py` uses Hydra with [`scripts/train.yaml`](scripts/train.yaml). Use `task=DroneRace` to match the training task.
 
+`play.py` loads the same **task-specific PPO config** as `train.py`: if [`cfg/task/DroneRace.yaml`](cfg/task/DroneRace.yaml) sets `ppo_cfg: DroneRace.yaml`, [`cfg/algo/DroneRace.yaml`](cfg/algo/DroneRace.yaml) is merged into `cfg.algo` **before** the policy is built (network width, `train_every`, etc.), so checkpoints trained with DroneRace match the loaded policy.
+
 ```bash
 cd c:/Users/agni_/Documents/106bFinalProject/scripts
 python play.py task=DroneRace headless=false task.env.num_envs=1 \
@@ -196,6 +198,21 @@ python play.py task=DroneRace record_video=true task.env.num_envs=1 \
 **Where is the video?** Exactly where you set `video_path`. If MP4 encoding fails the code may fall back to a **GIF** with the same base name.
 
 **Time:** First launch loads Kit and extensions — allow several minutes before the drone appears.
+
+### Example: checkpoint at repo root (`files_checkpoint_final.pt`)
+
+If you copied the final weights to the repo root as `files_checkpoint_final.pt`:
+
+```bash
+cd c:/Users/agni_/Documents/106bFinalProject/scripts
+python play.py task=DroneRace task.env.num_envs=1 total_frames=2048 ^
+  record_video=true record_video_max_steps=800 video_frame_interval=2 ^
+  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/files_checkpoint_final.pt ^
+  wandb.mode=disabled ^
+  video_path=c:/Users/agni_/Documents/106bFinalProject/drone_race_playback.mp4
+```
+
+(Bash: replace `^` with `\` at end of lines.) Ensure the `.pt` file exists at that path. Use a **finite** `total_frames` for a bounded first run; increase `record_video_max_steps` if you need a longer clip. Tune `viewer.eye` / `viewer.lookat` if the default camera does not frame the whole track.
 
 ---
 

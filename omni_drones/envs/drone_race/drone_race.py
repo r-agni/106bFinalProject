@@ -441,8 +441,10 @@ class DroneRaceEnv(IsaacEnv):
         # Custom robot state: linear_vel(3) + rotation_matrix_flat(9) + angular_vel(3) = 15
         robot_state_dim = 3 + 9 + 3  # 15
         # Observation: robot_state(15) + next_gate_rpos_local(3) + next_to_next_gate_pos(3)
-        #              + next_gate_rot_mat_2col(6)
-        observation_dim = robot_state_dim + 3 + 3 + 6  # 27
+        #              + next_gate_rot_mat_2col(6) + gate_index_normalized(1)
+        # gate_index_normalized: tells the policy where on the track it is (sim-only exploit —
+        # required for gate-specific behaviours like climbing at gate 7, reversing at gate 8).
+        observation_dim = robot_state_dim + 3 + 3 + 6 + 1  # 28
         self.observation_spec = Composite({
             "agents": {
                 "observation": Unbounded((1, observation_dim), device=self.device),
@@ -833,6 +835,10 @@ class DroneRaceEnv(IsaacEnv):
         gate_col1 = quat_rotate(next_gate_rot_flat, e_y)  # (N, 3) — gate y-axis in world frame
         next_gate_rot_mat_2col = torch.cat([gate_col0, gate_col1], dim=-1).unsqueeze(1)  # (N, 1, 6)
 
+        # Gate index normalized to [0, 1]: tells the policy where on the track it is.
+        # Sim-only exploit — needed for gate-specific behaviors (climb at gate 7, reverse at gate 8).
+        gate_index_norm = (self.gate_indices.float() / (self.num_gates - 1)).unsqueeze(1).unsqueeze(1)  # (N, 1, 1)
+
         # Build observation
         # All components need to have the agent dimension (middle dimension) to match spec (N, 1, obs_dim)
         obs = [
@@ -840,9 +846,10 @@ class DroneRaceEnv(IsaacEnv):
             next_gate_rpos_local,       # (N, 1, 3)
             next_to_next_gate_pos.unsqueeze(1),  # (N, 1, 3)
             next_gate_rot_mat_2col,     # (N, 1, 6)
+            gate_index_norm,            # (N, 1, 1)
         ]
 
-        # Concatenate along last dimension: (N, 1, 27)
+        # Concatenate along last dimension: (N, 1, 28)
         obs = torch.cat(obs, dim=-1)
 
         return TensorDict(
@@ -1064,10 +1071,10 @@ class DroneRaceEnv(IsaacEnv):
         #    because gate_to_gate_norm points almost entirely in Z. This bonus rewards the drone
         #    for matching the correct altitude when the target gate is elevated (z > 1.5m).
         current_gate_z = current_gate_center[:, 2]  # (N,)
-        # Gate centers: normal gates (origin z=1.0) have center z=2.25m; elevated gates (origin z=3.0)
-        # have center z=4.25m. Threshold must be between these: > 3.25m selects only elevated gates.
-        # The original threshold of > 1.5 was wrong — it fired on ALL gates every step.
-        elevated_gate = current_gate_z > 3.25        # True only for elevated gates at origin z=3.0
+        # Gate centers: normal gates (origin z=1.0) have center z=1.75m (= 1.0 + gate_height/2 = 1.0 + 0.75);
+        # elevated gates (origin z=3.0) have center z=3.75m. Threshold midpoint = 2.75m.
+        # Only fires for gates 7 and 11 (origin z=3.0). gate_height=1.5 (original gate design).
+        elevated_gate = current_gate_z > 2.75        # True only for elevated gates at origin z=3.0
         drone_z = drone_pos_flat[:, 2]               # (N,)
         altitude_error = (drone_z - current_gate_z).abs()
         altitude_reward = torch.where(

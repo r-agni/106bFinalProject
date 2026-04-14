@@ -127,8 +127,8 @@ track_config:
     yaw: 0.78
 
   "12":
-    pos: [8.0, 30.0, 1.0]    # same XY as gate 11, drop back to z=1
-    yaw: 0.78
+    pos: [8.0, 30.0, 1.0]    # same XY as gate 11, drop back to z=1; yaw reversed 180° so crossing detection works
+    yaw: 3.921               # = 0.78 + pi; must face OPPOSITE to gate 11 (same as gate 7/8 design)
 
   "13":
     pos: [14.0, 34.0, 1.0]   # lap closure = gate 1

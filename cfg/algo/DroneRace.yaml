@@ -14,7 +14,7 @@ max_grad_norm: 5.0
 # This gives much more accurate value estimates → better GAE advantages → faster policy learning.
 # The actor never sees intrinsics (it would have them at inference anyway since drone is fixed),
 # so this is a pure training acceleration exploit with no inference cost.
-priv_actor: false
+priv_actor: true    # SIM-ONLY EXPLOIT: no real-world transfer needed, actor also sees mass/inertia/KF
 priv_critic: true   # KEY SIM EXPLOIT: critic sees privileged physical parameters during training
 
 actor:

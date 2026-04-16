@@ -10,7 +10,7 @@ Options:
   --smoke              Short validation run (max_iters=3, save_interval=2).
   --dry-run            Print commands without launching.
   --hover-num-envs N   Override Hover num envs (default: 128).
-  --race-num-envs N    Override DroneRace num envs (default: 128).
+  --race-num-envs N    Override DroneRace num envs (default: 512).
   -h, --help           Show this help.
 USAGE
 }
@@ -18,7 +18,7 @@ USAGE
 SMOKE=false
 DRY_RUN=false
 HOVER_NUM_ENVS=128
-RACE_NUM_ENVS=128
+RACE_NUM_ENVS=512
 GPU_ID=0
 PYTHON_BIN="${PYTHON_BIN:-python}"
 

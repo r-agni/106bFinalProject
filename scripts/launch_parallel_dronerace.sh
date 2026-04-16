@@ -9,14 +9,14 @@ Usage:
 Options:
   --smoke       Launch one short smoke run (max_iters=3, save_interval=2).
   --dry-run     Print commands without executing them.
-  --num-envs N  Override task.env.num_envs (default: 128).
+  --num-envs N  Override task.env.num_envs (default: 512).
   -h, --help    Show this help message.
 USAGE
 }
 
 SMOKE=false
 DRY_RUN=false
-NUM_ENVS=128
+NUM_ENVS=512
 MAX_PARALLEL=2
 GPU_ID=0
 PYTHON_BIN="${PYTHON_BIN:-python}"

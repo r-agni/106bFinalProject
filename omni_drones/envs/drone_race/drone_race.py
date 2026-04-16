@@ -181,9 +181,9 @@ class DroneRaceEnv(IsaacEnv):
         self.effort = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device)
         self.prev_drone_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.total_frames_counter = 0
-        self.angular_penalty_decay_frames = 10_000_000  # race track has 180° reversal; keep angular damping longer before unleashing aggressive flight
+        self.angular_penalty_decay_frames = 100_000_000  # covers phase 1+2 fully and half of phase 3; keeps damping active until drone has learned basic flight + partial track
         self.gate_just_passed_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.crash_grace_steps = 45  # race track max gate spacing is 10.44m; 45 steps gives drone time to reorient toward new gate
+        self.crash_grace_steps = 100  # 1-second recovery window after gate crossing or mid-track spawn; prevents premature distance-crashes
         self.gates_crossed_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         # Per-gate crossing counters (12 gates, gate 12 = lap closure = same as gate 0)
         self.per_gate_crosses = torch.zeros(self.num_envs, 12, device=self.device, dtype=torch.long)
@@ -194,6 +194,22 @@ class DroneRaceEnv(IsaacEnv):
         self.mean_altitude_acc = torch.zeros(self.num_envs, device=self.device)
         # Action magnitude tracking
         self.mean_action_mag_acc = torch.zeros(self.num_envs, device=self.device)
+
+        # --- Performance-gated curriculum state ---
+        # Rolling EMA of per-episode statistics, updated on episode termination.
+        # Smoothing coefficient ~0.01 gives an effective window of ~100 episodes per env.
+        self.curriculum_phase = 0  # 0=phase1 (gate0), 1=phase2 (first half), 2=phase3 (full track)
+        self.curriculum_ema_alpha = 0.01
+        # Fraction of episodes where gate 0 was crossed (gates_crossed_this_ep >= 1 after starting at gate 0).
+        self.gate0_cross_rate_ema = 0.0
+        # EMA of furthest_gate_this_ep across all terminations.
+        self.furthest_gate_ema = 0.0
+        # Thresholds for unlocking next phase (Priority 2 in plan).
+        self.phase2_unlock_gate0_rate = 0.40   # need 40% gate-0 success before leaving phase 1
+        self.phase3_unlock_furthest = 5.0       # need avg furthest gate >= 5 before unlocking full-track
+        # Hard floor: don't gate phase 1 forever if EMA starts noisy — allow unlock once we have enough data.
+        self.curriculum_min_phase_frames = 2_000_000  # minimum frames per phase before unlock eligible
+        self._phase_started_at_frames = 0  # frame counter at start of current phase (updated on transition)
 
         # Use a single view with wildcard pattern to access all gates
         try:
@@ -489,16 +505,20 @@ class DroneRaceEnv(IsaacEnv):
             "lap_time_steps": Unbounded(1),     # steps to complete lap (0 if no lap completed)
             # Reward component breakdown
             "reward_progress": Unbounded(1),    # cumulative progress reward
+            "reward_speed": Unbounded(1),       # cumulative speed-along-racing-line reward
             "reward_gates": Unbounded(1),       # cumulative gate passage reward
             "reward_penalties": Unbounded(1),   # cumulative angular + smoothness penalties
             "reward_altitude": Unbounded(1),    # cumulative altitude alignment reward
             "reward_approach": Unbounded(1),    # cumulative close-approach shaping reward
+            "reward_crash": Unbounded(1),       # cumulative crash penalties
             # Angular rate magnitude
             "mean_ang_rate": Unbounded(1),      # mean ||ang_vel|| over episode
             # Angular penalty decay (scalar, same for all envs)
             "ang_penalty_decay_frac": Unbounded(1),
             # Curriculum phase tracking
             "curriculum_phase": Unbounded(1),   # 0=phase1, 1=phase2, 2=phase3
+            "curriculum_gate0_ema": Unbounded(1),   # EMA gate-0 success rate — gates phase 0→1 at 0.40
+            "curriculum_furthest_ema": Unbounded(1),  # EMA furthest gate reached — gates phase 1→2 at 5.0
             # Per-gate visit counts — how many times each gate was crossed in the episode
             "gate_0_crosses": Unbounded(1),
             "gate_1_crosses": Unbounded(1),
@@ -530,21 +550,24 @@ class DroneRaceEnv(IsaacEnv):
 
         n = len(env_ids)
 
-        # --- Progressive curriculum for 13-gate race track ---
-        # Phase 1 (0–5M frames):   always gate 0 — learn basic gate crossing first
-        # Phase 2 (5M–20M frames): 20% gate 0, 80% random from first half of track — learn upstream gates
-        # Phase 3 (>20M frames):   15% gate 0, 85% uniform over full track — generalize to all gates
+        # --- Performance-gated progressive curriculum for 13-gate race track ---
+        # Phase 0: always gate 0 — learn basic gate crossing first.
+        # Phase 1: 20% gate 0, 80% random from first half of track — learn upstream gates.
+        # Phase 2: 15% gate 0, 85% uniform over full track — generalize to all gates.
+        # Phase transitions are gated by self.curriculum_phase, which is only advanced by
+        # the performance gate check in _compute_reward_and_done (gate 0 success rate >= 40%
+        # to reach phase 1, furthest_gate EMA >= 5 to reach phase 2), with a min-frames floor.
+        # This fixes the run 2a8kkbon failure where frame-based phase 2 unlock at 5M frames
+        # poisoned training because gate 0 had never been crossed.
         # Gate num_gates-1 is excluded (it duplicates gate 0 = lap closure).
-        if self.total_frames_counter < 5_000_000:
+        if self.curriculum_phase == 0:
             start_gates = torch.zeros(n, device=self.device, dtype=torch.long)
-        elif self.total_frames_counter < 20_000_000:
-            # Phase 2: first half of track only
+        elif self.curriculum_phase == 1:
             half = max(1, self.num_gates // 2)
             always_gate0 = torch.rand(n, device=self.device) < 0.20
             random_gates = torch.randint(0, half, (n,), device=self.device)
             start_gates = torch.where(always_gate0, torch.zeros(n, dtype=torch.long, device=self.device), random_gates)
-        else:
-            # Phase 3: full track
+        else:  # curriculum_phase == 2
             always_gate0 = torch.rand(n, device=self.device) < 0.15
             random_gates = torch.randint(0, self.num_gates - 1, (n,), device=self.device)
             start_gates = torch.where(always_gate0, torch.zeros(n, dtype=torch.long, device=self.device), random_gates)
@@ -555,7 +578,10 @@ class DroneRaceEnv(IsaacEnv):
         self.track_completed[env_ids] = False
         self.last_action[env_ids] = 0.0
         self.effort[env_ids] = 0.0
-        self.gate_just_passed_steps[env_ids] = 0
+        # Give every spawned env a full grace window so mid-track curriculum spawns
+        # (which start up to ~10m from the target gate) are not immediately killed by
+        # the distance-crash check before the drone has a chance to orient itself.
+        self.gate_just_passed_steps[env_ids] = self.crash_grace_steps
         self.gates_crossed_this_ep[env_ids] = 0
         self.per_gate_crosses[env_ids] = 0
         self.furthest_gate_this_ep[env_ids] = start_gates
@@ -1143,6 +1169,39 @@ class DroneRaceEnv(IsaacEnv):
         completed_task = self.track_completed
         done = truncated | completed_task.unsqueeze(-1) | crashed.unsqueeze(-1)
 
+        # --- Performance-gated curriculum EMA update ---
+        # On each episode termination, update the rolling averages used to decide phase transitions.
+        # Block-EMA identity for k equal-weight samples applied in one go:
+        #   ema ← (1-α)^k · ema + (1 - (1-α)^k) · mean(x)
+        # This matches the sequential EMA exactly when all k samples are the same,
+        # and closely approximates it in the typical case (keeps the math GPU-resident).
+        done_flat = done.squeeze(-1)  # (N,)
+        n_done = int(done_flat.sum().item())
+        if n_done > 0:
+            gates_crossed_done = self.gates_crossed_this_ep[done_flat].float()
+            furthest_done = self.furthest_gate_this_ep[done_flat].float()
+            gate0_success_mean = (gates_crossed_done >= 1).float().mean().item()
+            furthest_mean = furthest_done.mean().item()
+            alpha = self.curriculum_ema_alpha
+            decay = (1.0 - alpha) ** n_done
+            self.gate0_cross_rate_ema = decay * self.gate0_cross_rate_ema + (1.0 - decay) * gate0_success_mean
+            self.furthest_gate_ema = decay * self.furthest_gate_ema + (1.0 - decay) * furthest_mean
+
+        # --- Curriculum phase transition (performance-gated, with frame-count floor) ---
+        # Phase unlocks only when (a) minimum frames elapsed since phase start AND (b) performance threshold met.
+        # This prevents the failure from run 2a8kkbon where phase 2 started at 5M frames with zero gate-0 competence.
+        frames_in_phase = self.total_frames_counter - self._phase_started_at_frames
+        if self.curriculum_phase == 0:
+            if frames_in_phase >= self.curriculum_min_phase_frames and \
+               self.gate0_cross_rate_ema >= self.phase2_unlock_gate0_rate:
+                self.curriculum_phase = 1
+                self._phase_started_at_frames = self.total_frames_counter
+        elif self.curriculum_phase == 1:
+            if frames_in_phase >= self.curriculum_min_phase_frames and \
+               self.furthest_gate_ema >= self.phase3_unlock_furthest:
+                self.curriculum_phase = 2
+                self._phase_started_at_frames = self.total_frames_counter
+
         # --- stats ---
         self.stats["truncated"].add_(truncated.float())
         self.stats["collision"].add_(crashed.float().unsqueeze(-1))
@@ -1169,13 +1228,17 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["lap_time_steps"][just_completed] = self.progress_buf[just_completed].float().unsqueeze(-1)
         # Reward component breakdown (cumulative)
         progress_reward = self.reward_progress_scale * progress  # (N,)
+        speed_reward = self.reward_speed_scale * speed_along_racing_line  # (N,)
         gate_reward = self.reward_gate_passage * gate_passed_this_step.float()  # (N,)
         penalty_reward = (self.reward_angular_penalty * ang_decay_frac) * ang_penalty + self.reward_action_smooth_scale * action_diff  # (N,)
+        crash_reward = self.reward_crash_scale * crashed.float()  # (N,)
         self.stats["reward_progress"].add_(progress_reward.unsqueeze(-1))
+        self.stats["reward_speed"].add_(speed_reward.unsqueeze(-1))
         self.stats["reward_gates"].add_(gate_reward.unsqueeze(-1))
         self.stats["reward_penalties"].add_(penalty_reward.unsqueeze(-1))
         self.stats["reward_altitude"].add_(altitude_reward.unsqueeze(-1))
         self.stats["reward_approach"].add_(approach_reward.unsqueeze(-1))
+        self.stats["reward_crash"].add_(crash_reward.unsqueeze(-1))
         # Angular rate magnitude (incremental mean)
         ang_rate_mag = ang_vel.norm(dim=-1)  # (N,)
         self.stats["mean_ang_rate"].add_((ang_rate_mag.unsqueeze(-1) - self.stats["mean_ang_rate"]) / ep_len.unsqueeze(-1))
@@ -1201,14 +1264,11 @@ class DroneRaceEnv(IsaacEnv):
         for gi in range(12):
             self.stats[f"gate_{gi}_crosses"][:] = self.per_gate_crosses[:, gi].float().unsqueeze(1)
 
-        # Curriculum phase (0=phase1, 1=phase2, 2=phase3) — same scalar for all envs
-        if self.total_frames_counter < 5_000_000:
-            cur_phase = 0.0
-        elif self.total_frames_counter < 20_000_000:
-            cur_phase = 1.0
-        else:
-            cur_phase = 2.0
-        self.stats["curriculum_phase"][:] = cur_phase
+        # Curriculum phase (0=phase1, 1=phase2, 2=phase3) — tracked in self.curriculum_phase,
+        # advanced by performance gate in the block above.
+        self.stats["curriculum_phase"][:] = float(self.curriculum_phase)
+        self.stats["curriculum_gate0_ema"][:] = float(self.gate0_cross_rate_ema)
+        self.stats["curriculum_furthest_ema"][:] = float(self.furthest_gate_ema)
 
         # Distance to current gate at end of episode (meaningful when episode ends)
         self.stats["final_dist_to_gate"][:] = distance_to_gate.unsqueeze(1)

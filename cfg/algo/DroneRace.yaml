@@ -5,7 +5,7 @@ train_every: 256  # race track avg gate spacing ~7.4m → ~74 steps at 10m/s; 25
 ppo_epochs: 10    # gradient epochs per update
 num_minibatches: 16   # 512*256/16=8192 per minibatch — good gradient diversity
 clip_param: 0.2
-entropy_coef: 0.02    # raised from 0.01: gate reward fires very rarely early, need longer-lived exploration to find first gate crossings before entropy collapses
+entropy_coef: 0.001   # actions are now clamped to [-1,1], so exploration is naturally bounded; 0.02 caused runaway entropy (5.7->41.4 in prev run)
 gae_lambda: 0.95
 gamma: 0.998  # long effective horizon (~500 steps) needed for lap bonus credit assignment
 max_grad_norm: 5.0

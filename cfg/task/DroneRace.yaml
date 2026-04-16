@@ -140,17 +140,18 @@ gate_height: 1.5   # original gate design — do not change
 gate_width: 1.5    # original gate design — do not change 
 
 # ---- Reward hyperparameters (tuned for 13-gate race track) ----
-reward_progress_scale: 5.0        # dense: path-projection progress along racing line (Song et al. 2021)
+# Retuned after run 2a8kkbon: gate reward was 0.01x of return (drowned by speed+progress). Target now: gate reward ≈ 40% of return at convergence.
+reward_progress_scale: 3.0        # dense: path-projection progress along racing line (Song et al. 2021) — reduced from 5.0 so gate reward dominates
 reward_velocity_scale: 0.0        # velocity toward gate — disabled (conflicts with corner-cutting)
-reward_gate_passage: 20.0         # sparse bonus per gate crossed
+reward_gate_passage: 50.0         # sparse bonus per gate crossed — 2.5x of previous 20.0 so gate crossings drive the gradient
 reward_lap_completion: 100.0      # full lap bonus
-reward_angular_penalty: 0.05      # penalize squared angular rates; decays over 10M frames
+reward_angular_penalty: 0.15      # penalize squared angular rates; 3x of previous 0.05 so tipping over actually costs; decays over 100M frames
 reward_action_smooth_scale: 0.003 # penalize large action changes
-reward_crash_scale: 80.0          # crash penalty — larger than sum of ~3 gate rewards to prevent crash-gaming
-reward_speed_scale: 0.3           # speed along racing line (clamped ≥0)
+reward_crash_scale: 80.0          # crash penalty — larger than sum of ~3 gate rewards to prevent crash-gaming (still >> 50 gate bonus)
+reward_speed_scale: 0.1           # speed along racing line (clamped ≥0) — reduced from 0.3: was drowning the gate reward
 reward_altitude_scale: 0.5        # bonus for matching altitude at elevated gates (origin z=3.0, center z=3.75m with gate_height=1.5); threshold fixed to > 2.75m so it only fires at gates 7 and 11
 reward_approach_scale: 0.3        # bonus for reducing distance when within 4m of gate
-crash_dist_threshold: 14.0        # max gate spacing is ~10.44m (gates 3→4); 14m gives 3.5m margin for reorientation
+crash_dist_threshold: 18.0        # max gate spacing is ~10.44m; 18m gives 7.6m recovery margin (0.76s at 10 m/s)
 crash_z_min: 0.15                 # minimum altitude (ground crash)
 # ---------------------------------------------------------------------------
 

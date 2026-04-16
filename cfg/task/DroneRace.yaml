@@ -140,18 +140,20 @@ gate_height: 1.5   # original gate design — do not change
 gate_width: 1.5    # original gate design — do not change 
 
 # ---- Reward hyperparameters (tuned for 13-gate race track) ----
-# Retuned after run 2a8kkbon: gate reward was 0.01x of return (drowned by speed+progress). Target now: gate reward ≈ 40% of return at convergence.
-reward_progress_scale: 3.0        # dense: path-projection progress along racing line (Song et al. 2021) — reduced from 5.0 so gate reward dominates
+# Phase 1: complete all gates. Phase 2: complete them fast.
+# Gate reward should be the dominant signal (~40% of return at convergence).
+reward_progress_scale: 2.0        # dense: path-projection progress along racing line — lowered from 3.0 so gate reward dominates
 reward_velocity_scale: 0.0        # velocity toward gate — disabled (conflicts with corner-cutting)
-reward_gate_passage: 50.0         # sparse bonus per gate crossed — 2.5x of previous 20.0 so gate crossings drive the gradient
-reward_lap_completion: 100.0      # full lap bonus
-reward_angular_penalty: 0.15      # penalize squared angular rates; 3x of previous 0.05 so tipping over actually costs; decays over 100M frames
-reward_action_smooth_scale: 0.003 # penalize large action changes
-reward_crash_scale: 80.0          # crash penalty — larger than sum of ~3 gate rewards to prevent crash-gaming (still >> 50 gate bonus)
-reward_speed_scale: 0.1           # speed along racing line (clamped ≥0) — reduced from 0.3: was drowning the gate reward
-reward_altitude_scale: 0.5        # bonus for matching altitude at elevated gates (origin z=3.0, center z=3.75m with gate_height=1.5); threshold fixed to > 2.75m so it only fires at gates 7 and 11
-reward_approach_scale: 0.3        # bonus for reducing distance when within 4m of gate
-crash_dist_threshold: 18.0        # max gate spacing is ~10.44m; 18m gives 7.6m recovery margin (0.76s at 10 m/s)
+reward_gate_passage: 100.0        # sparse bonus per gate crossed — raised from 50 so gate crossings are the primary gradient signal
+reward_lap_completion: 200.0      # full lap bonus — raised from 100; completing the course is the #1 objective
+reward_lap_speed_bonus: 200.0     # time-bonus: scales linearly with fraction of episode time remaining at lap completion
+reward_angular_penalty: 0.1       # penalize squared angular rates; reduced from 0.15 (actions are now clamped, less need)
+reward_action_smooth_scale: 0.002 # penalize large action changes
+reward_crash_scale: 80.0          # crash penalty
+reward_speed_scale: 0.05          # speed along racing line — halved from 0.1 to let gate reward dominate
+reward_altitude_scale: 0.5        # bonus for matching altitude at elevated gates 7 and 11
+reward_approach_scale: 0.5        # bonus for reducing distance when within 4m of gate — raised from 0.3 for better approach shaping
+crash_dist_threshold: 25.0        # raised from 18m — max gate spacing is 10.44m; 25m gives 14.6m recovery margin
 crash_z_min: 0.15                 # minimum altitude (ground crash)
 # ---------------------------------------------------------------------------
 

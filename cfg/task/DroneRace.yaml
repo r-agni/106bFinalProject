@@ -139,22 +139,39 @@ gate_scale: 1.0
 gate_height: 1.5   # original gate design — do not change
 gate_width: 1.5    # original gate design — do not change 
 
-# ---- Reward hyperparameters (tuned for 13-gate race track) ----
-# Phase 1: complete all gates. Phase 2: complete them fast.
-# Gate reward should be the dominant signal (~40% of return at convergence).
-reward_progress_scale: 2.0        # dense: path-projection progress along racing line — lowered from 3.0 so gate reward dominates
-reward_velocity_scale: 0.0        # velocity toward gate — disabled (conflicts with corner-cutting)
-reward_gate_passage: 100.0        # sparse bonus per gate crossed — raised from 50 so gate crossings are the primary gradient signal
-reward_lap_completion: 200.0      # full lap bonus — raised from 100; completing the course is the #1 objective
-reward_lap_speed_bonus: 200.0     # time-bonus: scales linearly with fraction of episode time remaining at lap completion
-reward_angular_penalty: 0.1       # penalize squared angular rates; reduced from 0.15 (actions are now clamped, less need)
+# ---- Reward hyperparameters (tuned for the 13-gate race track) ----
+# Phase 0: learn the full ordered lap from gate 1 with sparse gate / sequence / lap rewards.
+# Phase 1: once lap completion accuracy is high enough, enable progress shaping and lap-time pressure.
+
+# Dense shaping along the racing line.
+# Progress shaping is disabled during the accuracy-first phase and enabled only after unlock.
+reward_progress_scale: 2.0        # path-projection progress between consecutive gates
+
+# Sparse bonuses for correct ordered course completion.
+reward_gate_passage: 100.0        # dominant signal per gate crossed
+reward_gate_sequence_scale: 5.0   # increasing bonus for longer ordered gate streaks within the episode
+reward_lap_completion: 200.0      # base bonus for finishing the lap
+reward_lap_speed_bonus: 200.0     # extra bonus scaled by episode time remaining; enabled only after unlock
+
+# Auxiliary penalties for local mistakes.
+reward_altitude_scale: 0.5        # bounded penalty for altitude mismatch at elevated gates 7 and 11
+reward_approach_scale: 0.5        # penalty for moving away from the gate when already within 6m
+
+# Penalties and crash termination thresholds.
+reward_angular_penalty: 0.1       # penalize squared angular rates
 reward_action_smooth_scale: 0.002 # penalize large action changes
 reward_crash_scale: 80.0          # crash penalty
-reward_speed_scale: 0.05          # speed along racing line — halved from 0.1 to let gate reward dominate
-reward_altitude_scale: 0.5        # bonus for matching altitude at elevated gates 7 and 11
-reward_approach_scale: 0.5        # bonus for reducing distance when within 4m of gate — raised from 0.3 for better approach shaping
-crash_dist_threshold: 25.0        # raised from 18m — max gate spacing is 10.44m; 25m gives 14.6m recovery margin
-crash_z_min: 0.15                 # minimum altitude (ground crash)
+crash_dist_threshold: 25.0        # terminate if the drone diverges too far from the target gate
+crash_z_min: 0.15                 # terminate if the drone drops below this altitude
+
+# Accuracy-first curriculum.
+phase_speed_unlock_accuracy_rate: 0.40 # enable speed shaping once full-lap completion EMA reaches this rate
+curriculum_min_phase_frames: 2_000_000 # minimum frames before the speed phase can unlock
+curriculum_ema_alpha: 0.01             # EMA smoothing for curriculum metrics
+
+# Safety / penalty schedule.
+angular_penalty_decay_frames: 100_000_000 # keep angular damping active through the early learning stages
+crash_grace_steps: 100                    # grace window after spawn / gate crossing before distance crash applies
 # ---------------------------------------------------------------------------
 
 # If gates are hard to see, set debug_gate_origins: true for thick RGB axes at each gate.

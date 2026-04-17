@@ -26,6 +26,21 @@ pass_threshold: 0.4
 # Reward settings
 reward_progress_scale: 2.0
 reward_gate_passage: 10.0
+reward_gate_sequence_scale: 2.0
+reward_lap_completion: 25.0
+reward_lap_speed_bonus: 25.0
+reward_angular_penalty: 0.1
+reward_action_smooth_scale: 0.002
+reward_crash_scale: 20.0
+reward_altitude_scale: 0.0
+reward_approach_scale: 0.2
+crash_dist_threshold: 12.0
+crash_z_min: 0.15
+phase_speed_unlock_accuracy_rate: 0.40
+curriculum_min_phase_frames: 500_000
+curriculum_ema_alpha: 0.01
+angular_penalty_decay_frames: 20_000_000
+crash_grace_steps: 100
 reward_effort_weight: 0.1
 reward_final_position: 10.0
 

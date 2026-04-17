@@ -86,36 +86,30 @@ class DroneRaceEnv(IsaacEnv):
     | `gate_scale`            | float | 1.0           | Scale of the gate assets.                                                                                                                                                                                                              |
     | `gate_asset_path`       | str   | None          | Path to the gate USD asset. Defaults to `ASSET_PATH/gate/gate.usd` (isaac_drone_racer style). Can be overridden in config.                                                                                                        |
     """
+    REWARD_CONFIG_KEYS = (
+        "reward_progress_scale",
+        "reward_gate_passage",
+        "reward_gate_sequence_scale",
+        "reward_lap_completion",
+        "reward_lap_speed_bonus",
+        "reward_angular_penalty",
+        "reward_action_smooth_scale",
+        "reward_crash_scale",
+        "reward_altitude_scale",
+        "reward_approach_scale",
+    )
+    TERMINATION_CONFIG_KEYS = (
+        "crash_dist_threshold",
+        "crash_z_min",
+    )
+
     def __init__(self, cfg, headless):
-        # -----------------------------------------------------------------------
-        # STUDENT TODO (1/3): Load your reward scaling hyperparameters.
-        #
-        # Each line reads one value from cfg/task/DroneRace.yaml.
-        # The second argument to .get() is the default used if the key is absent.
-        # Add matching entries in cfg/task/DroneRace.yaml for each one you add.
-        #
-        # Example:
-        #   self.reward_progress_scale = cfg.task.get("reward_progress_scale", 1.0)
-        #   self.reward_gate_passage   = cfg.task.get("reward_gate_passage", 10.0)
-        #   self.reward_crash_scale    = cfg.task.get("reward_crash_scale", 5.0)
-        # -----------------------------------------------------------------------
-        # ----- ADD YOUR REWARD CONFIG LINES BELOW (replace / extend the example) -----
-
-        self.reward_progress_scale      = cfg.task.get("reward_progress_scale", 2.0)
-        self.reward_velocity_scale      = cfg.task.get("reward_velocity_scale", 0.0)
-        self.reward_gate_passage        = cfg.task.get("reward_gate_passage", 100.0)
-        self.reward_lap_completion      = cfg.task.get("reward_lap_completion", 200.0)
-        self.reward_lap_speed_bonus     = cfg.task.get("reward_lap_speed_bonus", 200.0)
-        self.reward_angular_penalty     = cfg.task.get("reward_angular_penalty", 0.1)
-        self.reward_action_smooth_scale = cfg.task.get("reward_action_smooth_scale", 0.002)
-        self.reward_crash_scale         = cfg.task.get("reward_crash_scale", 80.0)
-        self.reward_speed_scale         = cfg.task.get("reward_speed_scale", 0.05)
-        self.reward_altitude_scale      = cfg.task.get("reward_altitude_scale", 0.5)
-        self.reward_approach_scale      = cfg.task.get("reward_approach_scale", 0.5)
-        self.crash_dist_threshold       = cfg.task.get("crash_dist_threshold", 25.0)
-        self.crash_z_min                = cfg.task.get("crash_z_min", 0.15)
-
-        # ----- END STUDENT CODE -----
+        # Keep reward and termination scalars in the active task YAML so the
+        # environment code cannot drift from the configured track settings.
+        self._load_task_scalars(
+            cfg.task,
+            self.REWARD_CONFIG_KEYS + self.TERMINATION_CONFIG_KEYS,
+        )
 
         self.gate_scale = cfg.task.gate_scale
         
@@ -182,9 +176,9 @@ class DroneRaceEnv(IsaacEnv):
         self.effort = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device)
         self.prev_drone_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.total_frames_counter = 0
-        self.angular_penalty_decay_frames = 100_000_000  # covers phase 1+2 fully and half of phase 3; keeps damping active until drone has learned basic flight + partial track
+        self.angular_penalty_decay_frames = int(cfg.task.get("angular_penalty_decay_frames", 100_000_000))
         self.gate_just_passed_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.crash_grace_steps = 100  # 1-second recovery window after gate crossing or mid-track spawn; prevents premature distance-crashes
+        self.crash_grace_steps = int(cfg.task.get("crash_grace_steps", 100))
         self.gates_crossed_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         # Per-gate crossing counters (12 gates, gate 12 = lap closure = same as gate 0)
         self.per_gate_crosses = torch.zeros(self.num_envs, 12, device=self.device, dtype=torch.long)
@@ -196,20 +190,15 @@ class DroneRaceEnv(IsaacEnv):
         # Action magnitude tracking
         self.mean_action_mag_acc = torch.zeros(self.num_envs, device=self.device)
 
-        # --- Performance-gated curriculum state ---
-        # Rolling EMA of per-episode statistics, updated on episode termination.
-        # Smoothing coefficient ~0.01 gives an effective window of ~100 episodes per env.
-        self.curriculum_phase = 0  # 0=phase1 (gate0), 1=phase2 (first half), 2=phase3 (full track)
-        self.curriculum_ema_alpha = 0.01
-        # Fraction of episodes where gate 0 was crossed (gates_crossed_this_ep >= 1 after starting at gate 0).
-        self.gate0_cross_rate_ema = 0.0
-        # EMA of furthest_gate_this_ep across all terminations.
+        # --- Accuracy-first curriculum state ---
+        # Phase 0: accuracy-first full laps from gate 0, with only sparse ordered-completion rewards.
+        # Phase 1: same full-lap task, but dense speed/progress shaping is enabled.
+        self.curriculum_phase = 0  # 0=accuracy-first, 1=speed-shaping
+        self.curriculum_ema_alpha = cfg.task.get("curriculum_ema_alpha", 0.01)
+        self.lap_completion_rate_ema = 0.0
         self.furthest_gate_ema = 0.0
-        # Thresholds for unlocking next phase (Priority 2 in plan).
-        self.phase2_unlock_gate0_rate = 0.40   # need 40% gate-0 success before leaving phase 1
-        self.phase3_unlock_furthest = 3.0       # need avg furthest gate >= 3 before unlocking full-track (lowered from 4.0)
-        # Hard floor: don't gate phase 1 forever if EMA starts noisy — allow unlock once we have enough data.
-        self.curriculum_min_phase_frames = 2_000_000  # minimum frames per phase before unlock eligible
+        self.phase_speed_unlock_accuracy_rate = cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40)
+        self.curriculum_min_phase_frames = int(cfg.task.get("curriculum_min_phase_frames", 2_000_000))
         self._phase_started_at_frames = 0  # frame counter at start of current phase (updated on transition)
 
         # Use a single view with wildcard pattern to access all gates
@@ -264,6 +253,18 @@ class DroneRaceEnv(IsaacEnv):
             self.axis_length = cfg.task.get("debug_axis_length", 0.3)  # Length of axis lines
         else:
             self.draw = None
+
+    def _load_task_scalars(self, task_cfg, keys):
+        missing = [key for key in keys if key not in task_cfg]
+        if missing:
+            missing_str = ", ".join(missing)
+            raise KeyError(
+                "DroneRace task config is missing required scalar keys: "
+                f"{missing_str}. Add them to the active cfg/task/*.yaml file."
+            )
+
+        for key in keys:
+            setattr(self, key, task_cfg[key])
 
     def _draw_gate_origins(self, gate_world_pos, gate_world_rot, env_idx=0):
         """
@@ -511,20 +512,20 @@ class DroneRaceEnv(IsaacEnv):
             "lap_time_steps": Unbounded(1),     # steps to complete lap (0 if no lap completed)
             # Reward component breakdown
             "reward_progress": Unbounded(1),    # cumulative progress reward
-            "reward_speed": Unbounded(1),       # cumulative speed-along-racing-line reward
+            "reward_speed": Unbounded(1),       # cumulative per-step speed reward term (currently zeroed)
             "reward_gates": Unbounded(1),       # cumulative gate passage reward
             "reward_penalties": Unbounded(1),   # cumulative angular + smoothness penalties
-            "reward_altitude": Unbounded(1),    # cumulative altitude alignment reward
-            "reward_approach": Unbounded(1),    # cumulative close-approach shaping reward
+            "reward_altitude": Unbounded(1),    # cumulative altitude penalty term
+            "reward_approach": Unbounded(1),    # cumulative near-gate retreat penalty term
             "reward_crash": Unbounded(1),       # cumulative crash penalties
             # Angular rate magnitude
             "mean_ang_rate": Unbounded(1),      # mean ||ang_vel|| over episode
             # Angular penalty decay (scalar, same for all envs)
             "ang_penalty_decay_frac": Unbounded(1),
             # Curriculum phase tracking
-            "curriculum_phase": Unbounded(1),   # 0=phase1, 1=phase2, 2=phase3
-            "curriculum_gate0_ema": Unbounded(1),   # EMA gate-0 success rate — gates phase 0→1 at 0.40
-            "curriculum_furthest_ema": Unbounded(1),  # EMA furthest gate reached — gates phase 1→2 at 5.0
+            "curriculum_phase": Unbounded(1),   # 0=accuracy-first, 1=speed-shaping
+            "curriculum_accuracy_ema": Unbounded(1),   # EMA full-lap completion rate used to unlock speed shaping
+            "curriculum_furthest_ema": Unbounded(1),   # EMA furthest gate reached, kept as a diagnostic
             # Per-gate visit counts — how many times each gate was crossed in the episode
             "gate_0_crosses": Unbounded(1),
             "gate_1_crosses": Unbounded(1),
@@ -556,27 +557,9 @@ class DroneRaceEnv(IsaacEnv):
 
         n = len(env_ids)
 
-        # --- Performance-gated progressive curriculum for 13-gate race track ---
-        # Phase 0: always gate 0 — learn basic gate crossing first.
-        # Phase 1: 20% gate 0, 80% random from first half of track — learn upstream gates.
-        # Phase 2: 15% gate 0, 85% uniform over full track — generalize to all gates.
-        # Phase transitions are gated by self.curriculum_phase, which is only advanced by
-        # the performance gate check in _compute_reward_and_done (gate 0 success rate >= 40%
-        # to reach phase 1, furthest_gate EMA >= 5 to reach phase 2), with a min-frames floor.
-        # This fixes the run 2a8kkbon failure where frame-based phase 2 unlock at 5M frames
-        # poisoned training because gate 0 had never been crossed.
-        # Gate num_gates-1 is excluded (it duplicates gate 0 = lap closure).
-        if self.curriculum_phase == 0:
-            start_gates = torch.zeros(n, device=self.device, dtype=torch.long)
-        elif self.curriculum_phase == 1:
-            half = max(1, self.num_gates // 2)
-            always_gate0 = torch.rand(n, device=self.device) < 0.20
-            random_gates = torch.randint(0, half, (n,), device=self.device)
-            start_gates = torch.where(always_gate0, torch.zeros(n, dtype=torch.long, device=self.device), random_gates)
-        else:  # curriculum_phase == 2
-            always_gate0 = torch.rand(n, device=self.device) < 0.15
-            random_gates = torch.randint(0, self.num_gates - 1, (n,), device=self.device)
-            start_gates = torch.where(always_gate0, torch.zeros(n, dtype=torch.long, device=self.device), random_gates)
+        # Accuracy-first curriculum: always start behind gate 0 so the policy learns
+        # the whole ordered lap before any speed shaping is introduced.
+        start_gates = torch.zeros(n, device=self.device, dtype=torch.long)
 
         # Reset gate progress
         self.gate_indices[env_ids] = start_gates
@@ -584,9 +567,8 @@ class DroneRaceEnv(IsaacEnv):
         self.track_completed[env_ids] = False
         self.last_action[env_ids] = 0.0
         self.effort[env_ids] = 0.0
-        # Give every spawned env a full grace window so mid-track curriculum spawns
-        # (which start up to ~10m from the target gate) are not immediately killed by
-        # the distance-crash check before the drone has a chance to orient itself.
+        # Give every spawned env a full grace window so the drone is not immediately
+        # killed by the distance-crash check before it has a chance to orient itself.
         self.gate_just_passed_steps[env_ids] = self.crash_grace_steps
         self.gates_crossed_this_ep[env_ids] = 0
         self.per_gate_crosses[env_ids] = 0
@@ -1098,11 +1080,15 @@ class DroneRaceEnv(IsaacEnv):
         # -----------------------------------------------------------------------
         # ----- ADD YOUR REWARD CODE BELOW (replace the placeholder) -----
 
+        speed_shaping_enabled = self.curriculum_phase >= 1
+        speed_phase_weight = 1.0 if speed_shaping_enabled else 0.0
+
         # 1. Path-projection progress reward (Song et al. 2021).
         #    Projects the drone's step displacement onto the unit vector from the previous
         #    gate center to the current target gate center. This is smooth across gate
         #    transitions (no discontinuity when the target switches) and rewards forward
         #    movement along the racing line rather than distance to a point.
+        #    This is disabled during the accuracy-first phase.
         #    Placed AFTER _detect_gate_crossings so self.gate_indices is already updated.
         prev_gate_indices = (self.gate_indices - 1) % (self.num_gates - 1)  # (N,) — wraps at track
         prev_gate_pos_env = gate_env_pos[batch_indices, prev_gate_indices]   # (N, 3)
@@ -1115,31 +1101,44 @@ class DroneRaceEnv(IsaacEnv):
         progress = (displacement * gate_to_gate_norm).sum(dim=-1)            # (N,)
         self.prev_drone_pos = drone_pos_flat.clone()
 
-        reward = self.reward_progress_scale * progress
+        progress_reward = speed_phase_weight * self.reward_progress_scale * progress
+        reward = progress_reward
 
-        # 2. Speed-along-racing-line reward (replaces disabled velocity-toward-gate term).
-        #    Projects current velocity onto the gate-to-gate unit vector — same direction used
-        #    for progress reward. Clamped to ≥0 so only forward speed is rewarded, preventing
-        #    the policy from gaming it by flying backward.
+        # 2. Speed diagnostic.
+        #    Keep tracking forward speed along the racing line for stats, but do not pay
+        #    a per-step speed reward. Speed is only incentivized through lap_speed_reward
+        #    once the accuracy gate has unlocked phase 1.
         lin_vel_world = self.drone.vel[:, 0, :3]  # (N, 3) linear velocity in world frame
         speed_along_racing_line = (lin_vel_world * gate_to_gate_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
-        reward += self.reward_speed_scale * speed_along_racing_line
+        speed_reward = torch.zeros_like(speed_along_racing_line)
+        reward += speed_reward
 
         # 3. Sparse gate passage bonus.
-        reward += self.reward_gate_passage * gate_passed_this_step.float()
+        gate_reward = self.reward_gate_passage * gate_passed_this_step.float()
+        reward += gate_reward
 
-        # 4. Lap completion bonus with time-based speed incentive.
-        #    Base bonus for completing the lap + scaled bonus that rewards faster completion.
+        # 4. Ordered sequence bonus.
+        #    Gate crossings are only counted for the current target gate, so a non-zero
+        #    bonus here means the drone is advancing through the course in order. The bonus
+        #    grows with the current streak length to emphasize full consecutive laps.
+        ordered_streak = self.gates_crossed_this_ep.float()
+        sequence_reward = self.reward_gate_sequence_scale * ordered_streak * gate_passed_this_step.float()
+        reward += sequence_reward
+
+        # 5. Lap completion bonus with optional time-based speed incentive.
+        #    The speed incentive stays off during the accuracy-first phase.
         #    time_fraction = fraction of episode budget remaining (1.0 = instant, 0.0 = at timeout).
         time_fraction = (self.max_episode_length - self.progress_buf).float() / self.max_episode_length
-        lap_reward = (self.reward_lap_completion + self.reward_lap_speed_bonus * time_fraction) * self.track_completed.float()
+        lap_completion_reward = self.reward_lap_completion * self.track_completed.float()
+        lap_speed_reward = speed_phase_weight * self.reward_lap_speed_bonus * time_fraction * self.track_completed.float()
+        lap_reward = lap_completion_reward + lap_speed_reward
         reward += lap_reward
 
-        # 5. Altitude alignment bonus.
+        # 6. Altitude mismatch penalty.
         #    Race track has two elevated gates (z=3.0) at gates 7 and 11. The path-projection
         #    reward gives near-zero signal on the purely-vertical 2m segments (gate 6→7, 10→11)
-        #    because gate_to_gate_norm points almost entirely in Z. This bonus rewards the drone
-        #    for matching the correct altitude when the target gate is elevated (z > 1.5m).
+        #    because gate_to_gate_norm points almost entirely in Z. Instead of paying a bonus
+        #    for being aligned, subtract a bounded penalty when the drone is at the wrong height.
         current_gate_z = current_gate_center[:, 2]  # (N,)
         # Gate centers: normal gates (origin z=1.0) have center z=1.75m (= 1.0 + gate_height/2 = 1.0 + 0.75);
         # elevated gates (origin z=3.0) have center z=3.75m. Threshold midpoint = 2.75m.
@@ -1147,30 +1146,31 @@ class DroneRaceEnv(IsaacEnv):
         elevated_gate = current_gate_z > 2.75        # True only for elevated gates at origin z=3.0
         drone_z = drone_pos_flat[:, 2]               # (N,)
         altitude_error = (drone_z - current_gate_z).abs()
-        altitude_reward = torch.where(
+        altitude_penalty = torch.where(
             elevated_gate,
-            self.reward_altitude_scale * torch.exp(-altitude_error),
+            self.reward_altitude_scale * (1.0 - torch.exp(-altitude_error)),
             torch.zeros_like(altitude_error)
         )
-        reward += altitude_reward
+        reward -= altitude_penalty
 
-        # 6. Close-approach shaping bonus.
+        # 7. Near-gate retreat penalty.
         #    The 180° reversal at gate 7→8 (identical XY, only Z differs) causes path-projection
         #    progress to break down because the gate-to-gate direction reverses mid-approach.
-        #    Within 4m of any gate, reward distance reduction so the policy always has a signal
-        #    to close on the gate regardless of the racing-line direction.
+        #    Instead of giving a bonus for small approach improvements, penalize the drone only
+        #    when it retreats from the gate while already in the close-approach region.
         close_approach_mask = distance_to_gate < 6.0
         dist_improvement = self.prev_distance_to_gate - distance_to_gate  # positive = approaching
-        approach_reward = torch.where(
+        retreat_amount = (-dist_improvement).clamp(min=0.0)
+        approach_penalty = torch.where(
             close_approach_mask,
-            self.reward_approach_scale * dist_improvement.clamp(min=0.0),
-            torch.zeros_like(dist_improvement)
+            self.reward_approach_scale * retreat_amount,
+            torch.zeros_like(retreat_amount)
         )
-        reward += approach_reward
+        reward -= approach_penalty
         # Update prev_distance_to_gate for next step's approach reward computation.
         self.prev_distance_to_gate = distance_to_gate.clone()
 
-        # 7. Angular rate penalty with linear decay (Song et al.: used only in early training).
+        # 8. Angular rate penalty with linear decay (Song et al.: used only in early training).
         #    Decays from reward_angular_penalty → 0 over angular_penalty_decay_frames steps.
         self.total_frames_counter += self.num_envs
         ang_decay_frac = max(0.0, 1.0 - self.total_frames_counter / self.angular_penalty_decay_frames)
@@ -1178,7 +1178,7 @@ class DroneRaceEnv(IsaacEnv):
         ang_penalty = ang_vel.pow(2).sum(dim=-1)  # (N,)
         reward -= (self.reward_angular_penalty * ang_decay_frac) * ang_penalty
 
-        # 8. Action smoothness penalty.
+        # 9. Action smoothness penalty.
         action_diff = self.drone.throttle_difference.squeeze(-1)  # (N,)
         reward -= self.reward_action_smooth_scale * action_diff
 
@@ -1213,37 +1213,28 @@ class DroneRaceEnv(IsaacEnv):
         completed_task = self.track_completed
         done = truncated | completed_task.unsqueeze(-1) | crashed.unsqueeze(-1)
 
-        # --- Performance-gated curriculum EMA update ---
-        # On each episode termination, update the rolling averages used to decide phase transitions.
-        # Block-EMA identity for k equal-weight samples applied in one go:
-        #   ema ← (1-α)^k · ema + (1 - (1-α)^k) · mean(x)
-        # This matches the sequential EMA exactly when all k samples are the same,
-        # and closely approximates it in the typical case (keeps the math GPU-resident).
+        # --- Accuracy-first curriculum EMA update ---
+        # On each episode termination, update the rolling averages used to decide when
+        # to enable speed shaping. The unlock metric is full ordered-lap completion rate.
         done_flat = done.squeeze(-1)  # (N,)
         n_done = int(done_flat.sum().item())
         if n_done > 0:
-            gates_crossed_done = self.gates_crossed_this_ep[done_flat].float()
+            lap_completed_mean = completed_task[done_flat].float().mean().item()
             furthest_done = self.furthest_gate_this_ep[done_flat].float()
-            gate0_success_mean = (gates_crossed_done >= 1).float().mean().item()
             furthest_mean = furthest_done.mean().item()
             alpha = self.curriculum_ema_alpha
             decay = (1.0 - alpha) ** n_done
-            self.gate0_cross_rate_ema = decay * self.gate0_cross_rate_ema + (1.0 - decay) * gate0_success_mean
+            self.lap_completion_rate_ema = decay * self.lap_completion_rate_ema + (1.0 - decay) * lap_completed_mean
             self.furthest_gate_ema = decay * self.furthest_gate_ema + (1.0 - decay) * furthest_mean
 
-        # --- Curriculum phase transition (performance-gated, with frame-count floor) ---
-        # Phase unlocks only when (a) minimum frames elapsed since phase start AND (b) performance threshold met.
-        # This prevents the failure from run 2a8kkbon where phase 2 started at 5M frames with zero gate-0 competence.
+        # --- Curriculum phase transition (accuracy-gated, with frame-count floor) ---
+        # Speed shaping unlocks only when the policy has learned to finish full ordered laps
+        # reliably enough from gate 0.
         frames_in_phase = self.total_frames_counter - self._phase_started_at_frames
         if self.curriculum_phase == 0:
             if frames_in_phase >= self.curriculum_min_phase_frames and \
-               self.gate0_cross_rate_ema >= self.phase2_unlock_gate0_rate:
+               self.lap_completion_rate_ema >= self.phase_speed_unlock_accuracy_rate:
                 self.curriculum_phase = 1
-                self._phase_started_at_frames = self.total_frames_counter
-        elif self.curriculum_phase == 1:
-            if frames_in_phase >= self.curriculum_min_phase_frames and \
-               self.furthest_gate_ema >= self.phase3_unlock_furthest:
-                self.curriculum_phase = 2
                 self._phase_started_at_frames = self.total_frames_counter
 
         # --- stats ---
@@ -1271,17 +1262,15 @@ class DroneRaceEnv(IsaacEnv):
         just_completed = completed_task & (self.stats["lap_time_steps"].squeeze(-1) == 0)
         self.stats["lap_time_steps"][just_completed] = self.progress_buf[just_completed].float().unsqueeze(-1)
         # Reward component breakdown (cumulative)
-        progress_reward = self.reward_progress_scale * progress  # (N,)
-        speed_reward = self.reward_speed_scale * speed_along_racing_line  # (N,)
-        gate_reward = self.reward_gate_passage * gate_passed_this_step.float() + lap_reward  # (N,) includes gate + lap bonuses
+        gate_reward_total = gate_reward + sequence_reward + lap_reward  # (N,) includes ordered streak + lap bonuses
         penalty_reward = (self.reward_angular_penalty * ang_decay_frac) * ang_penalty + self.reward_action_smooth_scale * action_diff  # (N,)
         crash_reward = self.reward_crash_scale * crashed.float()  # (N,)
         self.stats["reward_progress"].add_(progress_reward.unsqueeze(-1))
         self.stats["reward_speed"].add_(speed_reward.unsqueeze(-1))
-        self.stats["reward_gates"].add_(gate_reward.unsqueeze(-1))
+        self.stats["reward_gates"].add_(gate_reward_total.unsqueeze(-1))
         self.stats["reward_penalties"].add_(penalty_reward.unsqueeze(-1))
-        self.stats["reward_altitude"].add_(altitude_reward.unsqueeze(-1))
-        self.stats["reward_approach"].add_(approach_reward.unsqueeze(-1))
+        self.stats["reward_altitude"].add_((-altitude_penalty).unsqueeze(-1))
+        self.stats["reward_approach"].add_((-approach_penalty).unsqueeze(-1))
         self.stats["reward_crash"].add_(crash_reward.unsqueeze(-1))
         # Angular rate magnitude (incremental mean)
         ang_rate_mag = ang_vel.norm(dim=-1)  # (N,)
@@ -1308,10 +1297,10 @@ class DroneRaceEnv(IsaacEnv):
         for gi in range(12):
             self.stats[f"gate_{gi}_crosses"][:] = self.per_gate_crosses[:, gi].float().unsqueeze(1)
 
-        # Curriculum phase (0=phase1, 1=phase2, 2=phase3) — tracked in self.curriculum_phase,
-        # advanced by performance gate in the block above.
+        # Curriculum phase (0=accuracy-first, 1=speed-shaping) — tracked in
+        # self.curriculum_phase and advanced by the full-lap accuracy gate above.
         self.stats["curriculum_phase"][:] = float(self.curriculum_phase)
-        self.stats["curriculum_gate0_ema"][:] = float(self.gate0_cross_rate_ema)
+        self.stats["curriculum_accuracy_ema"][:] = float(self.lap_completion_rate_ema)
         self.stats["curriculum_furthest_ema"][:] = float(self.furthest_gate_ema)
 
         # Distance to current gate at end of episode (meaningful when episode ends)

@@ -307,6 +307,8 @@ def main(cfg):
                 rew_altitude     = _mean("reward_altitude")
                 rew_approach     = _mean("reward_approach")
                 curriculum_phase = _mean("curriculum_phase")
+                curriculum_accuracy = _mean("curriculum_accuracy_ema")
+                curriculum_furthest = _mean("curriculum_furthest_ema")
 
                 derived = {}
 
@@ -362,10 +364,11 @@ def main(cfg):
 
                 # Curriculum tracking
                 if curriculum_phase is not None: derived["curriculum/phase"] = curriculum_phase
-                # frames at curriculum transitions (for reference lines in WandB)
-                derived["curriculum/phase1_end_frames"] = 5_000_000
-                derived["curriculum/phase2_end_frames"] = 20_000_000
-                derived["curriculum/ang_decay_end_frames"] = 10_000_000
+                if curriculum_accuracy is not None: derived["curriculum/accuracy_ema"] = curriculum_accuracy
+                if curriculum_furthest is not None: derived["curriculum/furthest_gate_ema"] = curriculum_furthest
+                derived["curriculum/min_accuracy_phase_frames"] = cfg.task.get("curriculum_min_phase_frames", 2_000_000)
+                derived["curriculum/speed_unlock_accuracy_rate"] = cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40)
+                derived["curriculum/ang_decay_end_frames"] = cfg.task.get("angular_penalty_decay_frames", 100_000_000)
 
                 # Per-gate crossing heatmap data — log as individual metrics for WandB bar chart
                 for gi in range(12):

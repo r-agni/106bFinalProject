@@ -5,6 +5,7 @@ import signal
 import time
 import yaml
 import traceback
+from collections import deque
 
 import hydra
 import torch
@@ -209,6 +210,24 @@ def main(cfg):
     max_iters = cfg.get("max_iters", -1)
     eval_interval = cfg.get("eval_interval", -1)
     save_interval = cfg.get("save_interval", -1)
+    auto_stop_cfg = cfg.get("auto_stop", {})
+    auto_stop_enabled = bool(auto_stop_cfg.get("enabled", False))
+    auto_stop_stop_on_first_success = bool(auto_stop_cfg.get("stop_on_first_success", False))
+    auto_stop_min_frames = int(auto_stop_cfg.get("min_frames", 0))
+    auto_stop_window = max(int(auto_stop_cfg.get("window", 30)), 1)
+    auto_stop_thresholds = {
+        "lap_completion_rate": auto_stop_cfg.get("lap_completion_rate", None),
+        "gates_passed_per_ep": auto_stop_cfg.get("gates_passed_per_ep", None),
+        "mean_speed_ms": auto_stop_cfg.get("mean_speed_ms", None),
+        "min_gate_cross_rate": auto_stop_cfg.get("min_gate_cross_rate", None),
+    }
+    auto_stop_history = {
+        key: deque(maxlen=auto_stop_window)
+        for key, threshold in auto_stop_thresholds.items()
+        if threshold is not None
+    }
+    auto_stop_reason = None
+    required_gate_count = max(int(getattr(base_env, "num_gates", 1)) - 1, 1)
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -289,11 +308,20 @@ def main(cfg):
             f"Starting training loop: frames_per_batch={frames_per_batch}, "
             f"total_frames={total_frames}, num_envs={env.num_envs}"
         )
+        if auto_stop_enabled:
+            logging.info(
+                "Auto-stop enabled: stop_on_first_success=%s min_frames=%s thresholds=%s window=%s",
+                auto_stop_stop_on_first_success,
+                auto_stop_min_frames,
+                {k: v for k, v in auto_stop_thresholds.items() if v is not None},
+                auto_stop_window,
+            )
         pbar = tqdm(collector, total=total_frames//frames_per_batch)
         env.train()
         logging.info("Entering collector iteration.")
         for i, data in enumerate(pbar):
             info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+            should_stop = False
             if adaptive_entropy_enabled:
                 info["entropy/current_coef"] = current_entropy_coef
                 info["entropy/target_coef"] = target_entropy_coef
@@ -360,6 +388,12 @@ def main(cfg):
                 if success_rate is not None: derived["race/lap_completion_rate"]  = success_rate
                 if ep_len       is not None: derived["race/episode_len_steps"]    = ep_len
                 if ep_len       is not None: derived["race/episode_len_sec"]      = ep_len * cfg.sim.dt * cfg.sim.substeps
+                # Simple aliases for W&B dashboards that expect the original names.
+                if mean_speed   is not None: derived["simple/mean_speed_ms"]              = mean_speed
+                if max_speed    is not None: derived["simple/max_speed_ms"]               = max_speed
+                if gates_passed is not None: derived["simple/gates_passed"]               = gates_passed
+                if success_rate is not None: derived["simple/full_course_completion_rate"] = success_rate
+                if ep_len       is not None: derived["simple/episode_time_sec"]           = ep_len * cfg.sim.dt * cfg.sim.substeps
                 if lap_time     is not None and success_rate and success_rate > 0:
                     derived["race/lap_time_steps"] = lap_time
                     derived["race/lap_time_sec"]   = lap_time * cfg.sim.dt * cfg.sim.substeps
@@ -369,6 +403,10 @@ def main(cfg):
                 if gates_passed is not None and ep_len is not None and ep_len > 0:
                     step_sec = cfg.sim.dt * cfg.sim.substeps
                     derived["race/gates_per_second"] = gates_passed / max(ep_len * step_sec, 1e-6)
+                gate_cross_rate = None
+                if gates_passed is not None:
+                    gate_cross_rate = gates_passed / required_gate_count
+                    derived["race/gate_cross_rate"] = gate_cross_rate
 
                 # Crash breakdown (fraction of episodes)
                 if crash_total    is not None: derived["crash/total_rate"]     = crash_total
@@ -473,6 +511,49 @@ def main(cfg):
 
                 info.update(derived)
 
+                if auto_stop_enabled:
+                    frames_ready = collector._frames >= auto_stop_min_frames
+                    if auto_stop_stop_on_first_success and success_rate is not None and success_rate > 0.0 and frames_ready:
+                        should_stop = True
+                        auto_stop_reason = (
+                            f"observed lap completion rate {success_rate:.4f} "
+                            f"at env_frames={collector._frames}"
+                        )
+                    else:
+                        current_auto_stop_metrics = {
+                            "lap_completion_rate": success_rate,
+                            "gates_passed_per_ep": gates_passed,
+                            "mean_speed_ms": mean_speed,
+                            "min_gate_cross_rate": gate_cross_rate,
+                        }
+                        for key, history in auto_stop_history.items():
+                            value = current_auto_stop_metrics.get(key)
+                            if value is not None:
+                                history.append(float(value))
+                            if history:
+                                info[f"auto_stop/window_{key}"] = sum(history) / len(history)
+
+                        window_ready = auto_stop_history and all(
+                            len(history) == auto_stop_window for history in auto_stop_history.values()
+                        )
+                        if frames_ready and window_ready:
+                            threshold_failures = []
+                            for key, threshold in auto_stop_thresholds.items():
+                                if threshold is None:
+                                    continue
+                                window_mean = sum(auto_stop_history[key]) / len(auto_stop_history[key])
+                                if window_mean < float(threshold):
+                                    threshold_failures.append((key, window_mean, float(threshold)))
+                            if not threshold_failures:
+                                should_stop = True
+                                auto_stop_reason = (
+                                    f"windowed auto-stop thresholds met at env_frames={collector._frames}"
+                                )
+
+                    info["auto_stop/enabled"] = 1.0
+                    if should_stop:
+                        info["auto_stop/triggered"] = 1.0
+
             if hasattr(policy, "entropy_coef"):
                 policy.entropy_coef = current_entropy_coef
             info.update(policy.train_op(data.to_tensordict()))
@@ -497,6 +578,10 @@ def main(cfg):
             print(f"[train] epoch={i + 1} total_frames_processed={collector._frames}")
 
             pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
+
+            if should_stop:
+                logging.info("Auto-stop triggered: %s", auto_stop_reason)
+                break
 
             if max_iters > 0 and i >= max_iters - 1:
                 break

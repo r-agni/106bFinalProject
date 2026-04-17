@@ -18,6 +18,16 @@ eval_interval: -1
 save_interval: ${oc.select:task.save_interval,100}
 seed: 0
 
+auto_stop:
+  enabled: false
+  stop_on_first_success: false
+  min_frames: 0
+  lap_completion_rate:
+  gates_passed_per_ep:
+  mean_speed_ms:
+  min_gate_cross_rate:
+  window: 30
+
 viewer:
   resolution: ${oc.select:task.viewer.resolution,[960,720]}
   eye: ${oc.select:task.viewer.eye,[8,0.,6.]}

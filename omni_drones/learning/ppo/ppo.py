@@ -60,6 +60,7 @@ class PPOConfig:
     priv_critic: bool = False
 
     checkpoint_path: Union[str, None] = None
+    adaptive_entropy: dict = field(default_factory=dict)
     actor: dict = field(default_factory=lambda: {
         "lr": 5e-4,
         "lr_scheduler": None,
@@ -141,6 +142,18 @@ class Actor(nn.Module):
         return loc, scale
 
 
+class FlattenCat(nn.Module):
+    def forward(self, *tensors: torch.Tensor) -> torch.Tensor:
+        normalized_tensors = []
+        for tensor in tensors:
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(-1).unsqueeze(-1)
+            elif tensor.ndim == 2:
+                tensor = tensor.unsqueeze(-1)
+            normalized_tensors.append(tensor)
+        return torch.cat(normalized_tensors, dim=-1)
+
+
 class PPOPolicy(TensorDictModuleBase):
 
     def __init__(
@@ -181,23 +194,39 @@ class PPOPolicy(TensorDictModuleBase):
             self.critic_loss_fn = nn.MSELoss()
 
         fake_input = observation_spec.zero()
+        intrinsics_prefix = ("agents", "intrinsics")
+        intrinsics_keys = [
+            key for key in observation_spec.keys(True, True)
+            if isinstance(key, tuple) and key[:len(intrinsics_prefix)] == intrinsics_prefix and key != intrinsics_prefix
+        ]
 
         if self.cfg.priv_actor:
-            intrinsics_dim = observation_spec[("agents", "intrinsics")].shape[-1]
-            actor_module = TensorDictSequential(
-                TensorDictModule(
-                    make_mlp([128, 128], activation=actor_activation, layer_norm=actor_layer_norm),
-                    [("agents", "observation")],
-                    ["feature"],
-                ),
-                TensorDictModule(
+            if intrinsics_keys:
+                actor_context_module = TensorDictSequential(
+                    TensorDictModule(FlattenCat(), intrinsics_keys, ["_intrinsics_flat"]),
+                    TensorDictModule(
+                        make_mlp([64, 64], activation=actor_activation, layer_norm=actor_layer_norm),
+                        ["_intrinsics_flat"],
+                        ["context"],
+                    ),
+                )
+            else:
+                intrinsics_dim = observation_spec[("agents", "intrinsics")].shape[-1]
+                actor_context_module = TensorDictModule(
                     nn.Sequential(
                         nn.LayerNorm(intrinsics_dim),
                         make_mlp([64, 64], activation=actor_activation, layer_norm=actor_layer_norm),
                     ),
                     [("agents", "intrinsics")],
                     ["context"],
+                )
+            actor_module = TensorDictSequential(
+                TensorDictModule(
+                    make_mlp([128, 128], activation=actor_activation, layer_norm=actor_layer_norm),
+                    [("agents", "observation")],
+                    ["feature"],
                 ),
+                actor_context_module,
                 CatTensors(["feature", "context"], "feature"),
                 TensorDictModule(
                     nn.Sequential(
@@ -226,21 +255,32 @@ class PPOPolicy(TensorDictModuleBase):
         ).to(self.device)
 
         if self.cfg.priv_critic:
-            intrinsics_dim = observation_spec[("agents", "intrinsics")].shape[-1]
-            self.critic = TensorDictSequential(
-                TensorDictModule(
-                    make_mlp([128, 128], activation=critic_activation, layer_norm=critic_layer_norm),
-                    [("agents", "observation")],
-                    ["feature"],
-                ),
-                TensorDictModule(
+            if intrinsics_keys:
+                critic_context_module = TensorDictSequential(
+                    TensorDictModule(FlattenCat(), intrinsics_keys, ["_intrinsics_flat"]),
+                    TensorDictModule(
+                        make_mlp([64, 64], activation=critic_activation, layer_norm=critic_layer_norm),
+                        ["_intrinsics_flat"],
+                        ["context"],
+                    ),
+                )
+            else:
+                intrinsics_dim = observation_spec[("agents", "intrinsics")].shape[-1]
+                critic_context_module = TensorDictModule(
                     nn.Sequential(
                         nn.LayerNorm(intrinsics_dim),
                         make_mlp([64, 64], activation=critic_activation, layer_norm=critic_layer_norm),
                     ),
                     [("agents", "intrinsics")],
                     ["context"],
+                )
+            self.critic = TensorDictSequential(
+                TensorDictModule(
+                    make_mlp([128, 128], activation=critic_activation, layer_norm=critic_layer_norm),
+                    [("agents", "observation")],
+                    ["feature"],
                 ),
+                critic_context_module,
                 CatTensors(["feature", "context"], "feature"),
                 TensorDictModule(
                     nn.Sequential(
@@ -306,7 +346,7 @@ class PPOPolicy(TensorDictModuleBase):
     def __call__(self, tensordict: TensorDict):
         self.actor(tensordict)
         self.critic(tensordict)
-        tensordict.exclude("loc", "scale", "feature", inplace=True)
+        tensordict.exclude("loc", "scale", "feature", "context", "_intrinsics_flat", inplace=True)
         return tensordict
 
     def train_op(self, tensordict: TensorDict):

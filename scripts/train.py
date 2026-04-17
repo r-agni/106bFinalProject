@@ -167,6 +167,43 @@ def main(cfg):
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
 
+    adaptive_entropy_cfg = cfg.algo.get("adaptive_entropy", {})
+    adaptive_entropy_enabled = bool(adaptive_entropy_cfg.get("enabled", False))
+    adaptive_entropy_enabled = adaptive_entropy_enabled and hasattr(policy, "entropy_coef")
+    if bool(cfg.algo.get("adaptive_entropy", {}).get("enabled", False)) and not hasattr(policy, "entropy_coef"):
+        logging.warning(
+            "adaptive_entropy.enabled is true, but policy %s does not expose entropy_coef; "
+            "falling back to fixed entropy.",
+            type(policy).__name__,
+        )
+
+    if adaptive_entropy_enabled:
+        current_entropy_coef = float(adaptive_entropy_cfg.get("phase0_coef_max", cfg.algo.entropy_coef))
+        target_entropy_coef = current_entropy_coef
+        prev_curriculum_phase = 0.0
+        speed_perf_ema = 0.0
+        phase1_rebump_applied = False
+        policy.entropy_coef = current_entropy_coef
+    else:
+        current_entropy_coef = float(getattr(policy, "entropy_coef", cfg.algo.entropy_coef))
+        target_entropy_coef = current_entropy_coef
+        prev_curriculum_phase = 0.0
+        speed_perf_ema = 0.0
+        phase1_rebump_applied = False
+        if hasattr(policy, "entropy_coef"):
+            policy.entropy_coef = current_entropy_coef
+
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    def _slew_toward(current: float, target: float, max_delta: float) -> float:
+        delta = target - current
+        if delta > max_delta:
+            return current + max_delta
+        if delta < -max_delta:
+            return current - max_delta
+        return target
+
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)
     total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch
     max_iters = cfg.get("max_iters", -1)
@@ -257,6 +294,10 @@ def main(cfg):
         logging.info("Entering collector iteration.")
         for i, data in enumerate(pbar):
             info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+            if adaptive_entropy_enabled:
+                info["entropy/current_coef"] = current_entropy_coef
+                info["entropy/target_coef"] = target_entropy_coef
+                info["entropy/rebump_applied"] = float(phase1_rebump_applied)
             episode_stats.add(data.to_tensordict())
 
             if len(episode_stats) >= base_env.num_envs:
@@ -370,6 +411,54 @@ def main(cfg):
                 derived["curriculum/speed_unlock_accuracy_rate"] = cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40)
                 derived["curriculum/ang_decay_end_frames"] = cfg.task.get("angular_penalty_decay_frames", 100_000_000)
 
+                if adaptive_entropy_enabled:
+                    step_sec = cfg.sim.dt * cfg.sim.substeps
+                    gates_per_second_batch = 0.0
+                    if gates_passed is not None and ep_len is not None and ep_len > 0:
+                        gates_per_second_batch = gates_passed / max(ep_len * step_sec, 1e-6)
+
+                    phase0_coef_max = float(adaptive_entropy_cfg.get("phase0_coef_max", 0.005))
+                    phase0_coef_min = float(adaptive_entropy_cfg.get("phase0_coef_min", 0.0005))
+                    phase1_rebump_coef = float(adaptive_entropy_cfg.get("phase1_rebump_coef", 0.0045))
+                    phase1_coef_min = float(adaptive_entropy_cfg.get("phase1_coef_min", 0.0003))
+                    speed_ema_alpha = float(adaptive_entropy_cfg.get("speed_ema_alpha", 0.05))
+                    speed_signal_low = float(adaptive_entropy_cfg.get("speed_signal_low", 0.05))
+                    speed_signal_high = float(adaptive_entropy_cfg.get("speed_signal_high", 0.60))
+                    max_delta_per_update = float(adaptive_entropy_cfg.get("max_delta_per_update", 0.00025))
+
+                    curr_phase = float(curriculum_phase if curriculum_phase is not None else prev_curriculum_phase)
+                    accuracy_signal = float(curriculum_accuracy if curriculum_accuracy is not None else 0.0)
+
+                    if prev_curriculum_phase == 0.0 and curr_phase >= 1.0:
+                        current_entropy_coef = phase1_rebump_coef
+                        target_entropy_coef = phase1_rebump_coef
+                        phase1_rebump_applied = True
+                    elif curr_phase < 1.0:
+                        unlock_rate = float(cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40))
+                        accuracy_norm = _clamp01(accuracy_signal / max(unlock_rate, 1e-6))
+                        target_entropy_coef = phase0_coef_max - accuracy_norm * (phase0_coef_max - phase0_coef_min)
+                        current_entropy_coef = _slew_toward(
+                            current_entropy_coef, target_entropy_coef, max_delta_per_update
+                        )
+                    else:
+                        speed_perf_ema = (1.0 - speed_ema_alpha) * speed_perf_ema + speed_ema_alpha * gates_per_second_batch
+                        speed_span = max(speed_signal_high - speed_signal_low, 1e-6)
+                        speed_norm = _clamp01((speed_perf_ema - speed_signal_low) / speed_span)
+                        target_entropy_coef = phase1_rebump_coef - speed_norm * (phase1_rebump_coef - phase1_coef_min)
+                        current_entropy_coef = _slew_toward(
+                            current_entropy_coef, target_entropy_coef, max_delta_per_update
+                        )
+
+                    prev_curriculum_phase = curr_phase
+                    policy.entropy_coef = current_entropy_coef
+
+                    derived["entropy/current_coef"] = current_entropy_coef
+                    derived["entropy/target_coef"] = target_entropy_coef
+                    derived["entropy/phase"] = curr_phase
+                    derived["entropy/accuracy_signal"] = accuracy_signal
+                    derived["entropy/gates_per_second_ema"] = speed_perf_ema
+                    derived["entropy/rebump_applied"] = float(phase1_rebump_applied)
+
                 # Per-gate crossing heatmap data — log as individual metrics for WandB bar chart
                 for gi in range(12):
                     v = _mean(f"gate_{gi}_crosses")
@@ -384,6 +473,8 @@ def main(cfg):
 
                 info.update(derived)
 
+            if hasattr(policy, "entropy_coef"):
+                policy.entropy_coef = current_entropy_coef
             info.update(policy.train_op(data.to_tensordict()))
 
             if eval_interval > 0 and i % eval_interval == 0:

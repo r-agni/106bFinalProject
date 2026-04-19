@@ -1088,7 +1088,8 @@ class DroneRaceEnv(IsaacEnv):
         #    gate center to the current target gate center. This is smooth across gate
         #    transitions (no discontinuity when the target switches) and rewards forward
         #    movement along the racing line rather than distance to a point.
-        #    This is disabled during the accuracy-first phase.
+        #    This stays on in phase 0 because it is the main signal for making progress
+        #    through the ordered gate sequence, not a raw speed bonus.
         #    Placed AFTER _detect_gate_crossings so self.gate_indices is already updated.
         prev_gate_indices = (self.gate_indices - 1) % (self.num_gates - 1)  # (N,) — wraps at track
         prev_gate_pos_env = gate_env_pos[batch_indices, prev_gate_indices]   # (N, 3)
@@ -1101,7 +1102,7 @@ class DroneRaceEnv(IsaacEnv):
         progress = (displacement * gate_to_gate_norm).sum(dim=-1)            # (N,)
         self.prev_drone_pos = drone_pos_flat.clone()
 
-        progress_reward = speed_phase_weight * self.reward_progress_scale * progress
+        progress_reward = self.reward_progress_scale * progress
         reward = progress_reward
 
         # 2. Speed diagnostic.

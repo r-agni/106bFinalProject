@@ -140,18 +140,18 @@ gate_height: 1.5   # original gate design — do not change
 gate_width: 1.5    # original gate design — do not change 
 
 # ---- Reward hyperparameters (tuned for the 13-gate race track) ----
-# Phase 0: learn the full ordered lap from gate 1 with sparse gate / sequence / lap rewards.
-# Phase 1: once lap completion accuracy is high enough, enable progress shaping and lap-time pressure.
+# Phase 0: learn the full ordered lap from gate 1 with gate / sequence / gate-progress rewards.
+# Phase 1: once lap completion accuracy is high enough, keep progress shaping and add lap-time pressure.
 
 # Dense shaping along the racing line.
-# Progress shaping is disabled during the accuracy-first phase and enabled only after unlock.
-reward_progress_scale: 2.0        # path-projection progress between consecutive gates
+# This is the main non-sparse signal: reward forward progress from gate to gate, not raw speed.
+reward_progress_scale: 4.0        # path-projection progress between consecutive gates
 
 # Sparse bonuses for correct ordered course completion.
-reward_gate_passage: 100.0        # dominant signal per gate crossed
-reward_gate_sequence_scale: 5.0   # increasing bonus for longer ordered gate streaks within the episode
-reward_lap_completion: 200.0      # base bonus for finishing the lap
-reward_lap_speed_bonus: 200.0     # extra bonus scaled by episode time remaining; enabled only after unlock
+reward_gate_passage: 30.0         # per-gate reward; lower so one gate does not dominate
+reward_gate_sequence_scale: 20.0  # stronger bonus for longer ordered gate streaks within the episode
+reward_lap_completion: 500.0      # make finishing the full course the primary objective
+reward_lap_speed_bonus: 300.0     # extra bonus scaled by episode time remaining; enabled only after unlock
 
 # Auxiliary penalties for local mistakes.
 reward_altitude_scale: 0.5        # bounded penalty for altitude mismatch at elevated gates 7 and 11

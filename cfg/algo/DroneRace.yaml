@@ -12,14 +12,14 @@ max_grad_norm: 5.0
 
 adaptive_entropy:
   enabled: true
-  phase0_coef_max: 0.005
-  phase0_coef_min: 0.0005
-  phase1_rebump_coef: 0.0045
-  phase1_coef_min: 0.0003
+  phase0_coef_max: 0.012
+  phase0_coef_min: 0.002
+  phase1_rebump_coef: 0.010
+  phase1_coef_min: 0.0005
   speed_ema_alpha: 0.05
   speed_signal_low: 0.05
   speed_signal_high: 0.60
-  max_delta_per_update: 0.00025
+  max_delta_per_update: 0.0005
 
 # Privileged critic: during training the critic gets obs + intrinsics (mass, inertia, KF).
 # This gives much more accurate value estimates → better GAE advantages → faster policy learning.

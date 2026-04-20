@@ -37,6 +37,7 @@ import isaacsim.core.utils.stage as stage_utils
 import isaacsim.core.utils.extensions as _ext_mod
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.util.debug_draw import _debug_draw
+from scipy.spatial.transform import Rotation
 
 def enable_extension(name):
     return _ext_mod.enable_extension(name)
@@ -90,8 +91,9 @@ class IsaacEnv(EnvBase):
         )
         # store inputs to class
         self.cfg = cfg
-        self.enable_render(not headless)
-        self.enable_viewport = not headless
+        self.enable_offscreen_render = bool(cfg.get("offscreen_render", False))
+        self.enable_render((not headless) or self.enable_offscreen_render)
+        self.enable_viewport = (not headless) and (not self.enable_offscreen_render)
         # extract commonly used parameters
         self.num_envs = self.cfg.env.num_envs
         self.max_episode_length = self.cfg.env.max_episode_length
@@ -161,10 +163,10 @@ class IsaacEnv(EnvBase):
         # find the environment closest to the origin for visualization
         self.central_env_idx = self.envs_positions.norm(dim=-1).argmin()
         central_env_pos = self.envs_positions[self.central_env_idx].cpu().numpy()
-        if self.enable_viewport:
-            set_camera_view(
+        if self.enable_viewport or self.enable_offscreen_render:
+            self.set_render_camera_view(
                 eye=central_env_pos + np.asarray(self.cfg.viewer.eye),
-                target=central_env_pos + np.asarray(self.cfg.viewer.lookat)
+                target=central_env_pos + np.asarray(self.cfg.viewer.lookat),
             )
 
         RobotBase._envs_positions = self.envs_positions.unsqueeze(1)
@@ -178,6 +180,10 @@ class IsaacEnv(EnvBase):
             global_paths=global_prim_paths,
         )
         self.sim.reset()
+        if getattr(self, "_offscreen_camera_sensor", None) is not None:
+            self._offscreen_camera_sensor.initialize()
+            self._render_product = self._offscreen_camera_sensor._render_product_path
+            self._rgb_annotator = self._offscreen_camera_sensor._rgb_annotator
         self.debug_draw = DebugDraw()
 
         self._tensordict = TensorDict(
@@ -335,22 +341,23 @@ class IsaacEnv(EnvBase):
 
         # set flags based on whether rendering is enabled or not
         # note: enabling extensions is order-sensitive. please do not change the order.
-        if self.enable_viewport:
+        if self.enable_viewport or self.enable_offscreen_render:
             # enable scene querying if rendering is enabled
             # this is needed for some GUI features
             sim_params["enable_scene_query_support"] = True
-            # extension to enable UI buttons (otherwise we get attribute errors)
-            enable_extension("omni.kit.window.toolbar")
-            # viewport utility helpers (required by some viewport APIs)
-            enable_extension("omni.kit.viewport.utility")
             # extension to make RTX realtime and path-traced renderers
             enable_extension("omni.kit.viewport.rtx")
             # extension to make HydraDelegate renderers
             enable_extension("omni.kit.viewport.pxr")
-            # enable viewport bundle when not in headless mode
-            enable_extension("omni.kit.viewport.bundle")
-            # extension for window status bar
-            enable_extension("omni.kit.window.status_bar")
+            if self.enable_viewport:
+                # extension to enable UI buttons (otherwise we get attribute errors)
+                enable_extension("omni.kit.window.toolbar")
+                # viewport utility helpers (required by some viewport APIs)
+                enable_extension("omni.kit.viewport.utility")
+                # enable viewport bundle when not in headless mode
+                enable_extension("omni.kit.viewport.bundle")
+                # extension for window status bar
+                enable_extension("omni.kit.window.status_bar")
             # enable replicator extensions only if requested
             if getattr(self.cfg.sim, "enable_replicator", False):
                 enable_extension("isaacsim.replicator.domain_randomization")
@@ -391,7 +398,7 @@ class IsaacEnv(EnvBase):
             return None
         elif mode == "rgb_array":
             # check if viewport is enabled -- if not, then complain because we won't get any data
-            if not self.enable_viewport:
+            if not (self.enable_viewport or self.enable_offscreen_render):
                 raise RuntimeError(
                     f"Cannot render '{mode}' when enable viewport is False. Please check the provided"
                     "arguments to the environment class at initialization."
@@ -446,8 +453,63 @@ class IsaacEnv(EnvBase):
                 # leave render product uninitialized to avoid loading synthetic-data stack
                 self._render_product = None
                 self._rgb_annotator = None
+        elif self.enable_offscreen_render:
+            self._render_product = None
+            self._rgb_annotator = None
+            self._render_camera_prim_path = str(self.cfg.get("offscreen_camera_prim_path", "/World/OffscreenCamera"))
+            if getattr(self.cfg.sim, "enable_replicator", False):
+                from isaacsim.sensors.camera import Camera
+
+                self._offscreen_camera_sensor = Camera(
+                    prim_path=self._render_camera_prim_path,
+                    name="offscreen_camera",
+                    resolution=tuple(self.cfg.viewer.resolution),
+                )
+            else:
+                self._offscreen_camera_sensor = None
         else:
             carb.log_info("Viewport is disabled. Skipping creation of render product.")
+
+    def set_render_camera_view(self, eye, target):
+        eye = np.asarray(eye, dtype=np.float64)
+        target = np.asarray(target, dtype=np.float64)
+
+        if self.enable_viewport:
+            set_camera_view(eye=eye, target=target)
+            return
+
+        if not self.enable_offscreen_render or getattr(self, "_offscreen_camera_sensor", None) is None:
+            return
+
+        forward = target - eye
+        forward_norm = np.linalg.norm(forward)
+        if not np.isfinite(forward_norm) or forward_norm < 1e-6:
+            return
+        forward = forward / forward_norm
+
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(np.dot(forward, world_up)) > 0.98:
+            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+        right = np.cross(forward, world_up)
+        right_norm = np.linalg.norm(right)
+        if not np.isfinite(right_norm) or right_norm < 1e-6:
+            return
+        right = right / right_norm
+        up = np.cross(right, forward)
+        up = up / np.linalg.norm(up)
+
+        rotation_matrix = np.column_stack((up, -right, -forward))
+        quat_xyzw = Rotation.from_matrix(rotation_matrix).as_quat()
+        quat_wxyz = np.asarray(
+            [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]],
+            dtype=np.float32,
+        )
+        self._offscreen_camera_sensor.set_world_pose(
+            position=eye.astype(np.float32),
+            orientation=quat_wxyz,
+            camera_axes="usd",
+        )
 
 
 class _AgentSpecView(Dict[str, AgentSpec]):

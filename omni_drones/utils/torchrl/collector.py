@@ -47,7 +47,7 @@ class SyncDataCollector(_SyncDataCollector):
 
         total_frames = self.total_frames
         i = -1
-        self._frames = 0
+        self._frames = int(getattr(self, "_initial_frames", 0))
         while True:
             i += 1
             self._iter = i
@@ -86,4 +86,3 @@ class SyncDataCollector(_SyncDataCollector):
 
             if self._frames >= self.total_frames:
                 break
-

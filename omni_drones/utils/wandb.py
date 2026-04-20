@@ -71,7 +71,6 @@ def init_wandb(cfg):
         project=wandb_cfg.project,
         group=wandb_cfg.group,
         entity=wandb_cfg.entity,
-        name=run_name,
         mode=wandb_cfg.mode,
         tags=wandb_cfg.tags,
     )
@@ -79,8 +78,9 @@ def init_wandb(cfg):
         kwargs["id"] = wandb_cfg.run_id
         kwargs["resume"] = "must"
     else:
+        kwargs["name"] = run_name
         kwargs["id"] = wandb.util.generate_id()
     run = wandb.init(**kwargs)
     cfg_dict = dict_flatten(OmegaConf.to_container(cfg))
-    run.config.update(cfg_dict)
+    run.config.update(cfg_dict, allow_val_change=wandb_cfg.run_id is not None)
     return run

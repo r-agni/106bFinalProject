@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import re
 import signal
 import time
 import yaml
@@ -242,6 +243,14 @@ def main(cfg):
         device=cfg.sim.device,
         return_same_td=True,
     )
+    resume_frame_offset = int(cfg.get("resume_frame_offset", 0))
+    if resume_frame_offset <= 0 and cfg.algo.get("checkpoint_path", None):
+        match = re.search(r"checkpoint_(\d+)\.pt$", os.path.basename(str(cfg.algo.checkpoint_path)))
+        if match:
+            resume_frame_offset = int(match.group(1))
+    if resume_frame_offset > 0:
+        collector._initial_frames = resume_frame_offset
+        logging.info("Resuming collector frame count from %s", resume_frame_offset)
 
     @torch.no_grad()
     def evaluate(
@@ -375,6 +384,7 @@ def main(cfg):
                 mean_action_mag  = _mean("mean_action_magnitude")
                 rew_altitude     = _mean("reward_altitude")
                 rew_approach     = _mean("reward_approach")
+                rew_centering    = _mean("reward_centering")
                 curriculum_phase = _mean("curriculum_phase")
                 curriculum_accuracy = _mean("curriculum_accuracy_ema")
                 curriculum_furthest = _mean("curriculum_furthest_ema")
@@ -420,6 +430,7 @@ def main(cfg):
                 if rew_penalties is not None: derived["reward/penalties_cumul"] = rew_penalties
                 if rew_altitude  is not None: derived["reward/altitude_cumul"]  = rew_altitude
                 if rew_approach  is not None: derived["reward/approach_cumul"]  = rew_approach
+                if rew_centering is not None: derived["reward/centering_cumul"] = rew_centering
                 if rew_return    is not None: derived["reward/total_return"]    = rew_return
                 if rew_progress is not None and rew_return is not None and abs(rew_return) > 1e-6:
                     derived["reward/progress_fraction"] = rew_progress / rew_return
@@ -428,6 +439,7 @@ def main(cfg):
                     if rew_gates     is not None: derived["reward/gates_fraction"]     = rew_gates / rew_return
                     if rew_altitude  is not None: derived["reward/altitude_fraction"]  = rew_altitude / rew_return
                     if rew_approach  is not None: derived["reward/approach_fraction"]  = rew_approach / rew_return
+                    if rew_centering is not None: derived["reward/centering_fraction"] = rew_centering / rew_return
                     if rew_penalties is not None: derived["reward/penalty_fraction"]   = rew_penalties / rew_return
 
                 # Behaviour diagnostics

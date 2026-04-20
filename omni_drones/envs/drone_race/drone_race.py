@@ -164,6 +164,24 @@ class DroneRaceEnv(IsaacEnv):
 
         self.hover_cmd_thrust = None
 
+        # Reversal-gate heuristics are inferred from geometry so the environment
+        # can specialize its shaping without introducing new YAML knobs.
+        self.reversal_xy_tol = 0.25
+        self.reversal_yaw_tol = 0.35
+        self.reversal_activation_dist = 5.0
+        self.reversal_setup_target_local = torch.tensor([-1.0, 0.0, 0.0], device=self.device)
+        self.reversal_setup_threshold = 0.35
+        self.reversal_setup_reward_scale = 2.0
+        self.reversal_cross_reward_scale = 2.0
+        self.reversal_centering_x_threshold = -0.5
+        self.reversal_progress_reset_tol = 0.02
+        self.reversal_no_progress_steps_limit = 250
+        self.reversal_no_progress_penalty = 15.0
+        self.reversal_setup_error_cap = 10.0
+        self.reversal_gate_mask = self._infer_reversal_gate_mask()
+        reversal_indices = torch.nonzero(self.reversal_gate_mask, as_tuple=False).flatten()
+        self.first_reversal_gate_idx = int(reversal_indices[0].item()) if reversal_indices.numel() > 0 else None
+
         print(f"[DroneRaceEnv] num_envs={self.num_envs}, num_gates={self.num_gates}")
         # Track gate progress for each environment
         self.gate_indices = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -190,6 +208,16 @@ class DroneRaceEnv(IsaacEnv):
         self.mean_altitude_acc = torch.zeros(self.num_envs, device=self.device)
         # Action magnitude tracking
         self.mean_action_mag_acc = torch.zeros(self.num_envs, device=self.device)
+        # Reversal-gate maneuver tracking
+        self.prev_reversal_setup_error = torch.full(
+            (self.num_envs,), self.reversal_setup_error_cap, device=self.device
+        )
+        self.best_reversal_setup_error_this_ep = torch.full(
+            (self.num_envs,), self.reversal_setup_error_cap, device=self.device
+        )
+        self.no_progress_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.reversal_stage_ready = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.reversal_stage_completed_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         # --- Accuracy-first curriculum state ---
         # Phase 0: accuracy-first full laps from gate 0, with only sparse ordered-completion rewards.
@@ -266,6 +294,36 @@ class DroneRaceEnv(IsaacEnv):
 
         for key in keys:
             setattr(self, key, task_cfg[key])
+
+    def _infer_reversal_gate_mask(self) -> torch.Tensor:
+        """Infer gates that require a same-XY, opposite-facing re-approach.
+
+        A gate is marked as reversal-like when it shares nearly the same XY
+        position as the previous gate while its yaw is approximately pi radians
+        away. This captures stacked descend-and-re-approach pairs such as
+        gate 7->8 and 11->12 on the current DroneRace track.
+        """
+        mask = torch.zeros(self.num_gates, dtype=torch.bool, device=self.device)
+        if self.track_type != "config" or self.track_config is None:
+            return mask
+
+        gate_keys = sorted(self.track_config.keys(), key=lambda x: int(x))
+        for idx in range(1, len(gate_keys)):
+            prev_gate = self.track_config[gate_keys[idx - 1]]
+            curr_gate = self.track_config[gate_keys[idx]]
+
+            prev_pos = np.asarray(prev_gate.get("pos", (0.0, 0.0, 0.0)), dtype=np.float32)
+            curr_pos = np.asarray(curr_gate.get("pos", (0.0, 0.0, 0.0)), dtype=np.float32)
+            xy_delta = np.linalg.norm(curr_pos[:2] - prev_pos[:2])
+
+            prev_yaw = float(prev_gate.get("yaw", 0.0))
+            curr_yaw = float(curr_gate.get("yaw", 0.0))
+            yaw_delta = ((curr_yaw - prev_yaw + np.pi) % (2.0 * np.pi)) - np.pi
+
+            if xy_delta <= self.reversal_xy_tol and abs(abs(yaw_delta) - np.pi) <= self.reversal_yaw_tol:
+                mask[idx] = True
+
+        return mask
 
     def _draw_gate_origins(self, gate_world_pos, gate_world_rot, env_idx=0):
         """
@@ -504,6 +562,7 @@ class DroneRaceEnv(IsaacEnv):
             "crashed_z": Unbounded(1),
             "crashed_z_gate": Unbounded(1),
             "crashed_distance": Unbounded(1),
+            "crashed_no_progress": Unbounded(1),
             "success": BinaryDiscreteTensorSpec(1, dtype=bool),
             "truncated": Unbounded(1),
             # Speed tracking
@@ -550,6 +609,9 @@ class DroneRaceEnv(IsaacEnv):
             # Altitude stats
             "mean_altitude": Unbounded(1),
             "min_altitude": Unbounded(1),
+            # Reversal-gate diagnostics
+            "reversal_setup_error": Unbounded(1),
+            "reversal_stage_completion_rate": Unbounded(1),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
@@ -578,6 +640,11 @@ class DroneRaceEnv(IsaacEnv):
         self.min_altitude_this_ep[env_ids] = float('inf')
         self.mean_altitude_acc[env_ids] = 0.0
         self.mean_action_mag_acc[env_ids] = 0.0
+        self.prev_reversal_setup_error[env_ids] = self.reversal_setup_error_cap
+        self.best_reversal_setup_error_this_ep[env_ids] = self.reversal_setup_error_cap
+        self.no_progress_steps[env_ids] = 0
+        self.reversal_stage_ready[env_ids] = False
+        self.reversal_stage_completed_this_ep[env_ids] = False
 
         # Reset gate velocities to prevent drift
         gate_velocities = torch.zeros(n, self.num_gates, 6, device=self.device)
@@ -668,6 +735,9 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["mean_altitude"][env_ids] = 0.
         self.stats["min_altitude"][env_ids] = 0.
         self.stats["mean_action_magnitude"][env_ids] = 0.
+        self.stats["crashed_no_progress"][env_ids] = 0.
+        self.stats["reversal_setup_error"][env_ids] = self.reversal_setup_error_cap
+        self.stats["reversal_stage_completion_rate"][env_ids] = 0.
         for gi in range(12):
             self.stats[f"gate_{gi}_crosses"][env_ids] = 0.
 
@@ -1038,6 +1108,27 @@ class DroneRaceEnv(IsaacEnv):
 
         drone_pos_flat = drone_pos.squeeze(1)  # (N, 3)
         distance_to_gate = torch.norm(drone_pos_flat - current_gate_center, dim=-1)  # (N,)
+        prev_gate_local = self.prev_drone_in_gate_frame.clone()  # (N, 3) gate-frame position from previous step
+        current_gate_local = quat_rotate_inverse(current_gate_rot, drone_pos_flat - current_gate_center)  # (N, 3)
+        current_reversal_gate = self.reversal_gate_mask[self.gate_indices]
+        reversal_active = current_reversal_gate & (distance_to_gate < self.reversal_activation_dist)
+        setup_target_local = self.reversal_setup_target_local.unsqueeze(0).expand(self.num_envs, -1)
+        current_setup_error = torch.linalg.norm(current_gate_local - setup_target_local, dim=-1).clamp(
+            max=self.reversal_setup_error_cap
+        )
+        has_prev_setup_error = self.prev_reversal_setup_error < (self.reversal_setup_error_cap - 1e-4)
+        setup_completed_now = current_setup_error < self.reversal_setup_threshold
+        stage2_active = current_reversal_gate & (self.reversal_stage_ready | setup_completed_now)
+        best_setup_candidate = torch.where(
+            current_reversal_gate,
+            current_setup_error,
+            torch.full_like(current_setup_error, self.reversal_setup_error_cap),
+        )
+        self.best_reversal_setup_error_this_ep = torch.minimum(
+            self.best_reversal_setup_error_this_ep,
+            best_setup_candidate,
+        )
+        self.reversal_stage_completed_this_ep.logical_or_(setup_completed_now & current_reversal_gate)
 
         # --- gate crossing detection ---
         # You either _deteect_gate_crossings or _detect_gate_crossings_via_segments
@@ -1106,6 +1197,18 @@ class DroneRaceEnv(IsaacEnv):
         self.prev_drone_pos = drone_pos_flat.clone()
 
         progress_reward = self.reward_progress_scale * progress
+        reversal_stage1_reward = torch.where(
+            reversal_active & (~stage2_active) & has_prev_setup_error,
+            self.reversal_setup_reward_scale * (self.prev_reversal_setup_error - current_setup_error),
+            torch.zeros_like(progress_reward),
+        )
+        reversal_stage2_reward = torch.where(
+            reversal_active & stage2_active,
+            self.reversal_cross_reward_scale * (current_gate_local[:, 0] - prev_gate_local[:, 0]).clamp(min=0.0, max=0.5),
+            torch.zeros_like(progress_reward),
+        )
+        reversal_progress_reward = reversal_stage1_reward + reversal_stage2_reward
+        progress_reward = torch.where(reversal_active, reversal_progress_reward, progress_reward)
         reward = progress_reward.clone()
 
         # 2. Speed diagnostic.
@@ -1161,11 +1264,15 @@ class DroneRaceEnv(IsaacEnv):
         #    When the drone is near the target gate plane, penalize lateral/vertical
         #    miss relative to the gate center. This keeps progress shaping from
         #    rewarding fly-bys that move along the track but miss the aperture.
-        current_gate_local = quat_rotate_inverse(current_gate_rot, drone_pos_flat - current_gate_center)
         gate_plane_window = (current_gate_local[:, 0] > -6.0) & (current_gate_local[:, 0] < 2.0)
         gate_center_miss = torch.linalg.norm(current_gate_local[:, 1:3], dim=-1)
+        centering_enabled = gate_plane_window & (
+            (~current_reversal_gate)
+            | stage2_active
+            | (current_gate_local[:, 0] > self.reversal_centering_x_threshold)
+        )
         centering_penalty = torch.where(
-            gate_plane_window,
+            centering_enabled,
             self.reward_gate_centering_scale * (1.0 - torch.exp(-gate_center_miss)),
             torch.zeros_like(gate_center_miss),
         )
@@ -1180,13 +1287,36 @@ class DroneRaceEnv(IsaacEnv):
         dist_improvement = self.prev_distance_to_gate - distance_to_gate  # positive = approaching
         retreat_amount = (-dist_improvement).clamp(min=0.0)
         approach_penalty = torch.where(
-            close_approach_mask,
+            close_approach_mask & (~current_reversal_gate),
             self.reward_approach_scale * retreat_amount,
             torch.zeros_like(retreat_amount)
         )
         reward -= approach_penalty
         # Update prev_distance_to_gate for next step's approach reward computation.
         self.prev_distance_to_gate = distance_to_gate.clone()
+
+        setup_progress = (
+            has_prev_setup_error
+            & ((self.prev_reversal_setup_error - current_setup_error) > self.reversal_progress_reset_tol)
+        )
+        crossing_progress = (current_gate_local[:, 0] - prev_gate_local[:, 0]) > self.reversal_progress_reset_tol
+        useful_reversal_progress = torch.where(stage2_active, crossing_progress, setup_progress)
+        reset_no_progress = gate_index_changed | (~reversal_active) | useful_reversal_progress
+        self.no_progress_steps = torch.where(
+            reset_no_progress,
+            torch.zeros_like(self.no_progress_steps),
+            self.no_progress_steps + 1,
+        )
+        no_progress_crash = reversal_active & (self.no_progress_steps >= self.reversal_no_progress_steps_limit)
+        reset_setup_error = torch.full_like(self.prev_reversal_setup_error, self.reversal_setup_error_cap)
+        next_setup_error = torch.where(current_reversal_gate, current_setup_error, reset_setup_error)
+        self.prev_reversal_setup_error = torch.where(gate_index_changed, reset_setup_error, next_setup_error)
+        next_stage_ready = (self.reversal_stage_ready | (setup_completed_now & current_reversal_gate)) & current_reversal_gate
+        self.reversal_stage_ready = torch.where(
+            gate_index_changed,
+            torch.zeros_like(self.reversal_stage_ready),
+            next_stage_ready,
+        )
 
         # 9. Angular rate penalty with linear decay (Song et al.: used only in early training).
         #    Decays from reward_angular_penalty → 0 over angular_penalty_decay_frames steps.
@@ -1221,10 +1351,11 @@ class DroneRaceEnv(IsaacEnv):
         # preventing false terminations when the target gate index just advanced (~7m away).
         dist_crash = (distance_to_gate > self.crash_dist_threshold) & (~in_grace)  # (N,)
 
-        crashed = phys_crash | ground_crash | dist_crash
+        crashed = phys_crash | ground_crash | dist_crash | no_progress_crash
 
         # Apply crash penalty to reward.
-        reward -= self.reward_crash_scale * crashed.float()
+        crash_reward = self.reward_crash_scale * crashed.float() + self.reversal_no_progress_penalty * no_progress_crash.float()
+        reward -= crash_reward
 
         # ----- END STUDENT CODE -----
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
@@ -1266,6 +1397,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["crashed_z"].add_(ground_crash.float().unsqueeze(-1))
         self.stats["crashed_z_gate"].add_(phys_crash.float().unsqueeze(-1))
         self.stats["crashed_distance"].add_(dist_crash.float().unsqueeze(-1))
+        self.stats["crashed_no_progress"].add_(no_progress_crash.float().unsqueeze(-1))
         # Uprightness: exponential moving average of the drone's up-vector z-component.
         self.stats["drone_uprightness"].lerp_(self.drone.up[..., 2], 1 - self.alpha)
 
@@ -1282,7 +1414,6 @@ class DroneRaceEnv(IsaacEnv):
         # Reward component breakdown (cumulative)
         gate_reward_total = gate_reward + sequence_reward + lap_reward  # (N,) includes ordered streak + lap bonuses
         penalty_reward = (self.reward_angular_penalty * ang_decay_frac) * ang_penalty + self.reward_action_smooth_scale * action_diff  # (N,)
-        crash_reward = self.reward_crash_scale * crashed.float()  # (N,)
         self.stats["reward_progress"].add_(progress_reward.unsqueeze(-1))
         self.stats["reward_speed"].add_(speed_reward.unsqueeze(-1))
         self.stats["reward_gates"].add_(gate_reward_total.unsqueeze(-1))
@@ -1332,6 +1463,10 @@ class DroneRaceEnv(IsaacEnv):
         min_alt_clamped[min_alt_clamped == float('inf')] = 0.0
         self.stats["min_altitude"][:] = min_alt_clamped.unsqueeze(1)
         self.stats["mean_altitude"][:] = self.mean_altitude_acc.unsqueeze(1)
+        self.stats["reversal_setup_error"][:] = self.best_reversal_setup_error_this_ep.unsqueeze(1)
+        self.stats["reversal_stage_completion_rate"][:] = (
+            self.reversal_stage_completed_this_ep.float().unsqueeze(1)
+        )
 
         # Action magnitude (incremental mean of L2 norm of action vector)
         action_mag = self.effort.squeeze(1).norm(dim=-1)  # (N,)

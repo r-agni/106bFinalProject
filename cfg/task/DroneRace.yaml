@@ -157,6 +157,7 @@ reward_lap_speed_bonus: 300.0     # extra bonus scaled by episode time remaining
 reward_altitude_scale: 0.5        # bounded penalty for altitude mismatch at elevated gates 7 and 11
 reward_approach_scale: 0.5        # penalty for moving away from the gate when already within 6m
 reward_gate_centering_scale: 0.03 # bounded per-step penalty for missing the gate centerline near any gate
+reward_off_path_scale: 0.0        # disabled for the long race track; figure-8 task enables this to stop shortcutting
 
 # Penalties and crash termination thresholds.
 reward_angular_penalty: 0.1       # penalize squared angular rates

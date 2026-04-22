@@ -1,0 +1,89 @@
+name: DroneRaceEnv
+
+defaults:
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+viewer:
+  resolution: [960, 720]
+  eye: [6.0, -16.0, 18.0]
+  lookat: [6.0, 0.0, 1.5]
+
+ppo_cfg: DroneRace.yaml
+
+env:
+  num_envs: 512
+  max_episode_length: 1500
+
+sim:
+  substeps: 5
+  dt: 0.002
+
+drone_model:
+  name: Iris
+  controller: RateController
+
+total_frames: 800_000_000
+save_interval: 100
+
+# Figure-8 track.
+# The last gate matches the first gate so the course closes cleanly.
+track_config:
+  "1":
+    pos: [0.0, 0.0, 1.0]
+    yaw: 1.57
+
+  "2":
+    pos: [2.0, 3.0, 1.0]
+    yaw: 0.0
+
+  "3":
+    pos: [10.0, -3.0, 1.0]
+    yaw: 0.0
+
+  "4":
+    pos: [12.0, 0.0, 1.0]
+    yaw: 1.57
+
+  "5":
+    pos: [10.0, 3.0, 1.0]
+    yaw: 3.14
+
+  "6":
+    pos: [2.0, -3.0, 1.0]
+    yaw: 3.14
+
+  "7":
+    pos: [0.0, 0.0, 1.0]
+    yaw: 1.57
+
+gate_scale: 1.0
+gate_height: 1.5
+gate_width: 1.5
+
+reward_progress_scale: 1.0
+reward_gate_passage: 60.0
+reward_gate_sequence_scale: 20.0
+reward_lap_completion: 500.0
+reward_lap_speed_bonus: 300.0
+
+reward_altitude_scale: 0.0
+reward_approach_scale: 0.5
+reward_gate_centering_scale: 0.03
+reward_off_path_scale: 0.25
+
+reward_angular_penalty: 0.1
+reward_action_smooth_scale: 0.002
+reward_crash_scale: 80.0
+crash_dist_threshold: 15.0
+crash_z_min: 0.15
+
+phase_speed_unlock_accuracy_rate: 0.40
+curriculum_min_phase_frames: 2_000_000
+curriculum_ema_alpha: 0.01
+
+angular_penalty_decay_frames: 100_000_000
+crash_grace_steps: 100
+
+debug_gate_origins: false
+debug_axis_length: 0.5

@@ -149,6 +149,7 @@ test*.ipynb
 examples/*.mp4
 *.sh
 !scripts/launch_parallel_dronerace.sh
+!scripts/launch_dronerace_figure8.sh
 !scripts/launch_hover_racetrack.sh
 !scripts/monitor_hover_race.sh
 

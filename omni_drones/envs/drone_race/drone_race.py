@@ -98,6 +98,7 @@ class DroneRaceEnv(IsaacEnv):
         "reward_altitude_scale",
         "reward_approach_scale",
         "reward_gate_centering_scale",
+        "reward_off_path_scale",
     )
     TERMINATION_CONFIG_KEYS = (
         "crash_dist_threshold",
@@ -578,6 +579,7 @@ class DroneRaceEnv(IsaacEnv):
             "reward_altitude": Unbounded(1),    # cumulative altitude penalty term
             "reward_approach": Unbounded(1),    # cumulative near-gate retreat penalty term
             "reward_centering": Unbounded(1),   # cumulative near-gate centerline penalty term
+            "reward_off_path": Unbounded(1),    # cumulative distance-to-centerline penalty term
             "reward_crash": Unbounded(1),       # cumulative crash penalties
             # Angular rate magnitude
             "mean_ang_rate": Unbounded(1),      # mean ||ang_vel|| over episode
@@ -727,6 +729,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_altitude"][env_ids] = 0.
         self.stats["reward_approach"][env_ids] = 0.
         self.stats["reward_centering"][env_ids] = 0.
+        self.stats["reward_off_path"][env_ids] = 0.
         self.stats["mean_ang_rate"][env_ids] = 0.
         self.stats["ang_penalty_decay_frac"][env_ids] = 0.
         self.stats["curriculum_phase"][env_ids] = 0.
@@ -1211,7 +1214,20 @@ class DroneRaceEnv(IsaacEnv):
         progress_reward = torch.where(reversal_active, reversal_progress_reward, progress_reward)
         reward = progress_reward.clone()
 
-        # 2. Speed diagnostic.
+        # 2. Off-path penalty.
+        #    Figure-8 training needs a dense penalty for cutting across the crossover.
+        #    Penalize the distance to the closest point on the current gate-to-gate segment,
+        #    using a bounded form so spawn/reset transients do not dominate learning.
+        segment_progress = (
+            ((drone_pos_flat - prev_gate_center_proj) * gate_to_gate_vec).sum(dim=-1, keepdim=True)
+            / gate_to_gate_vec.pow(2).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        ).clamp(0.0, 1.0)
+        closest_point_on_segment = prev_gate_center_proj + segment_progress * gate_to_gate_vec
+        off_path_distance = torch.linalg.norm(drone_pos_flat - closest_point_on_segment, dim=-1)
+        off_path_penalty = self.reward_off_path_scale * (1.0 - torch.exp(-off_path_distance))
+        reward -= off_path_penalty
+
+        # 3. Speed diagnostic.
         #    Keep tracking forward speed along the racing line for stats, but do not pay
         #    a per-step speed reward. Speed is only incentivized through lap_speed_reward
         #    once the accuracy gate has unlocked phase 1.
@@ -1220,11 +1236,11 @@ class DroneRaceEnv(IsaacEnv):
         speed_reward = torch.zeros_like(speed_along_racing_line)
         reward += speed_reward
 
-        # 3. Sparse gate passage bonus.
+        # 4. Sparse gate passage bonus.
         gate_reward = self.reward_gate_passage * gate_passed_this_step.float()
         reward += gate_reward
 
-        # 4. Ordered sequence bonus.
+        # 5. Ordered sequence bonus.
         #    Gate crossings are only counted for the current target gate, so a non-zero
         #    bonus here means the drone is advancing through the course in order. The bonus
         #    grows with the current streak length to emphasize full consecutive laps.
@@ -1232,7 +1248,7 @@ class DroneRaceEnv(IsaacEnv):
         sequence_reward = self.reward_gate_sequence_scale * ordered_streak * gate_passed_this_step.float()
         reward += sequence_reward
 
-        # 5. Lap completion bonus with optional time-based speed incentive.
+        # 6. Lap completion bonus with optional time-based speed incentive.
         #    The speed incentive stays off during the accuracy-first phase.
         #    time_fraction = fraction of episode budget remaining (1.0 = instant, 0.0 = at timeout).
         time_fraction = (self.max_episode_length - self.progress_buf).float() / self.max_episode_length
@@ -1241,7 +1257,7 @@ class DroneRaceEnv(IsaacEnv):
         lap_reward = lap_completion_reward + lap_speed_reward
         reward += lap_reward
 
-        # 6. Altitude mismatch penalty.
+        # 7. Altitude mismatch penalty.
         #    Race track has two elevated gates (z=3.0) at gates 7 and 11. The path-projection
         #    reward gives near-zero signal on the purely-vertical 2m segments (gate 6→7, 10→11)
         #    because gate_to_gate_norm points almost entirely in Z. Instead of paying a bonus
@@ -1260,7 +1276,7 @@ class DroneRaceEnv(IsaacEnv):
         )
         reward -= altitude_penalty
 
-        # 7. Gate-centering penalty.
+        # 8. Gate-centering penalty.
         #    When the drone is near the target gate plane, penalize lateral/vertical
         #    miss relative to the gate center. This keeps progress shaping from
         #    rewarding fly-bys that move along the track but miss the aperture.
@@ -1278,7 +1294,7 @@ class DroneRaceEnv(IsaacEnv):
         )
         reward -= centering_penalty
 
-        # 8. Near-gate retreat penalty.
+        # 9. Near-gate retreat penalty.
         #    The 180° reversal at gate 7→8 (identical XY, only Z differs) causes path-projection
         #    progress to break down because the gate-to-gate direction reverses mid-approach.
         #    Instead of giving a bonus for small approach improvements, penalize the drone only
@@ -1318,7 +1334,7 @@ class DroneRaceEnv(IsaacEnv):
             next_stage_ready,
         )
 
-        # 9. Angular rate penalty with linear decay (Song et al.: used only in early training).
+        # 10. Angular rate penalty with linear decay (Song et al.: used only in early training).
         #    Decays from reward_angular_penalty → 0 over angular_penalty_decay_frames steps.
         self.total_frames_counter += self.num_envs
         ang_decay_frac = max(0.0, 1.0 - self.total_frames_counter / self.angular_penalty_decay_frames)
@@ -1326,7 +1342,7 @@ class DroneRaceEnv(IsaacEnv):
         ang_penalty = ang_vel.pow(2).sum(dim=-1)  # (N,)
         reward -= (self.reward_angular_penalty * ang_decay_frac) * ang_penalty
 
-        # 10. Action smoothness penalty.
+        # 11. Action smoothness penalty.
         action_diff = self.drone.throttle_difference.squeeze(-1)  # (N,)
         reward -= self.reward_action_smooth_scale * action_diff
 
@@ -1421,6 +1437,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_altitude"].add_((-altitude_penalty).unsqueeze(-1))
         self.stats["reward_approach"].add_((-approach_penalty).unsqueeze(-1))
         self.stats["reward_centering"].add_((-centering_penalty).unsqueeze(-1))
+        self.stats["reward_off_path"].add_((-off_path_penalty).unsqueeze(-1))
         self.stats["reward_crash"].add_(crash_reward.unsqueeze(-1))
         # Angular rate magnitude (incremental mean)
         ang_rate_mag = ang_vel.norm(dim=-1)  # (N,)

@@ -366,7 +366,10 @@ def main(cfg):
 
                 # Reward components
                 rew_progress  = _mean("reward_progress")
+                rew_speed     = _mean("reward_speed")
                 rew_gates     = _mean("reward_gates")
+                rew_stacked_direction = _mean("reward_stacked_direction")
+                rew_stacked_bonus = _mean("reward_stacked_bonus")
                 rew_penalties = _mean("reward_penalties")
                 rew_return    = _mean("return")
 
@@ -388,6 +391,10 @@ def main(cfg):
                 curriculum_phase = _mean("curriculum_phase")
                 curriculum_accuracy = _mean("curriculum_accuracy_ema")
                 curriculum_furthest = _mean("curriculum_furthest_ema")
+                reset_active_gate = _mean("reset_active_gate")
+                reset_from_gate0 = _mean("reset_from_gate0")
+                reset_from_prev_gate = _mean("reset_from_prev_gate")
+                reset_from_random_gate = _mean("reset_from_random_gate")
 
                 derived = {}
 
@@ -426,7 +433,10 @@ def main(cfg):
 
                 # Reward components (useful for spotting imbalances)
                 if rew_progress  is not None: derived["reward/progress_cumul"]  = rew_progress
+                if rew_speed     is not None: derived["reward/speed_cumul"]     = rew_speed
                 if rew_gates     is not None: derived["reward/gates_cumul"]     = rew_gates
+                if rew_stacked_direction is not None: derived["reward/stacked_direction_cumul"] = rew_stacked_direction
+                if rew_stacked_bonus is not None: derived["reward/stacked_bonus_cumul"] = rew_stacked_bonus
                 if rew_penalties is not None: derived["reward/penalties_cumul"] = rew_penalties
                 if rew_altitude  is not None: derived["reward/altitude_cumul"]  = rew_altitude
                 if rew_approach  is not None: derived["reward/approach_cumul"]  = rew_approach
@@ -436,7 +446,14 @@ def main(cfg):
                     derived["reward/progress_fraction"] = rew_progress / rew_return
                 # Reward component fractions (diagnostic: which terms dominate)
                 if rew_return is not None and abs(rew_return) > 1e-6:
+                    stacked_total = (
+                        (rew_stacked_direction if rew_stacked_direction is not None else 0.0)
+                        + (rew_stacked_bonus if rew_stacked_bonus is not None else 0.0)
+                    )
+                    if rew_speed     is not None: derived["reward/speed_fraction"]     = rew_speed / rew_return
                     if rew_gates     is not None: derived["reward/gates_fraction"]     = rew_gates / rew_return
+                    if rew_stacked_direction is not None or rew_stacked_bonus is not None:
+                        derived["reward/stacked_fraction"] = stacked_total / rew_return
                     if rew_altitude  is not None: derived["reward/altitude_fraction"]  = rew_altitude / rew_return
                     if rew_approach  is not None: derived["reward/approach_fraction"]  = rew_approach / rew_return
                     if rew_centering is not None: derived["reward/centering_fraction"] = rew_centering / rew_return
@@ -457,6 +474,22 @@ def main(cfg):
                 if curriculum_phase is not None: derived["curriculum/phase"] = curriculum_phase
                 if curriculum_accuracy is not None: derived["curriculum/accuracy_ema"] = curriculum_accuracy
                 if curriculum_furthest is not None: derived["curriculum/furthest_gate_ema"] = curriculum_furthest
+                derived["curriculum/speed_focus_accuracy_rate"] = cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
+                speed_phase_scale = 0.0
+                if curriculum_phase is not None:
+                    if curriculum_phase >= 2.0:
+                        speed_phase_scale = cfg.task.get("reward_speed_scale_phase2", cfg.task.get("reward_speed_scale", 0.0))
+                    elif curriculum_phase >= 1.0:
+                        speed_phase_scale = cfg.task.get("reward_speed_scale", 0.0)
+                derived["reward/speed_phase_scale"] = speed_phase_scale
+                if reset_active_gate is not None: derived["curriculum/reset_active_gate"] = reset_active_gate
+                if reset_from_gate0 is not None: derived["curriculum/reset_from_gate0_rate"] = reset_from_gate0
+                if reset_from_prev_gate is not None: derived["curriculum/reset_from_prev_gate_rate"] = reset_from_prev_gate
+                if reset_from_random_gate is not None: derived["curriculum/reset_from_random_rate"] = reset_from_random_gate
+                for gi in range(12):
+                    reset_gate_ema = _mean(f"reset_gate_{gi}_pass_ema")
+                    if reset_gate_ema is not None:
+                        derived[f"curriculum/reset_gate_{gi:02d}_pass_ema"] = reset_gate_ema
                 derived["curriculum/min_accuracy_phase_frames"] = cfg.task.get("curriculum_min_phase_frames", 2_000_000)
                 derived["curriculum/speed_unlock_accuracy_rate"] = cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40)
                 derived["curriculum/ang_decay_end_frames"] = cfg.task.get("angular_penalty_decay_frames", 100_000_000)

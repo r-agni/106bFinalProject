@@ -141,11 +141,16 @@ gate_width: 1.5    # original gate design — do not change
 
 # ---- Reward hyperparameters (tuned for the 13-gate race track) ----
 # Phase 0: learn the ordered lap with gate / sequence rewards plus light guidance.
-# Phase 1: once lap completion accuracy is high enough, keep progress shaping and add lap-time pressure.
+# Phase 1: after speed shaping unlocks, add dense speed pressure while keeping sparse gate rewards dominant.
 
 # Dense shaping along the racing line.
 # Keep this small in phase 0 so the drone cannot earn most reward by flying past gates.
 reward_progress_scale: 1.0        # path-projection progress between consecutive gates
+reward_speed_scale: 0.25          # dense forward-speed reward after the first successful lap unlocks speed shaping
+reward_speed_target_ms: 6.0       # cap dense speed shaping so it stays well below sparse gate rewards
+reward_stacked_direction_scale: 2.0 # signed gate-frame progress shaping for the hard lower stacked-return gates
+reward_stacked_entry_bonus: 8.0     # bonus when advancing from the elevated entry gate to the lower reversal gate
+reward_stacked_clear_bonus: 30.0    # extra sparse bonus for actually clearing the lower reversal gate
 
 # Sparse bonuses for correct ordered course completion.
 reward_gate_passage: 60.0         # per-gate reward; crossing gates should dominate phase-0 learning
@@ -166,9 +171,26 @@ crash_dist_threshold: 25.0        # terminate if the drone diverges too far from
 crash_z_min: 0.15                 # terminate if the drone drops below this altitude
 
 # Accuracy-first curriculum.
-phase_speed_unlock_accuracy_rate: 0.40 # enable speed shaping once full-lap completion EMA reaches this rate
+phase_speed_unlock_on_first_success: true # enable dense speed shaping after the first successful full lap
+phase_speed_unlock_accuracy_rate: 0.40 # fallback EMA-based unlock when first-success unlock is disabled
+phase2_speed_focus_accuracy_rate: 0.40 # once full laps are reliable, switch to a speed-focused phase with shaping removed
 curriculum_min_phase_frames: 2_000_000 # minimum frames before the speed phase can unlock
 curriculum_ema_alpha: 0.01             # EMA smoothing for curriculum metrics
+reset_curriculum_enabled: true         # allocate some resets to the earliest unsolved gate bottleneck once gate-0-start passage drops below threshold
+reset_curriculum_gate_pass_threshold: 0.90 # activate practice resets when the earliest gate-0-start passage EMA falls below this
+reset_curriculum_gate0_prob: 0.70      # majority of episodes still start from gate 0
+reset_curriculum_prev_gate_prob: 0.20  # focused practice starts from the gate immediately before the active weak gate
+reset_curriculum_random_gate_prob: 0.10 # small amount of broad coverage from uniformly random real course gates
+reset_curriculum_metric_alpha: 0.01    # EMA smoothing for gate-0-start per-gate passage reliability
+sparse_only_gate_indices: [6, 7, 10, 11] # zero-based target gates in the stacked sections; dense shaping is disabled here
+sparse_disable_smoothness_penalties: true # allow harsher maneuvers inside sparse-only stacked-gate sections
+reward_speed_scale_phase2: 0.75        # stronger dense speed reward once reliable full laps are achieved
+reward_speed_target_ms_phase2: 8.0     # higher speed target for the final speed-focused phase
+phase2_disable_dense_shaping: true     # turn off dense shaping / penalty helpers in the final speed phase
+stacked_reversal_entry_gates: [6, 10]     # elevated stacked gates that transition into the hard lower reversal gates
+stacked_reversal_target_gates: [7, 11]    # lower stacked gates that need extra local credit assignment
+stacked_reversal_dist_threshold: 35.0     # allow wider divergence while recovering through the stacked reversal
+stacked_reversal_grace_steps: 220         # suppress distance-crash briefly after entering the stacked reversal window
 
 # Safety / penalty schedule.
 angular_penalty_decay_frames: 100_000_000 # keep angular damping active through the early learning stages

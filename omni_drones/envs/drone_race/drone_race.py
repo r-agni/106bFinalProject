@@ -88,6 +88,13 @@ class DroneRaceEnv(IsaacEnv):
     """
     REWARD_CONFIG_KEYS = (
         "reward_progress_scale",
+        "reward_speed_scale",
+        "reward_speed_target_ms",
+        "reward_speed_scale_phase2",
+        "reward_speed_target_ms_phase2",
+        "reward_stacked_direction_scale",
+        "reward_stacked_entry_bonus",
+        "reward_stacked_clear_bonus",
         "reward_gate_passage",
         "reward_gate_sequence_scale",
         "reward_lap_completion",
@@ -102,6 +109,7 @@ class DroneRaceEnv(IsaacEnv):
     TERMINATION_CONFIG_KEYS = (
         "crash_dist_threshold",
         "crash_z_min",
+        "stacked_reversal_dist_threshold",
     )
 
     def __init__(self, cfg, headless):
@@ -113,6 +121,63 @@ class DroneRaceEnv(IsaacEnv):
         )
 
         self.gate_scale = cfg.task.gate_scale
+        self.phase_speed_unlock_on_first_success = bool(
+            cfg.task.get("phase_speed_unlock_on_first_success", False)
+        )
+        self.phase2_speed_focus_accuracy_rate = float(
+            cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
+        )
+        self.phase2_disable_dense_shaping = bool(
+            cfg.task.get("phase2_disable_dense_shaping", True)
+        )
+        self.reset_curriculum_enabled = bool(
+            cfg.task.get("reset_curriculum_enabled", False)
+        )
+        self.reset_curriculum_gate_pass_threshold = float(
+            cfg.task.get("reset_curriculum_gate_pass_threshold", 0.90)
+        )
+        self.reset_curriculum_gate0_prob = float(
+            cfg.task.get("reset_curriculum_gate0_prob", 1.0)
+        )
+        self.reset_curriculum_prev_gate_prob = float(
+            cfg.task.get("reset_curriculum_prev_gate_prob", 0.0)
+        )
+        self.reset_curriculum_random_gate_prob = float(
+            cfg.task.get("reset_curriculum_random_gate_prob", 0.0)
+        )
+        self.reset_curriculum_metric_alpha = float(
+            cfg.task.get("reset_curriculum_metric_alpha", 0.01)
+        )
+        reset_prob_sum = (
+            self.reset_curriculum_gate0_prob
+            + self.reset_curriculum_prev_gate_prob
+            + self.reset_curriculum_random_gate_prob
+        )
+        if self.reset_curriculum_enabled and abs(reset_prob_sum - 1.0) > 1e-6:
+            raise ValueError(
+                "reset curriculum probabilities must sum to 1.0."
+            )
+        self.sparse_only_gate_indices = tuple(
+            int(idx) for idx in cfg.task.get("sparse_only_gate_indices", [])
+        )
+        self.sparse_disable_smoothness_penalties = bool(
+            cfg.task.get("sparse_disable_smoothness_penalties", False)
+        )
+        self.stacked_reversal_entry_gates = tuple(
+            int(idx) for idx in cfg.task.get("stacked_reversal_entry_gates", [])
+        )
+        self.stacked_reversal_target_gates = tuple(
+            int(idx) for idx in cfg.task.get("stacked_reversal_target_gates", [])
+        )
+        if len(self.stacked_reversal_entry_gates) != len(self.stacked_reversal_target_gates):
+            raise ValueError(
+                "stacked_reversal_entry_gates and stacked_reversal_target_gates must have the same length."
+            )
+        self.stacked_reversal_gate_pairs = tuple(
+            zip(self.stacked_reversal_entry_gates, self.stacked_reversal_target_gates)
+        )
+        self.stacked_reversal_grace_steps = int(cfg.task.get("stacked_reversal_grace_steps", 0))
+        self.step_dt = float(cfg.sim.dt * cfg.sim.substeps)
         
         # Gate asset path - default to isaac_drone_racer gate asset
         # User can override this in config: gate_asset_path: "path/to/gate.usd"
@@ -135,6 +200,7 @@ class DroneRaceEnv(IsaacEnv):
             self.gate_spacing = cfg.task.gate_spacing
             self.gate_height = cfg.task.gate_height
             self.track_type = "circular"
+        self.num_course_gates = max(min(self.num_gates - 1, 12), 1)
         
         import traceback
         import sys
@@ -180,9 +246,14 @@ class DroneRaceEnv(IsaacEnv):
         self.angular_penalty_decay_frames = int(cfg.task.get("angular_penalty_decay_frames", 100_000_000))
         self.gate_just_passed_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.crash_grace_steps = int(cfg.task.get("crash_grace_steps", 100))
+        self.stacked_reversal_grace = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.gates_crossed_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         # Per-gate crossing counters (12 gates, gate 12 = lap closure = same as gate 0)
         self.per_gate_crosses = torch.zeros(self.num_envs, 12, device=self.device, dtype=torch.long)
+        self.episode_start_gate = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.episode_reset_bucket = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.reset_gate_pass_ema = torch.ones(12, device=self.device)
+        self.active_reset_curriculum_gate = -1
         # Furthest gate index reached this episode
         self.furthest_gate_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         # Altitude tracking
@@ -192,9 +263,10 @@ class DroneRaceEnv(IsaacEnv):
         self.mean_action_mag_acc = torch.zeros(self.num_envs, device=self.device)
 
         # --- Accuracy-first curriculum state ---
-        # Phase 0: accuracy-first full laps from gate 0, with only sparse ordered-completion rewards.
-        # Phase 1: same full-lap task, but dense speed/progress shaping is enabled.
-        self.curriculum_phase = 0  # 0=accuracy-first, 1=speed-shaping
+        # Phase 0: accuracy-first full laps from gate 0, with shaping support.
+        # Phase 1: bridge phase with mild speed shaping still enabled.
+        # Phase 2: reliable-full-lap speed phase with shaping removed.
+        self.curriculum_phase = 0  # 0=accuracy-first, 1=bridge-speed, 2=speed-focus
         self.curriculum_ema_alpha = cfg.task.get("curriculum_ema_alpha", 0.01)
         self.lap_completion_rate_ema = 0.0
         self.furthest_gate_ema = 0.0
@@ -513,8 +585,10 @@ class DroneRaceEnv(IsaacEnv):
             "lap_time_steps": Unbounded(1),     # steps to complete lap (0 if no lap completed)
             # Reward component breakdown
             "reward_progress": Unbounded(1),    # cumulative progress reward
-            "reward_speed": Unbounded(1),       # cumulative per-step speed reward term (currently zeroed)
+            "reward_speed": Unbounded(1),       # cumulative per-step speed reward term
             "reward_gates": Unbounded(1),       # cumulative gate passage reward
+            "reward_stacked_direction": Unbounded(1), # cumulative signed stacked-gate local progress shaping
+            "reward_stacked_bonus": Unbounded(1),     # cumulative stacked-gate entry/clear sparse bonuses
             "reward_penalties": Unbounded(1),   # cumulative angular + smoothness penalties
             "reward_altitude": Unbounded(1),    # cumulative altitude penalty term
             "reward_approach": Unbounded(1),    # cumulative near-gate retreat penalty term
@@ -525,9 +599,25 @@ class DroneRaceEnv(IsaacEnv):
             # Angular penalty decay (scalar, same for all envs)
             "ang_penalty_decay_frac": Unbounded(1),
             # Curriculum phase tracking
-            "curriculum_phase": Unbounded(1),   # 0=accuracy-first, 1=speed-shaping
+            "curriculum_phase": Unbounded(1),   # 0=accuracy-first, 1=bridge-speed, 2=speed-focus
             "curriculum_accuracy_ema": Unbounded(1),   # EMA full-lap completion rate used to unlock speed shaping
             "curriculum_furthest_ema": Unbounded(1),   # EMA furthest gate reached, kept as a diagnostic
+            "reset_active_gate": Unbounded(1),         # earliest gate whose gate-0-start passage EMA is still below threshold
+            "reset_from_gate0": Unbounded(1),          # episode started from gate 0 bucket
+            "reset_from_prev_gate": Unbounded(1),      # episode started from previous-gate practice bucket
+            "reset_from_random_gate": Unbounded(1),    # episode started from random-gate practice bucket
+            "reset_gate_0_pass_ema": Unbounded(1),
+            "reset_gate_1_pass_ema": Unbounded(1),
+            "reset_gate_2_pass_ema": Unbounded(1),
+            "reset_gate_3_pass_ema": Unbounded(1),
+            "reset_gate_4_pass_ema": Unbounded(1),
+            "reset_gate_5_pass_ema": Unbounded(1),
+            "reset_gate_6_pass_ema": Unbounded(1),
+            "reset_gate_7_pass_ema": Unbounded(1),
+            "reset_gate_8_pass_ema": Unbounded(1),
+            "reset_gate_9_pass_ema": Unbounded(1),
+            "reset_gate_10_pass_ema": Unbounded(1),
+            "reset_gate_11_pass_ema": Unbounded(1),
             # Per-gate visit counts — how many times each gate was crossed in the episode
             "gate_0_crosses": Unbounded(1),
             "gate_1_crosses": Unbounded(1),
@@ -559,12 +649,43 @@ class DroneRaceEnv(IsaacEnv):
 
         n = len(env_ids)
 
-        # Accuracy-first curriculum: always start behind gate 0 so the policy learns
-        # the whole ordered lap before any speed shaping is introduced.
+        # Reset curriculum: default to gate 0, but optionally allocate some resets
+        # to the earliest weak gate's lead-in and a small random-gate coverage bucket.
         start_gates = torch.zeros(n, device=self.device, dtype=torch.long)
+        reset_bucket = torch.zeros(n, device=self.device, dtype=torch.long)
+        curriculum_active = (
+            self.reset_curriculum_enabled
+            and 0 <= self.active_reset_curriculum_gate < self.num_course_gates
+        )
+        if curriculum_active:
+            random_draw = torch.rand(n, device=self.device)
+            prev_bucket = (
+                (random_draw >= self.reset_curriculum_gate0_prob)
+                & (
+                    random_draw
+                    < self.reset_curriculum_gate0_prob + self.reset_curriculum_prev_gate_prob
+                )
+            )
+            random_bucket = (
+                random_draw
+                >= self.reset_curriculum_gate0_prob + self.reset_curriculum_prev_gate_prob
+            )
+            prev_gate = (self.active_reset_curriculum_gate - 1) % self.num_course_gates
+            start_gates[prev_bucket] = prev_gate
+            if random_bucket.any():
+                start_gates[random_bucket] = torch.randint(
+                    0,
+                    self.num_course_gates,
+                    (int(random_bucket.sum().item()),),
+                    device=self.device,
+                )
+            reset_bucket[prev_bucket] = 1
+            reset_bucket[random_bucket] = 2
 
         # Reset gate progress
         self.gate_indices[env_ids] = start_gates
+        self.episode_start_gate[env_ids] = start_gates
+        self.episode_reset_bucket[env_ids] = reset_bucket
         self.gate_passed[env_ids] = False
         self.track_completed[env_ids] = False
         self.last_action[env_ids] = 0.0
@@ -572,6 +693,7 @@ class DroneRaceEnv(IsaacEnv):
         # Give every spawned env a full grace window so the drone is not immediately
         # killed by the distance-crash check before it has a chance to orient itself.
         self.gate_just_passed_steps[env_ids] = self.crash_grace_steps
+        self.stacked_reversal_grace[env_ids] = 0
         self.gates_crossed_this_ep[env_ids] = 0
         self.per_gate_crosses[env_ids] = 0
         self.furthest_gate_this_ep[env_ids] = start_gates
@@ -655,20 +777,29 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["max_speed"][env_ids] = 0.
         self.stats["lap_time_steps"][env_ids] = 0.
         self.stats["reward_progress"][env_ids] = 0.
+        self.stats["reward_speed"][env_ids] = 0.
         self.stats["reward_gates"][env_ids] = 0.
+        self.stats["reward_stacked_direction"][env_ids] = 0.
+        self.stats["reward_stacked_bonus"][env_ids] = 0.
         self.stats["reward_penalties"][env_ids] = 0.
         self.stats["reward_altitude"][env_ids] = 0.
         self.stats["reward_approach"][env_ids] = 0.
         self.stats["reward_centering"][env_ids] = 0.
+        self.stats["reward_crash"][env_ids] = 0.
         self.stats["mean_ang_rate"][env_ids] = 0.
         self.stats["ang_penalty_decay_frac"][env_ids] = 0.
-        self.stats["curriculum_phase"][env_ids] = 0.
+        self.stats["curriculum_phase"][env_ids] = float(self.curriculum_phase)
+        self.stats["reset_active_gate"][env_ids] = float(self.active_reset_curriculum_gate)
+        self.stats["reset_from_gate0"][env_ids] = (reset_bucket == 0).float().unsqueeze(-1)
+        self.stats["reset_from_prev_gate"][env_ids] = (reset_bucket == 1).float().unsqueeze(-1)
+        self.stats["reset_from_random_gate"][env_ids] = (reset_bucket == 2).float().unsqueeze(-1)
         self.stats["furthest_gate"][env_ids] = 0.
         self.stats["final_dist_to_gate"][env_ids] = 0.
         self.stats["mean_altitude"][env_ids] = 0.
         self.stats["min_altitude"][env_ids] = 0.
         self.stats["mean_action_magnitude"][env_ids] = 0.
         for gi in range(12):
+            self.stats[f"reset_gate_{gi}_pass_ema"][env_ids] = float(self.reset_gate_pass_ema[gi].item())
             self.stats[f"gate_{gi}_crosses"][env_ids] = 0.
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
@@ -1042,6 +1173,7 @@ class DroneRaceEnv(IsaacEnv):
         # --- gate crossing detection ---
         # You either _deteect_gate_crossings or _detect_gate_crossings_via_segments
         # This function call updates the gate indexes
+        prev_gate_frame = self.prev_drone_in_gate_frame.clone()
         gate_passed_this_step, gate_index_changed, new_gate_center = self._detect_gate_crossings(
             drone_pos_flat, current_gate_center, current_gate_rot,
             gate_env_pos, gate_env_rot, batch_indices,
@@ -1056,6 +1188,12 @@ class DroneRaceEnv(IsaacEnv):
         self.gate_just_passed_steps[gate_index_changed] = self.crash_grace_steps
         self.gate_just_passed_steps = (self.gate_just_passed_steps - 1).clamp(min=0)
         in_grace = self.gate_just_passed_steps > 0
+
+        # Re-gather active target-gate geometry after possible gate advancement.
+        current_gate_rot = gate_env_rot[batch_indices, self.gate_indices]
+        current_gate_center = new_gate_center
+        current_gate_local = quat_rotate_inverse(current_gate_rot, drone_pos_flat - current_gate_center)
+        distance_to_gate = torch.norm(drone_pos_flat - current_gate_center, dim=-1)
 
         # -----------------------------------------------------------------------
         # STUDENT TODO (2/3): Implement your reward function.
@@ -1084,7 +1222,31 @@ class DroneRaceEnv(IsaacEnv):
         # ----- ADD YOUR REWARD CODE BELOW (replace the placeholder) -----
 
         speed_shaping_enabled = self.curriculum_phase >= 1
+        speed_focus_phase = self.curriculum_phase >= 2
+        disable_dense_shaping = speed_focus_phase and self.phase2_disable_dense_shaping
         speed_phase_weight = 1.0 if speed_shaping_enabled else 0.0
+        current_speed_scale = self.reward_speed_scale_phase2 if speed_focus_phase else self.reward_speed_scale
+        current_speed_target = (
+            self.reward_speed_target_ms_phase2 if speed_focus_phase else self.reward_speed_target_ms
+        )
+        sparse_zone_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        for gate_idx in self.sparse_only_gate_indices:
+            sparse_zone_mask |= self.gate_indices == gate_idx
+        stacked_target_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        for gate_idx in self.stacked_reversal_target_gates:
+            stacked_target_mask |= self.gate_indices == gate_idx
+        prev_target_indices = (self.gate_indices - 1).remainder(max(self.num_gates - 1, 1))
+        stacked_entry_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        for entry_gate, target_gate in self.stacked_reversal_gate_pairs:
+            stacked_entry_mask |= (
+                gate_index_changed
+                & (self.gate_indices == target_gate)
+                & (prev_target_indices == entry_gate)
+            )
+        if self.stacked_reversal_grace_steps > 0:
+            self.stacked_reversal_grace[stacked_entry_mask] = self.stacked_reversal_grace_steps
+        stacked_reversal_in_grace = self.stacked_reversal_grace > 0
+        self.stacked_reversal_grace = (self.stacked_reversal_grace - 1).clamp(min=0)
 
         # 1. Path-projection progress reward (Song et al. 2021).
         #    Projects the drone's step displacement onto the unit vector from the previous
@@ -1106,20 +1268,47 @@ class DroneRaceEnv(IsaacEnv):
         self.prev_drone_pos = drone_pos_flat.clone()
 
         progress_reward = self.reward_progress_scale * progress
+        progress_reward = torch.where(
+            sparse_zone_mask,
+            torch.zeros_like(progress_reward),
+            progress_reward,
+        )
+        if disable_dense_shaping:
+            progress_reward = torch.zeros_like(progress_reward)
         reward = progress_reward.clone()
 
-        # 2. Speed diagnostic.
-        #    Keep tracking forward speed along the racing line for stats, but do not pay
-        #    a per-step speed reward. Speed is only incentivized through lap_speed_reward
-        #    once the accuracy gate has unlocked phase 1.
+        # 2. Dense forward-speed shaping.
+        #    Only turns on in phase 1 and stays capped so sparse gate rewards remain dominant.
         lin_vel_world = self.drone.vel[:, 0, :3]  # (N, 3) linear velocity in world frame
         speed_along_racing_line = (lin_vel_world * gate_to_gate_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
-        speed_reward = torch.zeros_like(speed_along_racing_line)
+        speed_reward = (
+            speed_phase_weight
+            * current_speed_scale
+            * speed_along_racing_line.clamp(max=current_speed_target)
+            * self.step_dt
+        )
+        speed_reward = torch.where(
+            sparse_zone_mask,
+            torch.zeros_like(speed_reward),
+            speed_reward,
+        )
         reward += speed_reward
 
         # 3. Sparse gate passage bonus.
         gate_reward = self.reward_gate_passage * gate_passed_this_step.float()
         reward += gate_reward
+
+        # 3b. Extra sparse bonuses around the hard stacked return gates.
+        crossed_gate_idx = (self.gate_indices - 1).remainder(max(self.num_gates - 1, 1))
+        stacked_clear_mask = torch.zeros_like(gate_passed_this_step)
+        for gate_idx in self.stacked_reversal_target_gates:
+            stacked_clear_mask |= crossed_gate_idx == gate_idx
+        stacked_clear_mask &= gate_passed_this_step
+        stacked_bonus_reward = (
+            self.reward_stacked_entry_bonus * stacked_entry_mask.float()
+            + self.reward_stacked_clear_bonus * stacked_clear_mask.float()
+        )
+        reward += stacked_bonus_reward
 
         # 4. Ordered sequence bonus.
         #    Gate crossings are only counted for the current target gate, so a non-zero
@@ -1138,6 +1327,26 @@ class DroneRaceEnv(IsaacEnv):
         lap_reward = lap_completion_reward + lap_speed_reward
         reward += lap_reward
 
+        # 5b. Signed local-x progress shaping inside the hard lower stacked gates only.
+        # This is the only dense shaping reintroduced in the sparse stacked sections.
+        stacked_corridor_mask = (
+            stacked_target_mask
+            & (~gate_index_changed)
+            & (current_gate_local[:, 0] >= -4.0)
+            & (current_gate_local[:, 0] <= 2.0)
+            & (current_gate_local[:, 1].abs() <= self.gate_width)
+            & (current_gate_local[:, 2].abs() <= self.gate_height)
+        )
+        stacked_delta_x = current_gate_local[:, 0] - prev_gate_frame[:, 0]
+        stacked_direction_reward = torch.where(
+            stacked_corridor_mask,
+            self.reward_stacked_direction_scale * stacked_delta_x,
+            torch.zeros_like(stacked_delta_x),
+        )
+        if disable_dense_shaping:
+            stacked_direction_reward = torch.zeros_like(stacked_direction_reward)
+        reward += stacked_direction_reward
+
         # 6. Altitude mismatch penalty.
         #    Race track has two elevated gates (z=3.0) at gates 7 and 11. The path-projection
         #    reward gives near-zero signal on the purely-vertical 2m segments (gate 6→7, 10→11)
@@ -1155,13 +1364,19 @@ class DroneRaceEnv(IsaacEnv):
             self.reward_altitude_scale * (1.0 - torch.exp(-altitude_error)),
             torch.zeros_like(altitude_error)
         )
+        altitude_penalty = torch.where(
+            sparse_zone_mask,
+            torch.zeros_like(altitude_penalty),
+            altitude_penalty,
+        )
+        if disable_dense_shaping:
+            altitude_penalty = torch.zeros_like(altitude_penalty)
         reward -= altitude_penalty
 
         # 7. Gate-centering penalty.
         #    When the drone is near the target gate plane, penalize lateral/vertical
         #    miss relative to the gate center. This keeps progress shaping from
         #    rewarding fly-bys that move along the track but miss the aperture.
-        current_gate_local = quat_rotate_inverse(current_gate_rot, drone_pos_flat - current_gate_center)
         gate_plane_window = (current_gate_local[:, 0] > -6.0) & (current_gate_local[:, 0] < 2.0)
         gate_center_miss = torch.linalg.norm(current_gate_local[:, 1:3], dim=-1)
         centering_penalty = torch.where(
@@ -1169,6 +1384,13 @@ class DroneRaceEnv(IsaacEnv):
             self.reward_gate_centering_scale * (1.0 - torch.exp(-gate_center_miss)),
             torch.zeros_like(gate_center_miss),
         )
+        centering_penalty = torch.where(
+            sparse_zone_mask,
+            torch.zeros_like(centering_penalty),
+            centering_penalty,
+        )
+        if disable_dense_shaping:
+            centering_penalty = torch.zeros_like(centering_penalty)
         reward -= centering_penalty
 
         # 8. Near-gate retreat penalty.
@@ -1184,6 +1406,13 @@ class DroneRaceEnv(IsaacEnv):
             self.reward_approach_scale * retreat_amount,
             torch.zeros_like(retreat_amount)
         )
+        approach_penalty = torch.where(
+            sparse_zone_mask,
+            torch.zeros_like(approach_penalty),
+            approach_penalty,
+        )
+        if disable_dense_shaping:
+            approach_penalty = torch.zeros_like(approach_penalty)
         reward -= approach_penalty
         # Update prev_distance_to_gate for next step's approach reward computation.
         self.prev_distance_to_gate = distance_to_gate.clone()
@@ -1194,11 +1423,29 @@ class DroneRaceEnv(IsaacEnv):
         ang_decay_frac = max(0.0, 1.0 - self.total_frames_counter / self.angular_penalty_decay_frames)
         ang_vel = self.drone.vel[:, 0, 3:]  # (N, 3) angular velocity in world frame
         ang_penalty = ang_vel.pow(2).sum(dim=-1)  # (N,)
-        reward -= (self.reward_angular_penalty * ang_decay_frac) * ang_penalty
+        angular_penalty = (self.reward_angular_penalty * ang_decay_frac) * ang_penalty
+        if self.sparse_disable_smoothness_penalties:
+            angular_penalty = torch.where(
+                sparse_zone_mask,
+                torch.zeros_like(angular_penalty),
+                angular_penalty,
+            )
+        if disable_dense_shaping:
+            angular_penalty = torch.zeros_like(angular_penalty)
+        reward -= angular_penalty
 
         # 10. Action smoothness penalty.
         action_diff = self.drone.throttle_difference.squeeze(-1)  # (N,)
-        reward -= self.reward_action_smooth_scale * action_diff
+        action_smooth_penalty = self.reward_action_smooth_scale * action_diff
+        if self.sparse_disable_smoothness_penalties:
+            action_smooth_penalty = torch.where(
+                sparse_zone_mask,
+                torch.zeros_like(action_smooth_penalty),
+                action_smooth_penalty,
+            )
+        if disable_dense_shaping:
+            action_smooth_penalty = torch.zeros_like(action_smooth_penalty)
+        reward -= action_smooth_penalty
 
         # ----- END STUDENT CODE -----
 
@@ -1219,7 +1466,16 @@ class DroneRaceEnv(IsaacEnv):
         # Out-of-bounds: drone is too far from its target gate (lost / diverged).
         # Grace period suppresses this check for crash_grace_steps steps after a gate crossing,
         # preventing false terminations when the target gate index just advanced (~7m away).
-        dist_crash = (distance_to_gate > self.crash_dist_threshold) & (~in_grace)  # (N,)
+        stacked_distance_window = stacked_target_mask | stacked_reversal_in_grace
+        distance_threshold = torch.full_like(distance_to_gate, self.crash_dist_threshold)
+        distance_threshold = torch.where(
+            stacked_distance_window,
+            torch.full_like(distance_to_gate, self.stacked_reversal_dist_threshold),
+            distance_threshold,
+        )
+        dist_crash = distance_to_gate > distance_threshold  # (N,)
+        dist_crash &= ~in_grace
+        dist_crash &= ~stacked_reversal_in_grace
 
         crashed = phys_crash | ground_crash | dist_crash
 
@@ -1245,15 +1501,48 @@ class DroneRaceEnv(IsaacEnv):
             self.lap_completion_rate_ema = decay * self.lap_completion_rate_ema + (1.0 - decay) * lap_completed_mean
             self.furthest_gate_ema = decay * self.furthest_gate_ema + (1.0 - decay) * furthest_mean
 
-        # --- Curriculum phase transition (accuracy-gated, with frame-count floor) ---
-        # Speed shaping unlocks only when the policy has learned to finish full ordered laps
-        # reliably enough from gate 0.
+            gate0_done_mask = done_flat & (self.episode_start_gate == 0)
+            n_gate0_done = int(gate0_done_mask.sum().item())
+            if n_gate0_done > 0:
+                pass_matrix = (
+                    self.per_gate_crosses[gate0_done_mask, :self.num_course_gates] > 0
+                ).float()
+                pass_mean = pass_matrix.mean(dim=0)
+                reset_alpha = self.reset_curriculum_metric_alpha
+                reset_decay = (1.0 - reset_alpha) ** n_gate0_done
+                self.reset_gate_pass_ema[:self.num_course_gates] = (
+                    reset_decay * self.reset_gate_pass_ema[:self.num_course_gates]
+                    + (1.0 - reset_decay) * pass_mean
+                )
+                if self.reset_curriculum_enabled:
+                    weak_gate_candidates = torch.nonzero(
+                        self.reset_gate_pass_ema[:self.num_course_gates]
+                        < self.reset_curriculum_gate_pass_threshold
+                    ).squeeze(-1)
+                    self.active_reset_curriculum_gate = (
+                        int(weak_gate_candidates[0].item())
+                        if weak_gate_candidates.numel() > 0
+                        else -1
+                    )
+                else:
+                    self.active_reset_curriculum_gate = -1
+
+        # --- Curriculum phase transition ---
+        # Speed shaping can unlock on the first success, or fall back to the original
+        # accuracy-gated rule when phase_speed_unlock_on_first_success is disabled.
         frames_in_phase = self.total_frames_counter - self._phase_started_at_frames
         if self.curriculum_phase == 0:
-            if frames_in_phase >= self.curriculum_min_phase_frames and \
+            if self.phase_speed_unlock_on_first_success and completed_task.any():
+                self.curriculum_phase = 1
+                self._phase_started_at_frames = self.total_frames_counter
+            elif frames_in_phase >= self.curriculum_min_phase_frames and \
                self.lap_completion_rate_ema >= self.phase_speed_unlock_accuracy_rate:
                 self.curriculum_phase = 1
                 self._phase_started_at_frames = self.total_frames_counter
+        elif self.curriculum_phase == 1 and \
+             self.lap_completion_rate_ema >= self.phase2_speed_focus_accuracy_rate:
+            self.curriculum_phase = 2
+            self._phase_started_at_frames = self.total_frames_counter
 
         # --- stats ---
         self.stats["truncated"].add_(truncated.float())
@@ -1281,11 +1570,13 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["lap_time_steps"][just_completed] = self.progress_buf[just_completed].float().unsqueeze(-1)
         # Reward component breakdown (cumulative)
         gate_reward_total = gate_reward + sequence_reward + lap_reward  # (N,) includes ordered streak + lap bonuses
-        penalty_reward = (self.reward_angular_penalty * ang_decay_frac) * ang_penalty + self.reward_action_smooth_scale * action_diff  # (N,)
+        penalty_reward = angular_penalty + action_smooth_penalty  # (N,)
         crash_reward = self.reward_crash_scale * crashed.float()  # (N,)
         self.stats["reward_progress"].add_(progress_reward.unsqueeze(-1))
         self.stats["reward_speed"].add_(speed_reward.unsqueeze(-1))
         self.stats["reward_gates"].add_(gate_reward_total.unsqueeze(-1))
+        self.stats["reward_stacked_direction"].add_(stacked_direction_reward.unsqueeze(-1))
+        self.stats["reward_stacked_bonus"].add_(stacked_bonus_reward.unsqueeze(-1))
         self.stats["reward_penalties"].add_(penalty_reward.unsqueeze(-1))
         self.stats["reward_altitude"].add_((-altitude_penalty).unsqueeze(-1))
         self.stats["reward_approach"].add_((-approach_penalty).unsqueeze(-1))
@@ -1316,11 +1607,16 @@ class DroneRaceEnv(IsaacEnv):
         for gi in range(12):
             self.stats[f"gate_{gi}_crosses"][:] = self.per_gate_crosses[:, gi].float().unsqueeze(1)
 
-        # Curriculum phase (0=accuracy-first, 1=speed-shaping) — tracked in
-        # self.curriculum_phase and advanced by the full-lap accuracy gate above.
+        # Curriculum phase (0=accuracy-first, 1=bridge-speed, 2=speed-focus).
         self.stats["curriculum_phase"][:] = float(self.curriculum_phase)
         self.stats["curriculum_accuracy_ema"][:] = float(self.lap_completion_rate_ema)
         self.stats["curriculum_furthest_ema"][:] = float(self.furthest_gate_ema)
+        self.stats["reset_active_gate"][:] = float(self.active_reset_curriculum_gate)
+        self.stats["reset_from_gate0"][:] = (self.episode_reset_bucket == 0).float().unsqueeze(-1)
+        self.stats["reset_from_prev_gate"][:] = (self.episode_reset_bucket == 1).float().unsqueeze(-1)
+        self.stats["reset_from_random_gate"][:] = (self.episode_reset_bucket == 2).float().unsqueeze(-1)
+        for gi in range(12):
+            self.stats[f"reset_gate_{gi}_pass_ema"][:] = float(self.reset_gate_pass_ema[gi].item())
 
         # Distance to current gate at end of episode (meaningful when episode ends)
         self.stats["final_dist_to_gate"][:] = distance_to_gate.unsqueeze(1)

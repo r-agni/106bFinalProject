@@ -5,14 +5,14 @@ train_every: 256  # race track avg gate spacing ~7.4m → ~74 steps at 10m/s; 25
 ppo_epochs: 10    # gradient epochs per update
 num_minibatches: 16   # 512*256/16=8192 per minibatch — good gradient diversity
 clip_param: 0.2
-entropy_coef: 0.001   # actions are now clamped to [-1,1], so exploration is naturally bounded; 0.02 caused runaway entropy (5.7->41.4 in prev run)
+entropy_coef: 0.03    # start resumed training with higher exploration, then let adaptive entropy reduce it as performance improves
 gae_lambda: 0.95
 gamma: 0.998  # long effective horizon (~500 steps) needed for lap bonus credit assignment
 max_grad_norm: 5.0
 
 adaptive_entropy:
   enabled: true
-  phase0_coef_max: 0.012
+  phase0_coef_max: 0.03
   phase0_coef_min: 0.002
   phase1_rebump_coef: 0.010
   phase1_coef_min: 0.0005
@@ -29,9 +29,9 @@ priv_actor: true    # SIM-ONLY EXPLOIT: no real-world transfer needed, actor als
 priv_critic: true   # KEY SIM EXPLOIT: critic sees privileged physical parameters during training
 
 actor:
-  # 2-layer 256-unit network with LeakyReLU (slope 0.2) — Swift (Nature 2023) architecture.
+  # Wider actor to increase policy capacity for the longer-horizon race curriculum.
   lr: 0.0003               # 3e-4 Adam — standard across Swift, MonoRace, SPIRAL
-  hidden_units: [256, 256]
+  hidden_units: [512, 512]
   activation: leaky_relu   # LeakyReLU(0.2) — avoids dead neurons vs ReLU
   lr_scheduler:
   lr_scheduler_kwargs:
@@ -39,10 +39,9 @@ actor:
   weight_decay: 0.0
 
 critic:
-  # Wider critic: value estimation benefits from capacity since it sees obs + intrinsics.
-  # Actor stays [256,256] to avoid overfitting on the compact 27-dim obs.
+  # Match the actor width and keep a deep critic for the wider value-estimation task.
   lr: 0.0003
-  hidden_units: [256, 256, 128]  # extra layer: critic has more signal (obs + intrinsics) to process
+  hidden_units: [512, 512, 512]
   activation: leaky_relu
   lr_scheduler:
   lr_scheduler_kwargs:

@@ -1085,6 +1085,9 @@ class DroneRaceEnv(IsaacEnv):
 
         Returns:
             gate_passed_this_step: (N,) bool — True for envs that just passed a gate.
+            crossed_gate_idx:      (N,) long — gate index that was just crossed before any
+                target advance. The duplicated lap-closure gate remains `num_course_gates`
+                so downstream code can exclude it from per-gate accounting.
             gate_index_changed:    (N,) bool — True for envs whose target gate advanced.
             new_gate_center:       (N, 3) — centre of the (possibly new) target gate.
         """
@@ -1112,6 +1115,7 @@ class DroneRaceEnv(IsaacEnv):
         self.gate_passed[gate_passed_this_step] = True
 
         old_gate_indices = self.gate_indices.clone()
+        crossed_gate_idx = old_gate_indices.clone()
         last_gate_passed = gate_passed_this_step & (self.gate_indices + 1 >= self.num_gates)
         self.track_completed[last_gate_passed] = True
         self.gate_indices[gate_passed_this_step] = torch.clamp(
@@ -1132,7 +1136,7 @@ class DroneRaceEnv(IsaacEnv):
             gate_index_changed.unsqueeze(-1), new_in_gate, curr_in_gate,
         )
 
-        return gate_passed_this_step, gate_index_changed, new_gate_center
+        return gate_passed_this_step, crossed_gate_idx, gate_index_changed, new_gate_center
 
 
     def _compute_reward_and_done(self):
@@ -1174,7 +1178,7 @@ class DroneRaceEnv(IsaacEnv):
         # You either _deteect_gate_crossings or _detect_gate_crossings_via_segments
         # This function call updates the gate indexes
         prev_gate_frame = self.prev_drone_in_gate_frame.clone()
-        gate_passed_this_step, gate_index_changed, new_gate_center = self._detect_gate_crossings(
+        gate_passed_this_step, crossed_gate_idx, gate_index_changed, new_gate_center = self._detect_gate_crossings(
             drone_pos_flat, current_gate_center, current_gate_rot,
             gate_env_pos, gate_env_rot, batch_indices,
         )
@@ -1299,11 +1303,11 @@ class DroneRaceEnv(IsaacEnv):
         reward += gate_reward
 
         # 3b. Extra sparse bonuses around the hard stacked return gates.
-        crossed_gate_idx = (self.gate_indices - 1).remainder(max(self.num_gates - 1, 1))
+        real_gate_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_course_gates)
         stacked_clear_mask = torch.zeros_like(gate_passed_this_step)
         for gate_idx in self.stacked_reversal_target_gates:
             stacked_clear_mask |= crossed_gate_idx == gate_idx
-        stacked_clear_mask &= gate_passed_this_step
+        stacked_clear_mask &= real_gate_cross_mask
         stacked_bonus_reward = (
             self.reward_stacked_entry_bonus * stacked_entry_mask.float()
             + self.reward_stacked_clear_bonus * stacked_clear_mask.float()
@@ -1595,13 +1599,13 @@ class DroneRaceEnv(IsaacEnv):
 
         # Per-gate crossing counts (gates 0–11, clamp index to valid range)
         if gate_passed_this_step.any():
-            # gate_indices was already incremented by _detect_gate_crossings, so previous gate is (gate_indices - 1) % (num_gates - 1)
-            crossed_gate_idx = ((self.gate_indices - 1) % (self.num_gates - 1)).clamp(0, 11)
+            real_gate_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_course_gates)
+            safe_crossed_gate_idx = crossed_gate_idx.clamp(0, self.num_course_gates - 1)
             per_gate_update = torch.zeros(self.num_envs, 12, device=self.device)
             per_gate_update.scatter_add_(
                 1,
-                crossed_gate_idx.unsqueeze(1),
-                gate_passed_this_step.float().unsqueeze(1)
+                safe_crossed_gate_idx.unsqueeze(1),
+                real_gate_cross_mask.float().unsqueeze(1)
             )
             self.per_gate_crosses += per_gate_update.long()
         for gi in range(12):

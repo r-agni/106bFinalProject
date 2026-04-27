@@ -229,6 +229,7 @@ def main(cfg):
     }
     auto_stop_reason = None
     required_gate_count = max(int(getattr(base_env, "num_gates", 1)) - 1, 1)
+    reversal_gate_idx = getattr(base_env, "first_reversal_gate_idx", None)
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -391,10 +392,9 @@ def main(cfg):
                 curriculum_phase = _mean("curriculum_phase")
                 curriculum_accuracy = _mean("curriculum_accuracy_ema")
                 curriculum_furthest = _mean("curriculum_furthest_ema")
-                reset_active_gate = _mean("reset_active_gate")
-                reset_from_gate0 = _mean("reset_from_gate0")
-                reset_from_prev_gate = _mean("reset_from_prev_gate")
-                reset_from_random_gate = _mean("reset_from_random_gate")
+                reversal_setup_error = _mean("reversal_setup_error")
+                reversal_stage_completion = _mean("reversal_stage_completion_rate")
+                crash_no_progress = _mean("crashed_no_progress")
 
                 derived = {}
 
@@ -430,6 +430,7 @@ def main(cfg):
                 if crash_ground   is not None: derived["crash/ground_rate"]    = crash_ground
                 if crash_contact  is not None: derived["crash/contact_rate"]   = crash_contact
                 if crash_distance is not None: derived["crash/distance_rate"]  = crash_distance
+                if crash_no_progress is not None: derived["crash/no_progress_rate"] = crash_no_progress
 
                 # Reward components (useful for spotting imbalances)
                 if rew_progress  is not None: derived["reward/progress_cumul"]  = rew_progress
@@ -469,6 +470,9 @@ def main(cfg):
                 # Altitude behaviour
                 if mean_alt is not None: derived["behaviour/mean_altitude_m"]  = mean_alt
                 if min_alt  is not None: derived["behaviour/min_altitude_m"]   = min_alt
+                if reversal_setup_error is not None: derived["reversal/setup_error"] = reversal_setup_error
+                if reversal_stage_completion is not None:
+                    derived["reversal/stage_completion_rate"] = reversal_stage_completion
 
                 # Curriculum tracking
                 if curriculum_phase is not None: derived["curriculum/phase"] = curriculum_phase
@@ -511,6 +515,7 @@ def main(cfg):
 
                     curr_phase = float(curriculum_phase if curriculum_phase is not None else prev_curriculum_phase)
                     accuracy_signal = float(curriculum_accuracy if curriculum_accuracy is not None else 0.0)
+                    furthest_signal = float(curriculum_furthest if curriculum_furthest is not None else 0.0)
 
                     if prev_curriculum_phase == 0.0 and curr_phase >= 1.0:
                         current_entropy_coef = phase1_rebump_coef
@@ -519,7 +524,14 @@ def main(cfg):
                     elif curr_phase < 1.0:
                         unlock_rate = float(cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40))
                         accuracy_norm = _clamp01(accuracy_signal / max(unlock_rate, 1e-6))
-                        target_entropy_coef = phase0_coef_max - accuracy_norm * (phase0_coef_max - phase0_coef_min)
+                        if reversal_gate_idx is not None:
+                            furthest_low = max(float(reversal_gate_idx) - 1.0, 0.0)
+                            furthest_span = max(float(reversal_gate_idx) - furthest_low, 1e-6)
+                            furthest_norm = _clamp01((furthest_signal - furthest_low) / furthest_span)
+                        else:
+                            furthest_norm = _clamp01(furthest_signal / max(required_gate_count, 1))
+                        phase0_progress_signal = max(accuracy_norm, furthest_norm)
+                        target_entropy_coef = phase0_coef_max - phase0_progress_signal * (phase0_coef_max - phase0_coef_min)
                         current_entropy_coef = _slew_toward(
                             current_entropy_coef, target_entropy_coef, max_delta_per_update
                         )
@@ -539,6 +551,11 @@ def main(cfg):
                     derived["entropy/target_coef"] = target_entropy_coef
                     derived["entropy/phase"] = curr_phase
                     derived["entropy/accuracy_signal"] = accuracy_signal
+                    derived["entropy/furthest_signal"] = furthest_signal
+                    if curr_phase < 1.0:
+                        derived["entropy/phase0_progress_signal"] = phase0_progress_signal
+                    if reversal_gate_idx is not None:
+                        derived["entropy/reversal_gate_idx"] = float(reversal_gate_idx)
                     derived["entropy/gates_per_second_ema"] = speed_perf_ema
                     derived["entropy/rebump_applied"] = float(phase1_rebump_applied)
 

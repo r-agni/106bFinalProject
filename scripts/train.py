@@ -38,14 +38,19 @@ from setproctitle import setproctitle
 from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
 
-# def set_global_reproducibility(seed: int, deterministic: bool = True):
-#     """Seed common RNGs and opt into deterministic torch kernels."""
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     if torch.cuda.is_available():
-#         torch.cuda.manual_seed(seed)
-#         torch.cuda.manual_seed_all(seed)
+def set_global_reproducibility(seed: int, deterministic: bool = True):
+    """Seed common RNGs and optionally opt into deterministic torch kernels."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.use_deterministic_algorithms(False)
 
 @hydra.main(version_base=None, config_path=".", config_name="train")
 def main(cfg):
@@ -69,7 +74,7 @@ def main(cfg):
         else:
             logging.warning(f"ppo_cfg '{ppo_cfg_name}' not found at {ppo_cfg_path}, using default.")
 
-    # set_global_reproducibility(cfg.seed, deterministic=cfg.get("deterministic", True))
+    set_global_reproducibility(cfg.seed, deterministic=cfg.get("deterministic", False))
 
     simulation_app = init_simulation_app(cfg)
     run = init_wandb(cfg)

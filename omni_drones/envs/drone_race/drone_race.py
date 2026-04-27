@@ -29,7 +29,7 @@ from torchrl.data import Unbounded, Composite, DiscreteTensorSpec, BinaryDiscret
 
 import isaacsim.core.utils.prims as prim_utils
 import omni_drones.utils.kit as kit_utils
-from omni_drones.utils.torch import euler_to_quaternion, quat_rotate, quat_rotate_inverse, quat_axis
+from omni_drones.utils.torch import euler_to_quaternion, quat_rotate, quat_rotate_inverse, quat_axis, quat_mul
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.robots.drone import MultirotorBase
 from omni_drones.views import ArticulationView, RigidPrimView
@@ -201,6 +201,47 @@ class DroneRaceEnv(IsaacEnv):
             self.gate_height = cfg.task.gate_height
             self.track_type = "circular"
         self.num_course_gates = max(min(self.num_gates - 1, 12), 1)
+        self.phase1_unlock_gate_index = int(
+            cfg.task.get("phase1_unlock_gate_index", min(5, self.num_course_gates - 1))
+        )
+        self.phase1_unlock_gate_index = min(
+            max(self.phase1_unlock_gate_index, 0), self.num_course_gates - 1
+        )
+        self.phase1_unlock_gate_pass_rate = float(
+            cfg.task.get("phase1_unlock_gate_pass_rate", 0.70)
+        )
+        self.hard_turn_target_gates = tuple(
+            sorted(
+                {
+                    gate_idx
+                    for gate_idx in (
+                        int(idx) for idx in cfg.task.get("hard_turn_target_gates", [5])
+                    )
+                    if 0 <= gate_idx < self.num_course_gates
+                }
+            )
+        )
+        self.reward_hard_turn_direction_scale = float(
+            cfg.task.get("reward_hard_turn_direction_scale", 0.0)
+        )
+        self.reward_hard_turn_clear_bonus = float(
+            cfg.task.get("reward_hard_turn_clear_bonus", 0.0)
+        )
+        self.hard_turn_corridor_x_min = float(
+            cfg.task.get("hard_turn_corridor_x_min", -10.0)
+        )
+        self.hard_turn_corridor_x_max = float(
+            cfg.task.get("hard_turn_corridor_x_max", 4.0)
+        )
+        self.hard_turn_corridor_halfwidth = float(
+            cfg.task.get("hard_turn_corridor_halfwidth", float(cfg.task.get("gate_width", 1.0)) * 3.0)
+        )
+        self.hard_turn_corridor_height = float(
+            cfg.task.get("hard_turn_corridor_height", self.gate_height * 2.0)
+        )
+        self.hard_turn_penalty_scale = float(
+            cfg.task.get("hard_turn_penalty_scale", 1.0)
+        )
         
         import traceback
         import sys
@@ -311,9 +352,10 @@ class DroneRaceEnv(IsaacEnv):
             torch.tensor([-1.0, -1.0, 1.5], device=self.device),
             torch.tensor([1.0, 1.0, 2.5], device=self.device)
         )
+        # Reset noise is local to the chosen start gate, so keep it modest.
         self.init_rpy_dist = D.Uniform(
-            torch.tensor([-.2, -.2, 0.], device=self.device) * torch.pi,
-            torch.tensor([.2, .2, 0.], device=self.device) * torch.pi
+            torch.tensor([-0.05, -0.05, -0.08], device=self.device) * torch.pi,
+            torch.tensor([0.05, 0.05, 0.08], device=self.device) * torch.pi
         )
 
         self.offset_local = torch.tensor([-1.5, 0.0, self.gate_height / 2.0], device=self.device)
@@ -705,9 +747,6 @@ class DroneRaceEnv(IsaacEnv):
         gate_velocities = torch.zeros(n, self.num_gates, 6, device=self.device)
         self.gates.set_velocities(gate_velocities, env_indices=env_ids)
 
-        # Reset drone position and orientation
-        drone_rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
-        drone_rot = euler_to_quaternion(drone_rpy)
         try:
             gate_world_pos, gate_world_rot = self.gates.get_world_poses()
             gate_env_pos, gate_env_rot = self.get_env_poses((gate_world_pos, gate_world_rot))
@@ -723,6 +762,9 @@ class DroneRaceEnv(IsaacEnv):
             offset_local_expanded = self.offset_local.unsqueeze(0).expand(n, -1)  # (n, 3)
             offset_world = quat_rotate(start_gate_rot, offset_local_expanded)     # (n, 3)
             drone_start_pos = start_gate_pos + offset_world                        # (n, 3)
+            local_rpy_noise = self.init_rpy_dist.sample((*env_ids.shape, 1))
+            local_rot_noise = euler_to_quaternion(local_rpy_noise)
+            drone_rot = quat_mul(start_gate_rot.unsqueeze(1), local_rot_noise)
 
             # Store prev_drone_pos for path-projection reward
             self.prev_drone_pos[env_ids] = drone_start_pos
@@ -1236,6 +1278,9 @@ class DroneRaceEnv(IsaacEnv):
         sparse_zone_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         for gate_idx in self.sparse_only_gate_indices:
             sparse_zone_mask |= self.gate_indices == gate_idx
+        hard_turn_target_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        for gate_idx in self.hard_turn_target_gates:
+            hard_turn_target_mask |= self.gate_indices == gate_idx
         stacked_target_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         for gate_idx in self.stacked_reversal_target_gates:
             stacked_target_mask |= self.gate_indices == gate_idx
@@ -1302,8 +1347,15 @@ class DroneRaceEnv(IsaacEnv):
         gate_reward = self.reward_gate_passage * gate_passed_this_step.float()
         reward += gate_reward
 
-        # 3b. Extra sparse bonuses around the hard stacked return gates.
         real_gate_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_course_gates)
+        hard_turn_clear_mask = torch.zeros_like(gate_passed_this_step)
+        for gate_idx in self.hard_turn_target_gates:
+            hard_turn_clear_mask |= crossed_gate_idx == gate_idx
+        hard_turn_clear_mask &= real_gate_cross_mask
+        hard_turn_bonus_reward = self.reward_hard_turn_clear_bonus * hard_turn_clear_mask.float()
+        reward += hard_turn_bonus_reward
+
+        # 3b. Extra sparse bonuses around the hard stacked return gates.
         stacked_clear_mask = torch.zeros_like(gate_passed_this_step)
         for gate_idx in self.stacked_reversal_target_gates:
             stacked_clear_mask |= crossed_gate_idx == gate_idx
@@ -1351,6 +1403,24 @@ class DroneRaceEnv(IsaacEnv):
             stacked_direction_reward = torch.zeros_like(stacked_direction_reward)
         reward += stacked_direction_reward
 
+        hard_turn_corridor_mask = (
+            hard_turn_target_mask
+            & (~gate_index_changed)
+            & (current_gate_local[:, 0] >= self.hard_turn_corridor_x_min)
+            & (current_gate_local[:, 0] <= self.hard_turn_corridor_x_max)
+            & (current_gate_local[:, 1].abs() <= self.hard_turn_corridor_halfwidth)
+            & (current_gate_local[:, 2].abs() <= self.hard_turn_corridor_height)
+        )
+        hard_turn_delta_x = current_gate_local[:, 0] - prev_gate_frame[:, 0]
+        hard_turn_direction_reward = torch.where(
+            hard_turn_corridor_mask,
+            self.reward_hard_turn_direction_scale * hard_turn_delta_x,
+            torch.zeros_like(hard_turn_delta_x),
+        )
+        if disable_dense_shaping:
+            hard_turn_direction_reward = torch.zeros_like(hard_turn_direction_reward)
+        reward += hard_turn_direction_reward
+
         # 6. Altitude mismatch penalty.
         #    Race track has two elevated gates (z=3.0) at gates 7 and 11. The path-projection
         #    reward gives near-zero signal on the purely-vertical 2m segments (gate 6→7, 10→11)
@@ -1393,6 +1463,11 @@ class DroneRaceEnv(IsaacEnv):
             torch.zeros_like(centering_penalty),
             centering_penalty,
         )
+        centering_penalty = torch.where(
+            hard_turn_corridor_mask,
+            centering_penalty * self.hard_turn_penalty_scale,
+            centering_penalty,
+        )
         if disable_dense_shaping:
             centering_penalty = torch.zeros_like(centering_penalty)
         reward -= centering_penalty
@@ -1413,6 +1488,11 @@ class DroneRaceEnv(IsaacEnv):
         approach_penalty = torch.where(
             sparse_zone_mask,
             torch.zeros_like(approach_penalty),
+            approach_penalty,
+        )
+        approach_penalty = torch.where(
+            hard_turn_corridor_mask,
+            approach_penalty * self.hard_turn_penalty_scale,
             approach_penalty,
         )
         if disable_dense_shaping:
@@ -1540,7 +1620,7 @@ class DroneRaceEnv(IsaacEnv):
                 self.curriculum_phase = 1
                 self._phase_started_at_frames = self.total_frames_counter
             elif frames_in_phase >= self.curriculum_min_phase_frames and \
-               self.lap_completion_rate_ema >= self.phase_speed_unlock_accuracy_rate:
+               self.reset_gate_pass_ema[self.phase1_unlock_gate_index].item() >= self.phase1_unlock_gate_pass_rate:
                 self.curriculum_phase = 1
                 self._phase_started_at_frames = self.total_frames_counter
         elif self.curriculum_phase == 1 and \
@@ -1573,10 +1653,10 @@ class DroneRaceEnv(IsaacEnv):
         just_completed = completed_task & (self.stats["lap_time_steps"].squeeze(-1) == 0)
         self.stats["lap_time_steps"][just_completed] = self.progress_buf[just_completed].float().unsqueeze(-1)
         # Reward component breakdown (cumulative)
-        gate_reward_total = gate_reward + sequence_reward + lap_reward  # (N,) includes ordered streak + lap bonuses
+        gate_reward_total = gate_reward + sequence_reward + lap_reward + hard_turn_bonus_reward  # (N,) includes ordered streak + lap bonuses
         penalty_reward = angular_penalty + action_smooth_penalty  # (N,)
         crash_reward = self.reward_crash_scale * crashed.float()  # (N,)
-        self.stats["reward_progress"].add_(progress_reward.unsqueeze(-1))
+        self.stats["reward_progress"].add_((progress_reward + hard_turn_direction_reward).unsqueeze(-1))
         self.stats["reward_speed"].add_(speed_reward.unsqueeze(-1))
         self.stats["reward_gates"].add_(gate_reward_total.unsqueeze(-1))
         self.stats["reward_stacked_direction"].add_(stacked_direction_reward.unsqueeze(-1))

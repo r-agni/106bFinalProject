@@ -103,8 +103,9 @@ class IsaacEnv(EnvBase):
         print(f"dt: {self.cfg.sim.dt}")
         print("--------------------------------")
         
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+        deterministic = bool(self.cfg.get("deterministic", False))
+        torch.backends.cudnn.benchmark = not deterministic
+        torch.backends.cudnn.deterministic = deterministic
 
         # check that simulation is running
         if stage_utils.get_current_stage() is None:

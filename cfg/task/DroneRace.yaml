@@ -34,7 +34,9 @@ save_interval: 100
 
 # Track configuration: config-based track with custom gate positions and orientations
 # Gate's local x axis is perpendicular to surface. Center is on the bottom middle. 
-# IMPORTANT: The last gate should be the exact same pos and yaw as the first gate. 
+# IMPORTANT: The last gate should be the exact same pos and yaw as the first gate.
+# It is kept only as a geometry / lookahead helper for lap closure; lap success is
+# awarded as soon as the drone clears the final real gate before this duplicate.
 
 # Circular track (disabled — using Race track below)
 # track_config:
@@ -78,8 +80,10 @@ save_interval: 100
 #     pos: [0.0, 0.0, 1.0]
 #     yaw: 1.57
 
-# Race track — 13 gates (original EECS106B positions).
-# Gate 13 = Gate 1 (lap closure). Elevated gates at 7 and 11 (z=3.0).
+# Race track — 13 YAML gate entries (original EECS106B positions).
+# Gates 1-12 are the real lap gates. Gate 13 duplicates Gate 1 only so the
+# observation lookahead can see the lap-closure turn without extending the lap.
+# Elevated gates at 7 and 11 (z=3.0).
 # Sharp turns at gates 5→6 and 7→8 (180° reversal).
 track_config:
   "1":
@@ -131,7 +135,7 @@ track_config:
     yaw: 3.921               # = 0.78 + pi; must face OPPOSITE to gate 11 (same as gate 7/8 design)
 
   "13":
-    pos: [14.0, 34.0, 1.0]   # lap closure = gate 1
+    pos: [14.0, 34.0, 1.0]   # duplicated gate-1 geometry helper; not an extra rewardable gate
     yaw: 0.0
     
 # Gate settings

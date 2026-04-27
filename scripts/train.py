@@ -98,6 +98,13 @@ def main(cfg):
             logging.warning(f"Could not save config.yaml early: {e}")
     
     save_config_early()
+
+    run.summary["curriculum/phase2_trigger_rule"] = (
+        "phase==1 and gate0-start lap_completion_rate_ema >= phase2_speed_focus_accuracy_rate"
+    )
+    run.summary["curriculum/phase2_trigger_threshold"] = float(
+        cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
+    )
     
     # Set up signal handler to ensure config is saved on Ctrl+C
     # The finally block will handle wandb.finish() and simulation_app.close()
@@ -233,7 +240,14 @@ def main(cfg):
         if threshold is not None
     }
     auto_stop_reason = None
-    required_gate_count = max(int(getattr(base_env, "num_gates", 1)) - 1, 1)
+    required_gate_count = max(
+        int(getattr(base_env, "num_course_gates", getattr(base_env, "num_gates", 1))),
+        1,
+    )
+    logged_curriculum_phase = int(round(float(getattr(base_env, "curriculum_phase", 0))))
+    phase2_started_env_frames = None
+    phase2_started_iter = None
+    phase2_started_accuracy_ema = None
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -262,59 +276,59 @@ def main(cfg):
         seed: int=0,
         exploration_type: ExplorationType=ExplorationType.MODE
     ):
-
-        base_env.enable_render(True)
-        base_env.eval()
-        env.eval()
-        env.set_seed(seed)
-
+        prev_reset_curriculum_enabled = getattr(base_env, "reset_curriculum_enabled", None)
         render_callback = RenderCallback(interval=2)
+        try:
+            if prev_reset_curriculum_enabled is not None:
+                base_env.reset_curriculum_enabled = False
 
-        with set_exploration_type(exploration_type):
-            trajs = env.rollout(
-                max_steps=base_env.max_episode_length,
-                policy=policy,
-                callback=render_callback,
-                auto_reset=True,
-                break_when_any_done=False,
-                return_contiguous=False,
-            )
-        base_env.enable_render(not cfg.headless)
-        env.reset()
+            base_env.enable_render(True)
+            base_env.eval()
+            env.eval()
+            env.set_seed(seed)
+            env.reset()
 
-        done = trajs.get(("next", "done"))
-        first_done = torch.argmax(done.long(), dim=1).cpu()
+            with set_exploration_type(exploration_type):
+                trajs = env.rollout(
+                    max_steps=base_env.max_episode_length,
+                    policy=policy,
+                    callback=render_callback,
+                    auto_reset=True,
+                    break_when_any_done=False,
+                    return_contiguous=False,
+                )
 
-        def take_first_episode(tensor: torch.Tensor):
-            indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
-            return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
+            done = trajs.get(("next", "done"))
+            first_done = torch.argmax(done.long(), dim=1).cpu()
 
-        traj_stats = {
-            k: take_first_episode(v)
-            for k, v in trajs[("next", "stats")].cpu().items()
-        }
+            def take_first_episode(tensor: torch.Tensor):
+                indices = first_done.reshape(first_done.shape + (1,) * (tensor.ndim - 2))
+                return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
 
-        info = {
-            "eval/stats." + k: torch.mean(v.float()).item()
-            for k, v in traj_stats.items()
-        }
+            traj_stats = {
+                k: take_first_episode(v)
+                for k, v in trajs[("next", "stats")].cpu().items()
+            }
 
-        # log video
-        video_array = render_callback.get_video_array(axes="t c h w")
-        if video_array is not None:
-            info["recording"] = wandb.Video(
-                video_array,
-                fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
-                format="mp4"
-            )
+            info = {
+                "eval/stats." + k: torch.mean(v.float()).item()
+                for k, v in traj_stats.items()
+            }
 
-        # log distributions
-        # df = pd.DataFrame(traj_stats)
-        # table = wandb.Table(dataframe=df)
-        # info["eval/return"] = wandb.plot.histogram(table, "return")
-        # info["eval/episode_len"] = wandb.plot.histogram(table, "episode_len")
+            video_array = render_callback.get_video_array(axes="t c h w")
+            if video_array is not None:
+                info["recording"] = wandb.Video(
+                    video_array,
+                    fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
+                    format="mp4"
+                )
 
-        return info
+            return info
+        finally:
+            if prev_reset_curriculum_enabled is not None:
+                base_env.reset_curriculum_enabled = prev_reset_curriculum_enabled
+            base_env.enable_render(not cfg.headless)
+            env.reset()
 
     loop_exception = None
     try:
@@ -355,13 +369,48 @@ def main(cfg):
                     v = raw_stats.get(("stats", key), None)
                     return torch.mean(v.float()).item() if v is not None else None
 
+                def _stats_tensor(key):
+                    v = raw_stats.get(("stats", key), None)
+                    return v.reshape(-1) if v is not None else None
+
+                def _masked_mean(key, mask):
+                    values = _stats_tensor(key)
+                    if values is None or mask is None or not bool(mask.any().item()):
+                        return None
+                    return values.float()[mask].mean().item()
+
+                episode_start_gate = _stats_tensor("episode_start_gate")
+                gate0_start_mask = None
+                gate0_episode_count = 0
+                if episode_start_gate is not None:
+                    gate0_start_mask = episode_start_gate.long() == 0
+                    gate0_episode_count = int(gate0_start_mask.sum().item())
+
+                success_values = _stats_tensor("success")
+                successful_mask = None
+                if success_values is not None:
+                    successful_mask = success_values.bool()
+
+                gate0_success_mask = None
+                gate0_success_count = 0
+                if gate0_start_mask is not None and successful_mask is not None:
+                    gate0_success_mask = gate0_start_mask & successful_mask
+                    gate0_success_count = int(gate0_success_mask.sum().item())
+
                 # Racing performance
                 mean_speed   = _mean("mean_speed")
                 max_speed    = _mean("max_speed")
                 gates_passed = _mean("gates_passed")
                 success_rate = _mean("success")
                 ep_len       = _mean("episode_len")
-                lap_time     = _mean("lap_time_steps")  # 0 for non-completions
+                lap_time     = _masked_mean("lap_time_steps", successful_mask)
+
+                task_mean_speed = _masked_mean("mean_speed", gate0_start_mask)
+                task_max_speed = _masked_mean("max_speed", gate0_start_mask)
+                task_gates_passed = _masked_mean("gates_passed", gate0_start_mask)
+                task_success_rate = _masked_mean("success", gate0_start_mask)
+                task_ep_len = _masked_mean("episode_len", gate0_start_mask)
+                task_completion_time_steps = _masked_mean("lap_time_steps", gate0_success_mask)
 
                 # Crash breakdown
                 crash_total    = _mean("collision")
@@ -410,15 +459,23 @@ def main(cfg):
                 if success_rate is not None: derived["race/lap_completion_rate"]  = success_rate
                 if ep_len       is not None: derived["race/episode_len_steps"]    = ep_len
                 if ep_len       is not None: derived["race/episode_len_sec"]      = ep_len * cfg.sim.dt * cfg.sim.substeps
-                # Simple aliases for W&B dashboards that expect the original names.
-                if mean_speed   is not None: derived["simple/mean_speed_ms"]              = mean_speed
-                if max_speed    is not None: derived["simple/max_speed_ms"]               = max_speed
-                if gates_passed is not None: derived["simple/gates_passed"]               = gates_passed
-                if success_rate is not None: derived["simple/full_course_completion_rate"] = success_rate
-                if ep_len       is not None: derived["simple/episode_time_sec"]           = ep_len * cfg.sim.dt * cfg.sim.substeps
-                if lap_time     is not None and success_rate and success_rate > 0:
+                if lap_time is not None:
                     derived["race/lap_time_steps"] = lap_time
                     derived["race/lap_time_sec"]   = lap_time * cfg.sim.dt * cfg.sim.substeps
+                if gate0_episode_count > 0:
+                    if task_mean_speed is not None: derived["simple/mean_speed_ms"] = task_mean_speed
+                    if task_max_speed is not None: derived["simple/max_speed_ms"] = task_max_speed
+                    if task_gates_passed is not None: derived["simple/gates_passed"] = task_gates_passed
+                    if task_success_rate is not None:
+                        derived["simple/full_course_completion_rate"] = task_success_rate
+                        derived["simple/full_course_completion_pct"] = 100.0 * task_success_rate
+                    if task_ep_len is not None:
+                        derived["simple/episode_time_sec"] = task_ep_len * cfg.sim.dt * cfg.sim.substeps
+                    if gate0_success_count > 0 and task_completion_time_steps is not None:
+                        derived["simple/completion_time_steps_mean"] = task_completion_time_steps
+                        derived["simple/completion_time_sec_mean"] = (
+                            task_completion_time_steps * cfg.sim.dt * cfg.sim.substeps
+                        )
                 if furthest_gate is not None: derived["race/furthest_gate_reached"] = furthest_gate
                 if final_dist    is not None: derived["race/final_dist_to_gate_m"]  = final_dist
                 # Gates-per-second: how fast the drone is clearing gates
@@ -429,6 +486,9 @@ def main(cfg):
                 if gates_passed is not None:
                     gate_cross_rate = gates_passed / required_gate_count
                     derived["race/gate_cross_rate"] = gate_cross_rate
+                task_gate_cross_rate = None
+                if task_gates_passed is not None:
+                    task_gate_cross_rate = task_gates_passed / required_gate_count
 
                 # Crash breakdown (fraction of episodes)
                 if crash_total    is not None: derived["crash/total_rate"]     = crash_total
@@ -480,6 +540,53 @@ def main(cfg):
                 if curriculum_accuracy is not None: derived["curriculum/accuracy_ema"] = curriculum_accuracy
                 if curriculum_furthest is not None: derived["curriculum/furthest_gate_ema"] = curriculum_furthest
                 derived["curriculum/speed_focus_accuracy_rate"] = cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
+                phase2_threshold = float(cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40))
+                if curriculum_phase is not None:
+                    current_phase = int(round(float(curriculum_phase)))
+                    phase2_active = current_phase >= 2
+                    phase2_just_unlocked = logged_curriculum_phase < 2 <= current_phase
+                    derived["curriculum/phase2_active"] = float(phase2_active)
+                    derived["curriculum/phase2_just_unlocked"] = float(phase2_just_unlocked)
+                    derived["curriculum/phase2_trigger_threshold"] = phase2_threshold
+                    if curriculum_accuracy is not None:
+                        derived["curriculum/phase2_trigger_met"] = float(
+                            curriculum_accuracy >= phase2_threshold
+                        )
+                        derived["curriculum/phase2_accuracy_margin"] = (
+                            curriculum_accuracy - phase2_threshold
+                        )
+                    if phase2_just_unlocked:
+                        phase2_started_env_frames = int(collector._frames)
+                        phase2_started_iter = int(i)
+                        phase2_started_accuracy_ema = (
+                            float(curriculum_accuracy)
+                            if curriculum_accuracy is not None
+                            else None
+                        )
+                        run.summary["curriculum/phase2_started_env_frames"] = phase2_started_env_frames
+                        run.summary["curriculum/phase2_started_iter"] = phase2_started_iter
+                        if phase2_started_accuracy_ema is not None:
+                            run.summary["curriculum/phase2_started_accuracy_ema"] = (
+                                phase2_started_accuracy_ema
+                            )
+                        logging.info(
+                            "Curriculum entered phase 2 at env_frames=%s iteration=%s "
+                            "accuracy_ema=%s threshold=%s",
+                            phase2_started_env_frames,
+                            phase2_started_iter,
+                            phase2_started_accuracy_ema,
+                            phase2_threshold,
+                        )
+                    if phase2_started_env_frames is not None:
+                        derived["curriculum/phase2_started_env_frames"] = float(
+                            phase2_started_env_frames
+                        )
+                        derived["curriculum/phase2_started_iter"] = float(phase2_started_iter)
+                        if phase2_started_accuracy_ema is not None:
+                            derived["curriculum/phase2_started_accuracy_ema"] = (
+                                phase2_started_accuracy_ema
+                            )
+                    logged_curriculum_phase = current_phase
                 speed_phase_scale = 0.0
                 if curriculum_phase is not None:
                     if curriculum_phase >= 2.0:
@@ -563,18 +670,23 @@ def main(cfg):
 
                 if auto_stop_enabled:
                     frames_ready = collector._frames >= auto_stop_min_frames
-                    if auto_stop_stop_on_first_success and success_rate is not None and success_rate > 0.0 and frames_ready:
+                    if (
+                        auto_stop_stop_on_first_success
+                        and task_success_rate is not None
+                        and task_success_rate > 0.0
+                        and frames_ready
+                    ):
                         should_stop = True
                         auto_stop_reason = (
-                            f"observed lap completion rate {success_rate:.4f} "
+                            f"observed gate-0 lap completion rate {task_success_rate:.4f} "
                             f"at env_frames={collector._frames}"
                         )
                     else:
                         current_auto_stop_metrics = {
-                            "lap_completion_rate": success_rate,
-                            "gates_passed_per_ep": gates_passed,
-                            "mean_speed_ms": mean_speed,
-                            "min_gate_cross_rate": gate_cross_rate,
+                            "lap_completion_rate": task_success_rate,
+                            "gates_passed_per_ep": task_gates_passed,
+                            "mean_speed_ms": task_mean_speed,
+                            "min_gate_cross_rate": task_gate_cross_rate,
                         }
                         for key, history in auto_stop_history.items():
                             value = current_auto_stop_metrics.get(key)

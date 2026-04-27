@@ -58,7 +58,8 @@ class DroneRaceEnv(IsaacEnv):
       position is **not** included.
     - `next_gate_rpos` (3): The relative position of the next gate to the drone in the drone's local frame.
     - `next_to_next_gate_pos` (3): The position of the gate after the immediate next gate, expressed in
-      the next gate's local frame. Clamped at the last gate (no wrap-around).
+      the next gate's local frame. When the immediate next gate is the last real lap gate, this wraps
+      back to gate 0 so the policy still sees the lap-closure turn.
     - `next_gate_rot_mat_2col` (6): The first two columns of the next gate's rotation matrix in the world frame
       (i.e. the gate's local x- and y-axes expressed in world coordinates), flattened to a 6-vector.
 
@@ -644,6 +645,7 @@ class DroneRaceEnv(IsaacEnv):
             "curriculum_phase": Unbounded(1),   # 0=accuracy-first, 1=bridge-speed, 2=speed-focus
             "curriculum_accuracy_ema": Unbounded(1),   # EMA full-lap completion rate used to unlock speed shaping
             "curriculum_furthest_ema": Unbounded(1),   # EMA furthest gate reached, kept as a diagnostic
+            "episode_start_gate": Unbounded(1),        # actual start gate index for this episode
             "reset_active_gate": Unbounded(1),         # earliest gate whose gate-0-start passage EMA is still below threshold
             "reset_from_gate0": Unbounded(1),          # episode started from gate 0 bucket
             "reset_from_prev_gate": Unbounded(1),      # episode started from previous-gate practice bucket
@@ -831,6 +833,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["mean_ang_rate"][env_ids] = 0.
         self.stats["ang_penalty_decay_frac"][env_ids] = 0.
         self.stats["curriculum_phase"][env_ids] = float(self.curriculum_phase)
+        self.stats["episode_start_gate"][env_ids] = start_gates.float().unsqueeze(-1)
         self.stats["reset_active_gate"][env_ids] = float(self.active_reset_curriculum_gate)
         self.stats["reset_from_gate0"][env_ids] = (reset_bucket == 0).float().unsqueeze(-1)
         self.stats["reset_from_prev_gate"][env_ids] = (reset_bucket == 1).float().unsqueeze(-1)
@@ -942,7 +945,8 @@ class DroneRaceEnv(IsaacEnv):
         and the reward are computed.
 
         Args:
-            next_to_next_gate_indices: (N,) index of the gate after the immediate next gate (clamped at last gate).
+            next_to_next_gate_indices: (N,) index of the gate after the immediate next gate. This wraps
+                back to gate 0 when the immediate next gate is the final real lap gate.
             gate_env_pos:              (N, num_gates, 3) gate positions in env frame.
             gate_env_rot:              (N, num_gates, 4) gate rotations in env frame.
             next_gate_indices:         (N,) index of the immediate next gate per environment.
@@ -1006,7 +1010,8 @@ class DroneRaceEnv(IsaacEnv):
 
         gate_env_pos, gate_env_rot = self.get_env_poses((gate_world_pos, gate_world_rot))  # (N, num_gates, 3), (N, num_gates, 4)
         
-        # If track is completed, target first gate for landing
+        # Track completion terminates the episode on the last real gate, so the active
+        # target always stays within the real course gates during normal rollouts.
         track_completed = self.track_completed  # (N,)
         
         # Get current gate positions for each environment
@@ -1018,11 +1023,12 @@ class DroneRaceEnv(IsaacEnv):
             )
         )
         
-        # Get next-to-next gate positions. If the immediate next gate is the last gate, clamp so
-        # next-to-next points at the same gate (no wrap-around).
+        # Get next-to-next gate positions. When the immediate next gate is the last real lap gate,
+        # wrap the lookahead back to gate 0 so the policy still sees the closure turn without ever
+        # targeting the duplicated helper gate.
         next_to_next_gate_indices = torch.where(
-            target_gate_indices == self.num_gates - 1,
-            target_gate_indices,
+            target_gate_indices == self.num_course_gates - 1,
+            torch.zeros_like(target_gate_indices),
             target_gate_indices + 1,
         )  # (N,)
 
@@ -1041,7 +1047,7 @@ class DroneRaceEnv(IsaacEnv):
         gate_angle = torch.acos(cos_angle.clamp(-1.0, 1.0))  # (N,)
 
         # Gate progress: fraction of gates completed in the single lap
-        gate_progress = self.gate_indices.float() / self.num_gates  # (N,)
+        gate_progress = self.gate_indices.float() / self.num_course_gates  # (N,)
         gate_progress = torch.where(track_completed, torch.ones_like(gate_progress), gate_progress)
         
         # Next gate orientation: first 2 columns of its rotation matrix in world frame.
@@ -1056,7 +1062,9 @@ class DroneRaceEnv(IsaacEnv):
 
         # Gate index normalized to [0, 1]: tells the policy where on the track it is.
         # Sim-only exploit — needed for gate-specific behaviors (climb at gate 7, reverse at gate 8).
-        gate_index_norm = (self.gate_indices.float() / (self.num_gates - 1)).unsqueeze(1).unsqueeze(1)  # (N, 1, 1)
+        gate_index_norm = (
+            self.gate_indices.float() / max(self.num_course_gates - 1, 1)
+        ).unsqueeze(1).unsqueeze(1)  # (N, 1, 1)
 
         # Scalar distance to gate center (pre-computed to save the policy from learning norm())
         dist_to_gate_center = next_gate_rpos_world.norm(dim=-1, keepdim=True)  # (N, 1, 1)
@@ -1158,13 +1166,14 @@ class DroneRaceEnv(IsaacEnv):
 
         old_gate_indices = self.gate_indices.clone()
         crossed_gate_idx = old_gate_indices.clone()
-        last_gate_passed = gate_passed_this_step & (self.gate_indices + 1 >= self.num_gates)
+        last_gate_passed = gate_passed_this_step & (crossed_gate_idx == self.num_course_gates - 1)
         self.track_completed[last_gate_passed] = True
-        self.gate_indices[gate_passed_this_step] = torch.clamp(
-            self.gate_indices[gate_passed_this_step] + 1,
-            max=self.num_gates - 1,
+        advance_gate_mask = gate_passed_this_step & (~last_gate_passed)
+        self.gate_indices[advance_gate_mask] = torch.clamp(
+            self.gate_indices[advance_gate_mask] + 1,
+            max=self.num_course_gates - 1,
         )
-        gate_index_changed = (self.gate_indices != old_gate_indices)
+        gate_index_changed = advance_gate_mask
         self.gate_passed[gate_index_changed] = False
 
         # Recompute gate centre for envs whose target changed
@@ -1284,7 +1293,7 @@ class DroneRaceEnv(IsaacEnv):
         stacked_target_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         for gate_idx in self.stacked_reversal_target_gates:
             stacked_target_mask |= self.gate_indices == gate_idx
-        prev_target_indices = (self.gate_indices - 1).remainder(max(self.num_gates - 1, 1))
+        prev_target_indices = (self.gate_indices - 1).remainder(self.num_course_gates)
         stacked_entry_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         for entry_gate, target_gate in self.stacked_reversal_gate_pairs:
             stacked_entry_mask |= (
@@ -1305,7 +1314,7 @@ class DroneRaceEnv(IsaacEnv):
         #    This stays on in phase 0 only as light guidance. Gate crossing rewards
         #    should dominate, otherwise the policy can learn to fly past gates.
         #    Placed AFTER _detect_gate_crossings so self.gate_indices is already updated.
-        prev_gate_indices = (self.gate_indices - 1) % (self.num_gates - 1)  # (N,) — wraps at track
+        prev_gate_indices = (self.gate_indices - 1) % self.num_course_gates  # (N,) — wraps at track
         prev_gate_pos_env = gate_env_pos[batch_indices, prev_gate_indices]   # (N, 3)
         prev_gate_rot_env = gate_env_rot[batch_indices, prev_gate_indices]   # (N, 4)
         prev_gate_center_proj = self._get_gate_center(prev_gate_pos_env, prev_gate_rot_env)  # (N, 3)
@@ -1577,16 +1586,21 @@ class DroneRaceEnv(IsaacEnv):
         done_flat = done.squeeze(-1)  # (N,)
         n_done = int(done_flat.sum().item())
         if n_done > 0:
-            lap_completed_mean = completed_task[done_flat].float().mean().item()
-            furthest_done = self.furthest_gate_this_ep[done_flat].float()
-            furthest_mean = furthest_done.mean().item()
-            alpha = self.curriculum_ema_alpha
-            decay = (1.0 - alpha) ** n_done
-            self.lap_completion_rate_ema = decay * self.lap_completion_rate_ema + (1.0 - decay) * lap_completed_mean
-            self.furthest_gate_ema = decay * self.furthest_gate_ema + (1.0 - decay) * furthest_mean
-
             gate0_done_mask = done_flat & (self.episode_start_gate == 0)
             n_gate0_done = int(gate0_done_mask.sum().item())
+            if n_gate0_done > 0:
+                lap_completed_mean = completed_task[gate0_done_mask].float().mean().item()
+                furthest_done = self.furthest_gate_this_ep[gate0_done_mask].float()
+                furthest_mean = furthest_done.mean().item()
+                alpha = self.curriculum_ema_alpha
+                decay = (1.0 - alpha) ** n_gate0_done
+                self.lap_completion_rate_ema = (
+                    decay * self.lap_completion_rate_ema + (1.0 - decay) * lap_completed_mean
+                )
+                self.furthest_gate_ema = (
+                    decay * self.furthest_gate_ema + (1.0 - decay) * furthest_mean
+                )
+
             if n_gate0_done > 0:
                 pass_matrix = (
                     self.per_gate_crosses[gate0_done_mask, :self.num_course_gates] > 0
@@ -1615,8 +1629,9 @@ class DroneRaceEnv(IsaacEnv):
         # Speed shaping can unlock on the first success, or fall back to the original
         # accuracy-gated rule when phase_speed_unlock_on_first_success is disabled.
         frames_in_phase = self.total_frames_counter - self._phase_started_at_frames
+        gate0_completed_any = bool((completed_task & (self.episode_start_gate == 0)).any().item())
         if self.curriculum_phase == 0:
-            if self.phase_speed_unlock_on_first_success and completed_task.any():
+            if self.phase_speed_unlock_on_first_success and gate0_completed_any:
                 self.curriculum_phase = 1
                 self._phase_started_at_frames = self.total_frames_counter
             elif frames_in_phase >= self.curriculum_min_phase_frames and \

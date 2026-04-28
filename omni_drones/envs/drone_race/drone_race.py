@@ -602,6 +602,7 @@ class DroneRaceEnv(IsaacEnv):
             "curriculum_phase": Unbounded(1),   # 0=accuracy-first, 1=bridge-speed, 2=speed-focus
             "curriculum_accuracy_ema": Unbounded(1),   # EMA full-lap completion rate used to unlock speed shaping
             "curriculum_furthest_ema": Unbounded(1),   # EMA furthest gate reached, kept as a diagnostic
+            "episode_start_gate": Unbounded(1),        # actual start gate index for this episode
             "reset_active_gate": Unbounded(1),         # earliest gate whose gate-0-start passage EMA is still below threshold
             "reset_from_gate0": Unbounded(1),          # episode started from gate 0 bucket
             "reset_from_prev_gate": Unbounded(1),      # episode started from previous-gate practice bucket
@@ -789,6 +790,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["mean_ang_rate"][env_ids] = 0.
         self.stats["ang_penalty_decay_frac"][env_ids] = 0.
         self.stats["curriculum_phase"][env_ids] = float(self.curriculum_phase)
+        self.stats["episode_start_gate"][env_ids] = start_gates.float().unsqueeze(-1)
         self.stats["reset_active_gate"][env_ids] = float(self.active_reset_curriculum_gate)
         self.stats["reset_from_gate0"][env_ids] = (reset_bucket == 0).float().unsqueeze(-1)
         self.stats["reset_from_prev_gate"][env_ids] = (reset_bucket == 1).float().unsqueeze(-1)
@@ -1085,6 +1087,9 @@ class DroneRaceEnv(IsaacEnv):
 
         Returns:
             gate_passed_this_step: (N,) bool — True for envs that just passed a gate.
+            crossed_gate_idx:      (N,) long — gate index that was just crossed before any
+                target advance. The duplicated lap-closure gate remains `num_course_gates`
+                so downstream logging can exclude it from per-gate accounting.
             gate_index_changed:    (N,) bool — True for envs whose target gate advanced.
             new_gate_center:       (N, 3) — centre of the (possibly new) target gate.
         """
@@ -1112,6 +1117,7 @@ class DroneRaceEnv(IsaacEnv):
         self.gate_passed[gate_passed_this_step] = True
 
         old_gate_indices = self.gate_indices.clone()
+        crossed_gate_idx = old_gate_indices.clone()
         last_gate_passed = gate_passed_this_step & (self.gate_indices + 1 >= self.num_gates)
         self.track_completed[last_gate_passed] = True
         self.gate_indices[gate_passed_this_step] = torch.clamp(
@@ -1132,7 +1138,7 @@ class DroneRaceEnv(IsaacEnv):
             gate_index_changed.unsqueeze(-1), new_in_gate, curr_in_gate,
         )
 
-        return gate_passed_this_step, gate_index_changed, new_gate_center
+        return gate_passed_this_step, crossed_gate_idx, gate_index_changed, new_gate_center
 
 
     def _compute_reward_and_done(self):
@@ -1174,7 +1180,7 @@ class DroneRaceEnv(IsaacEnv):
         # You either _deteect_gate_crossings or _detect_gate_crossings_via_segments
         # This function call updates the gate indexes
         prev_gate_frame = self.prev_drone_in_gate_frame.clone()
-        gate_passed_this_step, gate_index_changed, new_gate_center = self._detect_gate_crossings(
+        gate_passed_this_step, crossed_gate_idx, gate_index_changed, new_gate_center = self._detect_gate_crossings(
             drone_pos_flat, current_gate_center, current_gate_rot,
             gate_env_pos, gate_env_rot, batch_indices,
         )
@@ -1593,15 +1599,16 @@ class DroneRaceEnv(IsaacEnv):
         self.furthest_gate_this_ep = torch.maximum(self.furthest_gate_this_ep, self.gate_indices)
         self.stats["furthest_gate"][:] = self.furthest_gate_this_ep.float().unsqueeze(1)
 
-        # Per-gate crossing counts (gates 0–11, clamp index to valid range)
+        # Per-gate crossing counts (gates 0–11). Keep lap-closure on the duplicated
+        # finish gate out of these stats so the human gate numbers stay unambiguous.
         if gate_passed_this_step.any():
-            # gate_indices was already incremented by _detect_gate_crossings, so previous gate is (gate_indices - 1) % (num_gates - 1)
-            crossed_gate_idx = ((self.gate_indices - 1) % (self.num_gates - 1)).clamp(0, 11)
+            real_gate_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_course_gates)
+            safe_crossed_gate_idx = crossed_gate_idx.clamp(0, self.num_course_gates - 1)
             per_gate_update = torch.zeros(self.num_envs, 12, device=self.device)
             per_gate_update.scatter_add_(
                 1,
-                crossed_gate_idx.unsqueeze(1),
-                gate_passed_this_step.float().unsqueeze(1)
+                safe_crossed_gate_idx.unsqueeze(1),
+                real_gate_cross_mask.float().unsqueeze(1)
             )
             self.per_gate_crosses += per_gate_update.long()
         for gi in range(12):

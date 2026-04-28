@@ -1137,7 +1137,7 @@ class DroneRaceEnv(IsaacEnv):
             gate_passed_this_step: (N,) bool — True for envs that just passed a gate.
             crossed_gate_idx:      (N,) long — gate index that was just crossed before any
                 target advance. The duplicated lap-closure gate remains `num_course_gates`
-                so downstream code can exclude it from per-gate accounting.
+                so downstream logging can exclude it from per-gate accounting.
             gate_index_changed:    (N,) bool — True for envs whose target gate advanced.
             new_gate_center:       (N, 3) — centre of the (possibly new) target gate.
         """
@@ -1692,7 +1692,8 @@ class DroneRaceEnv(IsaacEnv):
         self.furthest_gate_this_ep = torch.maximum(self.furthest_gate_this_ep, self.gate_indices)
         self.stats["furthest_gate"][:] = self.furthest_gate_this_ep.float().unsqueeze(1)
 
-        # Per-gate crossing counts (gates 0–11, clamp index to valid range)
+        # Per-gate crossing counts (gates 0–11). Keep lap-closure on the duplicated
+        # finish gate out of these stats so the human gate numbers stay unambiguous.
         if gate_passed_this_step.any():
             real_gate_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_course_gates)
             safe_crossed_gate_idx = crossed_gate_idx.clamp(0, self.num_course_gates - 1)

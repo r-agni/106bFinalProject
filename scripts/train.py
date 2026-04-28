@@ -350,6 +350,40 @@ def main(cfg):
                     v = raw_stats.get(("stats", key), None)
                     return torch.mean(v.float()).item() if v is not None else None
 
+                def _stats_tensor(key):
+                    v = raw_stats.get(("stats", key), None)
+                    return v.reshape(-1) if v is not None else None
+
+                def _masked_mean(key, mask):
+                    values = _stats_tensor(key)
+                    if values is None or mask is None or not bool(mask.any().item()):
+                        return None
+                    return values.float()[mask].mean().item()
+
+                def _masked_min(key, mask):
+                    values = _stats_tensor(key)
+                    if values is None or mask is None or not bool(mask.any().item()):
+                        return None
+                    return values.float()[mask].min().item()
+
+                episode_start_gate = _stats_tensor("episode_start_gate")
+                gate0_start_mask = None
+                gate0_episode_count = 0
+                if episode_start_gate is not None:
+                    gate0_start_mask = episode_start_gate.long() == 0
+                    gate0_episode_count = int(gate0_start_mask.sum().item())
+
+                success_values = _stats_tensor("success")
+                successful_mask = None
+                if success_values is not None:
+                    successful_mask = success_values.bool()
+
+                gate0_success_mask = None
+                gate0_success_count = 0
+                if gate0_start_mask is not None and successful_mask is not None:
+                    gate0_success_mask = gate0_start_mask & successful_mask
+                    gate0_success_count = int(gate0_success_mask.sum().item())
+
                 # Racing performance
                 mean_speed   = _mean("mean_speed")
                 max_speed    = _mean("max_speed")
@@ -357,6 +391,11 @@ def main(cfg):
                 success_rate = _mean("success")
                 ep_len       = _mean("episode_len")
                 lap_time     = _mean("lap_time_steps")  # 0 for non-completions
+                task_success_rate = _masked_mean("success", gate0_start_mask)
+                task_completion_time_steps = _masked_mean("lap_time_steps", gate0_success_mask)
+                task_completion_time_steps_fastest = _masked_min("lap_time_steps", gate0_success_mask)
+                task_success_mean_speed = _masked_mean("mean_speed", gate0_success_mask)
+                task_success_peak_speed = _masked_mean("max_speed", gate0_success_mask)
 
                 # Crash breakdown
                 crash_total    = _mean("collision")
@@ -409,12 +448,42 @@ def main(cfg):
                 if mean_speed   is not None: derived["simple/mean_speed_ms"]              = mean_speed
                 if max_speed    is not None: derived["simple/max_speed_ms"]               = max_speed
                 if gates_passed is not None: derived["simple/gates_passed"]               = gates_passed
-                if success_rate is not None: derived["simple/full_course_completion_rate"] = success_rate
                 if ep_len       is not None: derived["simple/episode_time_sec"]           = ep_len * cfg.sim.dt * cfg.sim.substeps
+                derived["simple/full_course_completion_rate"] = 0.0
+                derived["simple/full_course_completion_pct"] = 0.0
+                derived["simple/full_course_completion_time_steps_mean"] = 0.0
+                derived["simple/full_course_completion_time_sec_mean"] = 0.0
+                derived["simple/full_course_completion_time_steps_fastest"] = 0.0
+                derived["simple/full_course_completion_time_sec_fastest"] = 0.0
+                derived["simple/full_course_completion_mean_speed_ms"] = 0.0
+                derived["simple/full_course_completion_peak_speed_ms"] = 0.0
+                if gate0_episode_count > 0 and task_success_rate is not None:
+                    derived["simple/full_course_completion_rate"] = task_success_rate
+                    derived["simple/full_course_completion_pct"] = 100.0 * task_success_rate
+                if gate0_success_count > 0 and task_completion_time_steps is not None:
+                    completion_time_sec_mean = task_completion_time_steps * cfg.sim.dt * cfg.sim.substeps
+                    derived["simple/full_course_completion_time_steps_mean"] = task_completion_time_steps
+                    derived["simple/full_course_completion_time_sec_mean"] = completion_time_sec_mean
+                if gate0_success_count > 0 and task_completion_time_steps_fastest is not None:
+                    completion_time_sec_fastest = (
+                        task_completion_time_steps_fastest * cfg.sim.dt * cfg.sim.substeps
+                    )
+                    derived["simple/full_course_completion_time_steps_fastest"] = (
+                        task_completion_time_steps_fastest
+                    )
+                    derived["simple/full_course_completion_time_sec_fastest"] = (
+                        completion_time_sec_fastest
+                    )
+                if gate0_success_count > 0 and task_success_mean_speed is not None:
+                    derived["simple/full_course_completion_mean_speed_ms"] = task_success_mean_speed
+                if gate0_success_count > 0 and task_success_peak_speed is not None:
+                    derived["simple/full_course_completion_peak_speed_ms"] = task_success_peak_speed
                 if lap_time     is not None and success_rate and success_rate > 0:
                     derived["race/lap_time_steps"] = lap_time
                     derived["race/lap_time_sec"]   = lap_time * cfg.sim.dt * cfg.sim.substeps
-                if furthest_gate is not None: derived["race/furthest_gate_reached"] = furthest_gate
+                if furthest_gate is not None:
+                    derived["race/furthest_gate_reached"] = furthest_gate
+                    derived["race/furthest_gate_number"] = furthest_gate + 1.0
                 if final_dist    is not None: derived["race/final_dist_to_gate_m"]  = final_dist
                 # Gates-per-second: how fast the drone is clearing gates
                 if gates_passed is not None and ep_len is not None and ep_len > 0:
@@ -482,7 +551,10 @@ def main(cfg):
                     elif curriculum_phase >= 1.0:
                         speed_phase_scale = cfg.task.get("reward_speed_scale", 0.0)
                 derived["reward/speed_phase_scale"] = speed_phase_scale
-                if reset_active_gate is not None: derived["curriculum/reset_active_gate"] = reset_active_gate
+                if reset_active_gate is not None:
+                    derived["curriculum/reset_active_gate"] = reset_active_gate
+                    if reset_active_gate >= 0:
+                        derived["curriculum/reset_active_gate_number"] = reset_active_gate + 1.0
                 if reset_from_gate0 is not None: derived["curriculum/reset_from_gate0_rate"] = reset_from_gate0
                 if reset_from_prev_gate is not None: derived["curriculum/reset_from_prev_gate_rate"] = reset_from_prev_gate
                 if reset_from_random_gate is not None: derived["curriculum/reset_from_random_rate"] = reset_from_random_gate
@@ -490,6 +562,7 @@ def main(cfg):
                     reset_gate_ema = _mean(f"reset_gate_{gi}_pass_ema")
                     if reset_gate_ema is not None:
                         derived[f"curriculum/reset_gate_{gi:02d}_pass_ema"] = reset_gate_ema
+                        derived[f"curriculum_human/reset_gate_{gi + 1:02d}_pass_ema"] = reset_gate_ema
                 derived["curriculum/min_accuracy_phase_frames"] = cfg.task.get("curriculum_min_phase_frames", 2_000_000)
                 derived["curriculum/speed_unlock_accuracy_rate"] = cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40)
                 derived["curriculum/ang_decay_end_frames"] = cfg.task.get("angular_penalty_decay_frames", 100_000_000)
@@ -547,10 +620,11 @@ def main(cfg):
                     v = _mean(f"gate_{gi}_crosses")
                     if v is not None:
                         derived[f"gates/gate_{gi:02d}_crosses"] = v
+                        derived[f"gates_human/gate_{gi + 1:02d}_crosses"] = v
 
                 # WandB bar chart for per-gate distribution
                 gate_counts = [_mean(f"gate_{gi}_crosses") or 0.0 for gi in range(12)]
-                gate_labels = [f"G{gi}" for gi in range(12)]
+                gate_labels = [f"G{gi + 1}" for gi in range(12)]
                 gate_table = wandb.Table(columns=["gate", "mean_crosses"], data=[[label, val] for label, val in zip(gate_labels, gate_counts)])
                 derived["gates/crossing_distribution"] = wandb.plot.bar(gate_table, "gate", "mean_crosses", title="Gate Crossing Distribution")
 

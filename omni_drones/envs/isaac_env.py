@@ -325,7 +325,10 @@ class IsaacEnv(EnvBase):
         carb_settings_iface = carb.settings.get_settings()
         # enable hydra scene-graph instancing
         # note: this allows rendering of instanceable assets on the GUI
-        carb_settings_iface.set_bool("/persistent/omnihydra/useSceneGraphInstancing", True)
+        carb_settings_iface.set_bool(
+            "/persistent/omnihydra/useSceneGraphInstancing",
+            bool(self.cfg.get("use_scene_graph_instancing", True)),
+        )
         # change dispatcher to use the default dispatcher in PhysX SDK instead of carb tasking
         # note: dispatcher handles how threads are launched for multi-threaded physics
         carb_settings_iface.set_bool("/physics/physxDispatcher", True)

@@ -182,8 +182,8 @@ def main(cfg):
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
 
     adaptive_entropy_cfg = cfg.algo.get("adaptive_entropy", {})
-    adaptive_entropy_enabled = bool(adaptive_entropy_cfg.get("enabled", False))
-    adaptive_entropy_enabled = adaptive_entropy_enabled and hasattr(policy, "entropy_coef")
+    entropy_controller_enabled = bool(adaptive_entropy_cfg.get("enabled", False))
+    entropy_controller_enabled = entropy_controller_enabled and hasattr(policy, "entropy_coef")
     if bool(cfg.algo.get("adaptive_entropy", {}).get("enabled", False)) and not hasattr(policy, "entropy_coef"):
         logging.warning(
             "adaptive_entropy.enabled is true, but policy %s does not expose entropy_coef; "
@@ -191,21 +191,165 @@ def main(cfg):
             type(policy).__name__,
         )
 
-    if adaptive_entropy_enabled:
-        current_entropy_coef = float(adaptive_entropy_cfg.get("phase0_coef_max", cfg.algo.entropy_coef))
-        target_entropy_coef = current_entropy_coef
-        prev_curriculum_phase = 0.0
-        speed_perf_ema = 0.0
-        phase1_rebump_applied = False
+    phase0_coef_max = float(adaptive_entropy_cfg.get("phase0_coef_max", cfg.algo.entropy_coef))
+    phase1_min_coef = float(
+        adaptive_entropy_cfg.get(
+            "phase1_min_coef",
+            adaptive_entropy_cfg.get("phase0_coef_min", 0.006),
+        )
+    )
+    phase2_min_coef = float(
+        adaptive_entropy_cfg.get(
+            "phase2_min_coef",
+            adaptive_entropy_cfg.get("phase1_coef_min", 0.002),
+        )
+    )
+    recovery_coef = float(
+        adaptive_entropy_cfg.get(
+            "recovery_coef",
+            adaptive_entropy_cfg.get("phase1_rebump_coef", 0.010),
+        )
+    )
+    entropy_increase_step = float(
+        adaptive_entropy_cfg.get(
+            "max_increase_per_update",
+            adaptive_entropy_cfg.get("max_delta_per_update", 0.0015),
+        )
+    )
+    entropy_decrease_step = float(
+        adaptive_entropy_cfg.get(
+            "max_decrease_per_update",
+            adaptive_entropy_cfg.get("max_delta_per_update", 0.0005),
+        )
+    )
+    current_entropy_coef = float(getattr(policy, "entropy_coef", cfg.algo.entropy_coef))
+    if entropy_controller_enabled:
+        current_entropy_coef = phase0_coef_max
+    target_entropy_coef = current_entropy_coef
+    if hasattr(policy, "entropy_coef"):
         policy.entropy_coef = current_entropy_coef
-    else:
-        current_entropy_coef = float(getattr(policy, "entropy_coef", cfg.algo.entropy_coef))
-        target_entropy_coef = current_entropy_coef
-        prev_curriculum_phase = 0.0
-        speed_perf_ema = 0.0
-        phase1_rebump_applied = False
-        if hasattr(policy, "entropy_coef"):
-            policy.entropy_coef = current_entropy_coef
+
+    controller_completion_target = float(getattr(base_env, "controller_completion_target", 0.78))
+    controller_completion_floor = float(getattr(base_env, "controller_completion_floor", 0.70))
+    controller_completion_recover = float(getattr(base_env, "controller_completion_recover", 0.60))
+    controller_hard_gate_target = float(getattr(base_env, "controller_hard_gate_target", 0.82))
+    controller_final_gate_target = float(getattr(base_env, "controller_final_gate_target", 0.78))
+    controller_crash_target = float(getattr(base_env, "controller_crash_target", 0.40))
+    controller_crash_recover = float(getattr(base_env, "controller_crash_recover", 0.60))
+    controller_speed_up_step = float(getattr(base_env, "controller_speed_up_step", 0.015))
+    controller_speed_down_step = float(getattr(base_env, "controller_speed_down_step", 0.08))
+    controller_speed_panic_step = float(getattr(base_env, "controller_speed_panic_step", 0.20))
+    controller_plateau_windows = max(int(getattr(base_env, "controller_plateau_windows", 8)), 1)
+    controller_plateau_improvement_eps = float(
+        getattr(base_env, "controller_plateau_improvement_eps", 0.01)
+    )
+    controller_success_min_for_t20 = max(
+        int(getattr(base_env, "controller_success_min_for_t20", 32)),
+        1,
+    )
+    controller_ema_alpha = float(cfg.task.get("controller_metric_alpha", 0.08))
+    controller_metric_window = max(
+        int(cfg.task.get("controller_metric_window", controller_plateau_windows)),
+        1,
+    )
+    controller_stabilize_completion_target = float(
+        cfg.task.get(
+            "controller_stabilize_completion_target",
+            max(controller_completion_target, 0.90),
+        )
+    )
+    controller_stabilize_hard_gate_target = float(
+        cfg.task.get(
+            "controller_stabilize_hard_gate_target",
+            max(controller_hard_gate_target, 0.90),
+        )
+    )
+    controller_stabilize_final_gate_target = float(
+        cfg.task.get(
+            "controller_stabilize_final_gate_target",
+            max(controller_final_gate_target, 0.90),
+        )
+    )
+    controller_stabilize_crash_target = float(
+        cfg.task.get("controller_stabilize_crash_target", min(controller_crash_target, 0.12))
+    )
+    controller_phase2_completion_target = float(
+        cfg.task.get(
+            "controller_phase2_completion_target",
+            max(controller_completion_floor, 0.84),
+        )
+    )
+    controller_phase2_hard_gate_target = float(
+        cfg.task.get("controller_phase2_hard_gate_target", 0.86)
+    )
+    controller_phase2_final_gate_target = float(
+        cfg.task.get("controller_phase2_final_gate_target", 0.84)
+    )
+    controller_phase2_completion_floor = float(
+        cfg.task.get(
+            "controller_phase2_completion_floor",
+            max(controller_completion_floor, 0.76),
+        )
+    )
+    controller_phase2_final_gate_floor = float(
+        cfg.task.get("controller_phase2_final_gate_floor", 0.78)
+    )
+    controller_phase2_crash_target = float(
+        cfg.task.get("controller_phase2_crash_target", 0.18)
+    )
+    controller_phase2_crash_recover = float(
+        cfg.task.get("controller_phase2_crash_recover", 0.28)
+    )
+    controller_phase1_initial_speed_pressure = float(
+        cfg.task.get("controller_phase1_initial_speed_pressure", 0.10)
+    )
+    controller_phase2_initial_speed_pressure = float(
+        cfg.task.get("controller_phase2_initial_speed_pressure", 0.35)
+    )
+    controller_phase2_speed_up_step = float(
+        cfg.task.get("controller_phase2_speed_up_step", 0.03)
+    )
+    controller_phase2_speed_down_step = float(
+        cfg.task.get("controller_phase2_speed_down_step", 0.06)
+    )
+    controller_phase2_panic_step = float(
+        cfg.task.get("controller_phase2_panic_step", 0.18)
+    )
+    controller_phase2_plateau_start_pressure = float(
+        cfg.task.get("controller_phase2_plateau_start_pressure", 0.45)
+    )
+    controller_completion_drop_recover = float(
+        cfg.task.get("controller_completion_drop_recover", 0.10)
+    )
+    controller_min_phase_frames = int(
+        cfg.task.get(
+            "controller_min_phase_frames",
+            cfg.task.get("curriculum_min_phase_frames", 0),
+        )
+    )
+    controller_phase = 0
+    controller_speed_pressure = 0.0
+    controller_exploration_pressure = 0.0
+    controller_collapse_active = False
+    controller_completion_ema = 0.0
+    controller_gate0_crash_ema = 0.0
+    controller_completion_signal = 0.0
+    controller_crash_signal = 0.0
+    controller_t20_lap_time_sec = None
+    controller_t20_best_stable_lap_time_sec = None
+    controller_phase2_ready_count = 0
+    controller_plateau_count = 0
+    controller_completion_history = deque(maxlen=6)
+    controller_completion_recent = deque(maxlen=controller_metric_window)
+    controller_gate0_crash_recent = deque(maxlen=controller_metric_window)
+    controller_phase_start_frames = 0
+    base_env.set_constrained_speed_controller(
+        phase=controller_phase,
+        speed_pressure=controller_speed_pressure,
+        exploration_pressure=controller_exploration_pressure,
+        collapse_active=controller_collapse_active,
+        entropy_target=target_entropy_coef,
+    )
 
     def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, value))
@@ -216,6 +360,19 @@ def main(cfg):
             return current + max_delta
         if delta < -max_delta:
             return current - max_delta
+        return target
+
+    def _slew_toward_asymmetric(
+        current: float,
+        target: float,
+        max_increase: float,
+        max_decrease: float,
+    ) -> float:
+        delta = target - current
+        if delta > max_increase:
+            return current + max_increase
+        if delta < -max_decrease:
+            return current - max_decrease
         return target
 
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)
@@ -350,10 +507,12 @@ def main(cfg):
         for i, data in enumerate(pbar):
             info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
             should_stop = False
-            if adaptive_entropy_enabled:
+            if hasattr(policy, "entropy_coef"):
                 info["entropy/current_coef"] = current_entropy_coef
                 info["entropy/target_coef"] = target_entropy_coef
-                info["entropy/rebump_applied"] = float(phase1_rebump_applied)
+            info["controller/phase"] = float(controller_phase)
+            info["controller/speed_pressure"] = controller_speed_pressure
+            info["controller/exploration_pressure"] = controller_exploration_pressure
             episode_stats.add(data.to_tensordict())
 
             if len(episode_stats) >= base_env.num_envs:
@@ -459,6 +618,11 @@ def main(cfg):
                 reset_from_gate0 = _mean("reset_from_gate0")
                 reset_from_prev_gate = _mean("reset_from_prev_gate")
                 reset_from_random_gate = _mean("reset_from_random_gate")
+                cheating_events = _mean("cheating")
+                cheating_values = _stats_tensor("cheating")
+                cheating_rate = None
+                if cheating_values is not None:
+                    cheating_rate = cheating_values.gt(0).float().mean().item()
 
                 derived = {}
 
@@ -520,6 +684,12 @@ def main(cfg):
                     derived["simple/full_course_completion_mean_speed_ms"] = task_success_mean_speed
                 if gate0_success_count > 0 and task_success_peak_speed is not None:
                     derived["simple/full_course_completion_peak_speed_ms"] = task_success_peak_speed
+                if cheating_rate is not None:
+                    derived["simple/cheating"] = cheating_rate
+                    derived["cheating/episode_rate"] = cheating_rate
+                if cheating_events is not None:
+                    derived["simple/cheating_events_per_ep"] = cheating_events
+                    derived["cheating/events_per_episode"] = cheating_events
                 if furthest_gate is not None:
                     derived["race/furthest_gate_reached"] = furthest_gate
                     derived["race/furthest_gate_number"] = furthest_gate + 1.0
@@ -644,78 +814,414 @@ def main(cfg):
                     derived["curriculum/reset_active_gate"] = reset_active_gate
                     if reset_active_gate >= 0:
                         derived["curriculum/reset_active_gate_number"] = reset_active_gate + 1.0
-                if reset_from_gate0 is not None: derived["curriculum/reset_from_gate0_rate"] = reset_from_gate0
-                if reset_from_prev_gate is not None: derived["curriculum/reset_from_prev_gate_rate"] = reset_from_prev_gate
-                if reset_from_random_gate is not None: derived["curriculum/reset_from_random_rate"] = reset_from_random_gate
+                if reset_from_gate0 is not None:
+                    derived["curriculum/reset_from_gate0_rate"] = reset_from_gate0
+                if reset_from_prev_gate is not None:
+                    derived["curriculum/reset_from_prev_gate_rate"] = reset_from_prev_gate
+                if reset_from_random_gate is not None:
+                    derived["curriculum/reset_from_random_rate"] = reset_from_random_gate
+                reset_gate_pass_emas = {}
                 for gi in range(12):
                     reset_gate_ema = _mean(f"reset_gate_{gi}_pass_ema")
                     if reset_gate_ema is not None:
+                        reset_gate_pass_emas[gi] = float(reset_gate_ema)
                         derived[f"curriculum/reset_gate_{gi:02d}_pass_ema"] = reset_gate_ema
                         derived[f"curriculum_human/reset_gate_{gi + 1:02d}_pass_ema"] = reset_gate_ema
-                derived["curriculum/min_accuracy_phase_frames"] = cfg.task.get("curriculum_min_phase_frames", 2_000_000)
-                derived["curriculum/speed_unlock_accuracy_rate"] = cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40)
-                derived["curriculum/ang_decay_end_frames"] = cfg.task.get("angular_penalty_decay_frames", 100_000_000)
+                derived["curriculum/min_accuracy_phase_frames"] = cfg.task.get(
+                    "curriculum_min_phase_frames", 2_000_000
+                )
+                derived["curriculum/speed_unlock_accuracy_rate"] = cfg.task.get(
+                    "phase_speed_unlock_accuracy_rate", 0.40
+                )
+                derived["curriculum/ang_decay_end_frames"] = cfg.task.get(
+                    "angular_penalty_decay_frames", 100_000_000
+                )
 
-                if adaptive_entropy_enabled:
-                    step_sec = cfg.sim.dt * cfg.sim.substeps
-                    gates_per_second_batch = 0.0
-                    if gates_passed is not None and ep_len is not None and ep_len > 0:
-                        gates_per_second_batch = gates_passed / max(ep_len * step_sec, 1e-6)
-
-                    phase0_coef_max = float(adaptive_entropy_cfg.get("phase0_coef_max", 0.005))
-                    phase0_coef_min = float(adaptive_entropy_cfg.get("phase0_coef_min", 0.0005))
-                    phase1_rebump_coef = float(adaptive_entropy_cfg.get("phase1_rebump_coef", 0.0045))
-                    phase1_coef_min = float(adaptive_entropy_cfg.get("phase1_coef_min", 0.0003))
-                    speed_ema_alpha = float(adaptive_entropy_cfg.get("speed_ema_alpha", 0.05))
-                    speed_signal_low = float(adaptive_entropy_cfg.get("speed_signal_low", 0.05))
-                    speed_signal_high = float(adaptive_entropy_cfg.get("speed_signal_high", 0.60))
-                    max_delta_per_update = float(adaptive_entropy_cfg.get("max_delta_per_update", 0.00025))
-
-                    curr_phase = float(curriculum_phase if curriculum_phase is not None else prev_curriculum_phase)
-                    accuracy_signal = float(curriculum_accuracy if curriculum_accuracy is not None else 0.0)
-
-                    if prev_curriculum_phase == 0.0 and curr_phase >= 1.0:
-                        current_entropy_coef = phase1_rebump_coef
-                        target_entropy_coef = phase1_rebump_coef
-                        phase1_rebump_applied = True
-                    elif curr_phase < 1.0:
-                        unlock_rate = float(cfg.task.get("phase_speed_unlock_accuracy_rate", 0.40))
-                        accuracy_norm = _clamp01(accuracy_signal / max(unlock_rate, 1e-6))
-                        target_entropy_coef = phase0_coef_max - accuracy_norm * (phase0_coef_max - phase0_coef_min)
-                        current_entropy_coef = _slew_toward(
-                            current_entropy_coef, target_entropy_coef, max_delta_per_update
-                        )
+                step_sec = cfg.sim.dt * cfg.sim.substeps
+                gate0_crash_rate_batch = _masked_mean("collision", gate0_start_mask)
+                if gate0_episode_count > 0 and task_success_rate is not None:
+                    batch_completion_rate = float(task_success_rate)
+                    if not controller_completion_recent:
+                        controller_completion_ema = batch_completion_rate
                     else:
-                        speed_perf_ema = (1.0 - speed_ema_alpha) * speed_perf_ema + speed_ema_alpha * gates_per_second_batch
-                        speed_span = max(speed_signal_high - speed_signal_low, 1e-6)
-                        speed_norm = _clamp01((speed_perf_ema - speed_signal_low) / speed_span)
-                        target_entropy_coef = phase1_rebump_coef - speed_norm * (phase1_rebump_coef - phase1_coef_min)
-                        current_entropy_coef = _slew_toward(
-                            current_entropy_coef, target_entropy_coef, max_delta_per_update
+                        controller_completion_ema = (
+                            (1.0 - controller_ema_alpha) * controller_completion_ema
+                            + controller_ema_alpha * batch_completion_rate
                         )
+                    controller_completion_recent.append(batch_completion_rate)
+                if gate0_episode_count > 0 and gate0_crash_rate_batch is not None:
+                    batch_gate0_crash_rate = float(gate0_crash_rate_batch)
+                    if not controller_gate0_crash_recent:
+                        controller_gate0_crash_ema = batch_gate0_crash_rate
+                    else:
+                        controller_gate0_crash_ema = (
+                            (1.0 - controller_ema_alpha) * controller_gate0_crash_ema
+                            + controller_ema_alpha * batch_gate0_crash_rate
+                        )
+                    controller_gate0_crash_recent.append(batch_gate0_crash_rate)
 
-                    prev_curriculum_phase = curr_phase
+                if controller_completion_recent:
+                    controller_completion_signal = float(
+                        sum(controller_completion_recent) / len(controller_completion_recent)
+                    )
+                else:
+                    controller_completion_signal = controller_completion_ema
+
+                if controller_gate0_crash_recent:
+                    controller_crash_signal = float(
+                        sum(controller_gate0_crash_recent) / len(controller_gate0_crash_recent)
+                    )
+                else:
+                    controller_crash_signal = controller_gate0_crash_ema
+
+                controller_completion_history.append(controller_completion_signal)
+                completion_drop_5 = 0.0
+                if len(controller_completion_history) >= controller_completion_history.maxlen:
+                    completion_drop_5 = (
+                        controller_completion_signal - controller_completion_history[0]
+                    )
+
+                hard_gate_reliability = 0.0
+                if getattr(base_env, "controller_hard_gate_indices", ()):
+                    hard_gate_values = [
+                        reset_gate_pass_emas[gi]
+                        for gi in base_env.controller_hard_gate_indices
+                        if gi in reset_gate_pass_emas
+                    ]
+                    if hard_gate_values:
+                        hard_gate_reliability = min(hard_gate_values)
+
+                final_gate_reliability = 0.0
+                if getattr(base_env, "controller_final_gate_indices", ()):
+                    final_gate_values = [
+                        reset_gate_pass_emas[gi]
+                        for gi in base_env.controller_final_gate_indices
+                        if gi in reset_gate_pass_emas
+                    ]
+                    if final_gate_values:
+                        final_gate_reliability = min(final_gate_values)
+
+                t20_valid = False
+                lap_time_steps_values = _stats_tensor("lap_time_steps")
+                if (
+                    lap_time_steps_values is not None
+                    and gate0_success_mask is not None
+                    and gate0_success_count >= controller_success_min_for_t20
+                ):
+                    gate0_success_lap_times = lap_time_steps_values.float()[gate0_success_mask]
+                    controller_t20_lap_time_sec = (
+                        torch.quantile(gate0_success_lap_times, 0.20).item() * step_sec
+                    )
+                    t20_valid = True
+
+                stabilize_window = (
+                    controller_completion_signal >= controller_stabilize_completion_target
+                    and hard_gate_reliability >= controller_stabilize_hard_gate_target
+                    and final_gate_reliability >= controller_stabilize_final_gate_target
+                    and controller_crash_signal <= controller_stabilize_crash_target
+                )
+                phase2_operating_window = (
+                    controller_phase >= 2
+                    and controller_completion_signal >= controller_phase2_completion_target
+                    and hard_gate_reliability >= controller_phase2_hard_gate_target
+                    and final_gate_reliability >= controller_phase2_final_gate_target
+                    and controller_crash_signal <= controller_phase2_crash_target
+                )
+
+                if (stabilize_window or phase2_operating_window) and t20_valid:
+                    if controller_t20_best_stable_lap_time_sec is None:
+                        controller_t20_best_stable_lap_time_sec = controller_t20_lap_time_sec
+                        controller_plateau_count = 0
+                    else:
+                        best_before_update = controller_t20_best_stable_lap_time_sec
+                        relative_improvement = (
+                            (best_before_update - controller_t20_lap_time_sec)
+                            / max(best_before_update, 1e-6)
+                        )
+                        controller_t20_best_stable_lap_time_sec = min(
+                            controller_t20_best_stable_lap_time_sec,
+                            controller_t20_lap_time_sec,
+                        )
+                        if relative_improvement >= controller_plateau_improvement_eps:
+                            controller_plateau_count = 0
+                        else:
+                            controller_plateau_count += 1
+                else:
+                    controller_plateau_count = 0
+
+                phase1_collapse_conditions = (
+                    controller_completion_signal < controller_completion_recover
+                    or final_gate_reliability < controller_completion_recover
+                    or controller_crash_signal > controller_crash_recover
+                    or completion_drop_5 < -controller_completion_drop_recover
+                )
+                phase2_collapse_conditions = (
+                    controller_completion_signal < controller_phase2_completion_floor
+                    or final_gate_reliability < controller_phase2_final_gate_floor
+                    or controller_crash_signal > controller_phase2_crash_recover
+                    or completion_drop_5 < -controller_completion_drop_recover
+                )
+                phase1_unlock = (
+                    gate0_success_count > 0 or controller_completion_signal >= 0.35
+                )
+                if controller_phase == 0 and phase1_unlock:
+                    controller_phase = 1
+                    controller_phase_start_frames = collector._frames
+                    controller_phase2_ready_count = 0
+                    controller_plateau_count = 0
+                    controller_speed_pressure = max(
+                        controller_speed_pressure,
+                        controller_phase1_initial_speed_pressure,
+                    )
+
+                if controller_phase >= 2 and phase2_collapse_conditions:
+                    controller_phase = 1
+                    controller_phase_start_frames = collector._frames
+                    controller_phase2_ready_count = 0
+                    controller_plateau_count = 0
+                    controller_exploration_pressure = 0.0
+
+                phase_frames = max(collector._frames - controller_phase_start_frames, 0)
+                phase2_ready_window = (
+                    controller_phase == 1
+                    and stabilize_window
+                    and phase_frames >= controller_min_phase_frames
+                )
+                if phase2_ready_window:
+                    controller_phase2_ready_count += 1
+                elif controller_phase == 1:
+                    controller_phase2_ready_count = 0
+
+                if (
+                    controller_phase == 1
+                    and controller_phase2_ready_count >= controller_plateau_windows
+                ):
+                    controller_phase = 2
+                    controller_phase_start_frames = collector._frames
+                    controller_phase2_ready_count = 0
+                    controller_plateau_count = 0
+                    controller_speed_pressure = max(
+                        controller_speed_pressure,
+                        controller_phase2_initial_speed_pressure,
+                    )
+
+                phase2_operating_window = (
+                    controller_phase >= 2
+                    and controller_completion_signal >= controller_phase2_completion_target
+                    and hard_gate_reliability >= controller_phase2_hard_gate_target
+                    and final_gate_reliability >= controller_phase2_final_gate_target
+                    and controller_crash_signal <= controller_phase2_crash_target
+                )
+                if controller_phase >= 2:
+                    controller_collapse_active = phase2_collapse_conditions
+                    slack = min(
+                        controller_completion_signal - controller_phase2_completion_target,
+                        hard_gate_reliability - controller_phase2_hard_gate_target,
+                        final_gate_reliability - controller_phase2_final_gate_target,
+                        controller_phase2_crash_target - controller_crash_signal,
+                    )
+                else:
+                    controller_collapse_active = (
+                        controller_phase == 1
+                        and controller_speed_pressure > controller_phase1_initial_speed_pressure + 1e-6
+                        and phase1_collapse_conditions
+                    )
+                    slack = min(
+                        controller_completion_signal - controller_stabilize_completion_target,
+                        hard_gate_reliability - controller_stabilize_hard_gate_target,
+                        final_gate_reliability - controller_stabilize_final_gate_target,
+                        controller_stabilize_crash_target - controller_crash_signal,
+                    )
+
+                if controller_phase < 1:
+                    controller_speed_pressure = 0.0
+                elif controller_phase == 1:
+                    updated_speed_pressure = max(
+                        controller_speed_pressure,
+                        controller_phase1_initial_speed_pressure,
+                    )
+                    if stabilize_window:
+                        updated_speed_pressure += controller_speed_up_step
+                    elif (
+                        controller_completion_signal < controller_completion_floor
+                        or final_gate_reliability < controller_completion_floor
+                        or controller_crash_signal > controller_crash_recover
+                    ):
+                        updated_speed_pressure -= controller_speed_down_step
+                    if controller_collapse_active:
+                        updated_speed_pressure -= controller_speed_panic_step
+                    controller_speed_pressure = _clamp01(updated_speed_pressure)
+                else:
+                    updated_speed_pressure = max(
+                        controller_speed_pressure,
+                        controller_phase2_initial_speed_pressure,
+                    )
+                    if phase2_operating_window:
+                        updated_speed_pressure += controller_phase2_speed_up_step
+                    elif slack < 0.0:
+                        updated_speed_pressure -= controller_phase2_speed_down_step
+                    if controller_collapse_active:
+                        updated_speed_pressure -= controller_phase2_panic_step
+                    controller_speed_pressure = _clamp01(updated_speed_pressure)
+
+                plateau_active = (
+                    controller_phase >= 2
+                    and phase2_operating_window
+                    and t20_valid
+                    and controller_t20_best_stable_lap_time_sec is not None
+                    and controller_plateau_count >= controller_plateau_windows
+                    and controller_speed_pressure >= controller_phase2_plateau_start_pressure
+                )
+                exploration_target = 0.0
+                if plateau_active:
+                    exploration_target = _clamp01(slack / 0.08)
+                controller_exploration_pressure = _clamp01(
+                    _slew_toward_asymmetric(
+                        controller_exploration_pressure,
+                        exploration_target,
+                        max_increase=0.05,
+                        max_decrease=0.15,
+                    )
+                )
+
+                if entropy_controller_enabled:
+                    if controller_completion_ema < 0.20:
+                        target_entropy_coef = phase0_coef_max
+                    elif controller_collapse_active:
+                        target_entropy_coef = recovery_coef
+                    else:
+                        entropy_floor = (
+                            phase2_min_coef if controller_phase >= 2 else phase1_min_coef
+                        )
+                        target_entropy_coef = entropy_floor + (
+                            1.0 - controller_speed_pressure
+                        ) * (phase0_coef_max - entropy_floor)
+                        if controller_phase >= 2:
+                            target_entropy_coef = max(
+                                target_entropy_coef,
+                                0.008 + 0.010 * controller_exploration_pressure,
+                            )
+                    current_entropy_coef = _slew_toward_asymmetric(
+                        current_entropy_coef,
+                        target_entropy_coef,
+                        max_increase=entropy_increase_step,
+                        max_decrease=entropy_decrease_step,
+                    )
                     policy.entropy_coef = current_entropy_coef
 
+                base_env.set_constrained_speed_controller(
+                    phase=controller_phase,
+                    speed_pressure=controller_speed_pressure,
+                    exploration_pressure=controller_exploration_pressure,
+                    collapse_active=controller_collapse_active,
+                    entropy_target=target_entropy_coef,
+                )
+
+                derived["curriculum/phase"] = float(controller_phase)
+                derived["controller/phase"] = float(controller_phase)
+                derived["controller/slack"] = slack
+                derived["controller/gate0_completion_ema"] = controller_completion_ema
+                derived["controller/gate0_completion_signal"] = controller_completion_signal
+                derived["controller/hard_gate_reliability"] = hard_gate_reliability
+                derived["controller/final_gate_reliability"] = final_gate_reliability
+                derived["controller/crash_ema_gate0"] = controller_gate0_crash_ema
+                derived["controller/crash_signal_gate0"] = controller_crash_signal
+                derived["controller/completion_drop_5"] = completion_drop_5
+                derived["controller/speed_pressure"] = controller_speed_pressure
+                derived["controller/exploration_pressure"] = controller_exploration_pressure
+                derived["controller/exploration_episode_rate"] = float(
+                    getattr(base_env, "controller_explore_episode_rate", 0.0)
+                )
+                derived["controller/collapse_active"] = float(controller_collapse_active)
+                derived["controller/stabilize_window"] = float(stabilize_window)
+                derived["controller/phase2_ready_window"] = float(phase2_ready_window)
+                derived["controller/phase2_operating_window"] = float(phase2_operating_window)
+                derived["controller/phase2_ready_windows"] = float(
+                    controller_phase2_ready_count
+                )
+                derived["controller/plateau_windows"] = float(controller_plateau_count)
+                derived["controller/min_phase_frames"] = float(controller_min_phase_frames)
+                derived["controller/stabilize_completion_target"] = (
+                    controller_stabilize_completion_target
+                )
+                derived["controller/phase2_completion_target"] = (
+                    controller_phase2_completion_target
+                )
+                derived["controller/phase2_completion_floor"] = (
+                    controller_phase2_completion_floor
+                )
+                if controller_t20_lap_time_sec is not None:
+                    derived["controller/t20_lap_time_sec"] = controller_t20_lap_time_sec
+                if controller_t20_best_stable_lap_time_sec is not None:
+                    derived["controller/t20_best_stable_lap_time_sec"] = (
+                        controller_t20_best_stable_lap_time_sec
+                    )
+
+                speed_phase_scale = 0.0
+                if controller_phase >= 2:
+                    speed_phase_scale = cfg.task.get(
+                        "reward_speed_scale_phase2",
+                        cfg.task.get("reward_speed_scale", 0.0),
+                    )
+                elif controller_phase >= 1:
+                    speed_phase_scale = cfg.task.get("reward_speed_scale", 0.0)
+                derived["reward/speed_phase_scale"] = (
+                    speed_phase_scale * controller_speed_pressure
+                )
+
+                if hasattr(policy, "entropy_coef"):
                     derived["entropy/current_coef"] = current_entropy_coef
                     derived["entropy/target_coef"] = target_entropy_coef
-                    derived["entropy/phase"] = curr_phase
-                    derived["entropy/accuracy_signal"] = accuracy_signal
-                    derived["entropy/gates_per_second_ema"] = speed_perf_ema
-                    derived["entropy/rebump_applied"] = float(phase1_rebump_applied)
+                    derived["entropy/phase"] = float(controller_phase)
+                    derived["entropy/speed_pressure"] = controller_speed_pressure
+                    derived["entropy/exploration_pressure"] = controller_exploration_pressure
+
+                controller_window_metrics = base_env.consume_controller_window_metrics()
+                controller_gate_count = int(getattr(base_env, "num_course_gates", required_gate_count))
+                for gi in range(controller_gate_count):
+                    derived[f"controller/gate_{gi:02d}_speed_target"] = (
+                        controller_window_metrics["gate_speed_target_ms"][gi]
+                    )
+                    derived[f"controller/gate_{gi:02d}_overspeed_rate"] = (
+                        controller_window_metrics["gate_overspeed_rate"][gi]
+                    )
+                    derived[f"controller/gate_{gi:02d}_split_time_sec"] = (
+                        controller_window_metrics["gate_split_time_steps"][gi] * step_sec
+                    )
+                    derived[f"controller/gate_{gi:02d}_exit_speed_ms"] = (
+                        controller_window_metrics["gate_exit_speed_ms"][gi]
+                    )
 
                 # Per-gate crossing heatmap data — log as individual metrics for WandB bar chart
-                for gi in range(12):
+                for gi in range(13):
                     v = _mean(f"gate_{gi}_crosses")
                     if v is not None:
                         derived[f"gates/gate_{gi:02d}_crosses"] = v
                         derived[f"gates_human/gate_{gi + 1:02d}_crosses"] = v
 
                 # WandB bar chart for per-gate distribution
-                gate_counts = [_mean(f"gate_{gi}_crosses") or 0.0 for gi in range(12)]
-                gate_labels = [f"G{gi + 1}" for gi in range(12)]
+                gate_counts = [_mean(f"gate_{gi}_crosses") or 0.0 for gi in range(13)]
+                gate_labels = [f"G{gi + 1}" for gi in range(13)]
                 gate_table = wandb.Table(columns=["gate", "mean_crosses"], data=[[label, val] for label, val in zip(gate_labels, gate_counts)])
                 derived["gates/crossing_distribution"] = wandb.plot.bar(gate_table, "gate", "mean_crosses", title="Gate Crossing Distribution")
+
+                for gi in range(13):
+                    v = _mean(f"cheating_gate_{gi}")
+                    if v is not None:
+                        derived[f"cheating/gate_{gi:02d}_repeat_events"] = v
+                        derived[f"cheating_human/gate_{gi + 1:02d}_repeat_events"] = v
+
+                cheating_gate_counts = [_mean(f"cheating_gate_{gi}") or 0.0 for gi in range(13)]
+                cheating_gate_table = wandb.Table(
+                    columns=["gate", "repeat_events"],
+                    data=[[label, val] for label, val in zip(gate_labels, cheating_gate_counts)],
+                )
+                derived["cheating/repeat_gate_distribution"] = wandb.plot.bar(
+                    cheating_gate_table,
+                    "gate",
+                    "repeat_events",
+                    title="Consecutive Same-Gate Repeat Events",
+                )
 
                 info.update(derived)
 

@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 
+import math
 import numpy as np
 import torch
 import torch.distributions as D
@@ -28,6 +29,8 @@ from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import Unbounded, Composite, DiscreteTensorSpec, BinaryDiscreteTensorSpec
 
 import isaacsim.core.utils.prims as prim_utils
+import isaacsim.core.utils.stage as stage_utils
+from isaacsim.core.prims import XFormPrim as XFormPrimView
 import omni_drones.utils.kit as kit_utils
 from omni_drones.utils.torch import euler_to_quaternion, quat_rotate, quat_rotate_inverse, quat_axis, quat_mul
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
@@ -36,7 +39,7 @@ from omni_drones.views import ArticulationView, RigidPrimView
 
 from omni_drones.robots import ASSET_PATH
 
-from pxr import UsdPhysics
+from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 # Debug visualization
 try:
@@ -178,8 +181,7 @@ class DroneRaceEnv(IsaacEnv):
             zip(self.stacked_reversal_entry_gates, self.stacked_reversal_target_gates)
         )
         self.stacked_reversal_grace_steps = int(cfg.task.get("stacked_reversal_grace_steps", 0))
-        self.step_dt = float(cfg.sim.dt * cfg.sim.substeps)
-        
+
         # Gate asset path - default to isaac_drone_racer gate asset
         # User can override this in config: gate_asset_path: "path/to/gate.usd"
         # If not specified, defaults to gate/gate.usd (isaac_drone_racer style)
@@ -243,7 +245,62 @@ class DroneRaceEnv(IsaacEnv):
         self.hard_turn_penalty_scale = float(
             cfg.task.get("hard_turn_penalty_scale", 1.0)
         )
-        
+        self.num_logged_gates = max(min(self.num_gates, 13), 1)
+        default_hard_gates = (6, 7, 10, 11)
+        default_final_gates = (10, 11)
+        self.controller_completion_target = float(cfg.task.get("controller_completion_target", 0.78))
+        self.controller_completion_floor = float(cfg.task.get("controller_completion_floor", 0.70))
+        self.controller_completion_recover = float(cfg.task.get("controller_completion_recover", 0.60))
+        self.controller_hard_gate_target = float(cfg.task.get("controller_hard_gate_target", 0.82))
+        self.controller_final_gate_target = float(cfg.task.get("controller_final_gate_target", 0.78))
+        self.controller_crash_target = float(cfg.task.get("controller_crash_target", 0.40))
+        self.controller_crash_recover = float(cfg.task.get("controller_crash_recover", 0.60))
+        self.controller_speed_up_step = float(cfg.task.get("controller_speed_up_step", 0.015))
+        self.controller_speed_down_step = float(cfg.task.get("controller_speed_down_step", 0.08))
+        self.controller_speed_panic_step = float(cfg.task.get("controller_speed_panic_step", 0.20))
+        self.controller_plateau_windows = int(cfg.task.get("controller_plateau_windows", 8))
+        self.controller_plateau_improvement_eps = float(cfg.task.get("controller_plateau_improvement_eps", 0.01))
+        self.controller_success_min_for_t20 = int(cfg.task.get("controller_success_min_for_t20", 32))
+        self.controller_explore_episode_rate_max = float(cfg.task.get("controller_explore_episode_rate_max", 0.5))
+        self.controller_easy_gate_jitter_lo = float(cfg.task.get("controller_easy_gate_jitter_lo", -0.05))
+        self.controller_easy_gate_jitter_hi = float(cfg.task.get("controller_easy_gate_jitter_hi", 0.15))
+        self.controller_speed_budget_a_lat_conservative = float(
+            cfg.task.get("speed_budget_a_lat_conservative", 4.5)
+        )
+        self.controller_speed_budget_a_lat_aggressive = float(
+            cfg.task.get("speed_budget_a_lat_aggressive", 8.0)
+        )
+        self.controller_speed_budget_vertical_discount = float(
+            cfg.task.get("speed_budget_vertical_discount", 0.90)
+        )
+        self.controller_speed_budget_entry_discount = float(
+            cfg.task.get("speed_budget_entry_discount", 0.92)
+        )
+        self.controller_speed_budget_target_discount = float(
+            cfg.task.get("speed_budget_target_discount", 0.85)
+        )
+        self.controller_speed_budget_v_min = float(cfg.task.get("speed_budget_v_min", 3.5))
+        self.controller_speed_budget_v_max = float(cfg.task.get("speed_budget_v_max", 12.0))
+        self.controller_hard_gate_indices = tuple(
+            sorted(
+                {
+                    int(idx)
+                    for idx in cfg.task.get("controller_hard_gate_indices", default_hard_gates)
+                    if 0 <= int(idx) < self.num_course_gates
+                }
+            )
+        )
+        self.controller_final_gate_indices = tuple(
+            sorted(
+                {
+                    int(idx)
+                    for idx in cfg.task.get("controller_final_gate_indices", default_final_gates)
+                    if 0 <= int(idx) < self.num_course_gates
+                }
+            )
+        )
+        self.step_dt = float(cfg.sim.dt * cfg.sim.substeps)
+
         import traceback
         import sys
         
@@ -290,8 +347,20 @@ class DroneRaceEnv(IsaacEnv):
         self.crash_grace_steps = int(cfg.task.get("crash_grace_steps", 100))
         self.stacked_reversal_grace = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.gates_crossed_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        # Per-gate crossing counters (12 gates, gate 12 = lap closure = same as gate 0)
-        self.per_gate_crosses = torch.zeros(self.num_envs, 12, device=self.device, dtype=torch.long)
+        # Per-gate crossing counters (13 gates total on this track, including the
+        # duplicated lap-closure gate 13 at the same pose as gate 1).
+        self.per_gate_crosses = torch.zeros(self.num_envs, 13, device=self.device, dtype=torch.long)
+        # Consecutive same-gate repeat detection ("cheating"): how often the same
+        # logged gate bucket is reported on back-to-back successful gate-cross events.
+        self.last_real_crossed_gate = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.long
+        )
+        self.repeat_gate_events_this_ep = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.repeat_gate_crosses = torch.zeros(
+            self.num_envs, 13, device=self.device, dtype=torch.long
+        )
         self.episode_start_gate = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.episode_reset_bucket = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.reset_gate_pass_ema = torch.ones(12, device=self.device)
@@ -303,6 +372,32 @@ class DroneRaceEnv(IsaacEnv):
         self.mean_altitude_acc = torch.zeros(self.num_envs, device=self.device)
         # Action magnitude tracking
         self.mean_action_mag_acc = torch.zeros(self.num_envs, device=self.device)
+        # Controller-driven constrained speed mode state.
+        self.controller_speed_pressure = 0.0
+        self.controller_exploration_pressure = 0.0
+        self.controller_collapse_active = False
+        self.controller_entropy_target = 0.0
+        self.controller_explore_episode_rate = 0.0
+        self.controller_explore_episode = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.controller_gate_target_jitter = torch.zeros(
+            self.num_envs, 12, device=self.device
+        )
+        self.controller_gate_speed_budget_cons = torch.zeros(12, device=self.device)
+        self.controller_gate_speed_budget_aggr = torch.zeros(12, device=self.device)
+        self.controller_gate_is_hard = torch.zeros(12, device=self.device, dtype=torch.bool)
+        self.controller_episode_overspeed_acc = torch.zeros(self.num_envs, device=self.device)
+        self.controller_window_gate_step_count = torch.zeros(12, device=self.device)
+        self.controller_window_gate_target_sum = torch.zeros(12, device=self.device)
+        self.controller_window_gate_overspeed_count = torch.zeros(12, device=self.device)
+        self.controller_window_gate_split_step_sum = torch.zeros(12, device=self.device)
+        self.controller_window_gate_split_count = torch.zeros(12, device=self.device)
+        self.controller_window_gate_exit_speed_sum = torch.zeros(12, device=self.device)
+        self.controller_window_gate_exit_count = torch.zeros(12, device=self.device)
+        self._build_controller_speed_budget_tables()
+        for gate_idx in self.controller_hard_gate_indices:
+            self.controller_gate_is_hard[gate_idx] = True
 
         # --- Accuracy-first curriculum state ---
         # Phase 0: accuracy-first full laps from gate 0, with shaping support.
@@ -382,6 +477,188 @@ class DroneRaceEnv(IsaacEnv):
         for key in keys:
             setattr(self, key, task_cfg[key])
 
+    def _estimate_turn_radius(self, prev_center, curr_center, next_center) -> float:
+        prev_center = np.asarray(prev_center, dtype=np.float64)
+        curr_center = np.asarray(curr_center, dtype=np.float64)
+        next_center = np.asarray(next_center, dtype=np.float64)
+        ab = curr_center - prev_center
+        bc = next_center - curr_center
+        ac = next_center - prev_center
+        ab_norm = np.linalg.norm(ab)
+        bc_norm = np.linalg.norm(bc)
+        ac_norm = np.linalg.norm(ac)
+        cross = np.cross(ab, ac)
+        area = 0.5 * np.linalg.norm(cross)
+        if area < 1e-9 or min(ab_norm, bc_norm, ac_norm) < 1e-9:
+            return float("inf")
+        return float(ab_norm * bc_norm * ac_norm / max(4.0 * area, 1e-9))
+
+    def _build_controller_speed_budget_tables(self):
+        cons = torch.zeros(12, device=self.device)
+        aggr = torch.zeros(12, device=self.device)
+        if self.track_config is None:
+            cons[:self.num_course_gates] = float(self.reward_speed_target_ms)
+            aggr[:self.num_course_gates] = max(
+                float(self.reward_speed_target_ms_phase2),
+                float(self.reward_speed_target_ms),
+            )
+            self.controller_gate_speed_budget_cons = cons
+            self.controller_gate_speed_budget_aggr = torch.maximum(aggr, cons)
+            return
+
+        gate_keys = sorted(self.track_config.keys(), key=lambda x: int(x))
+        centers = []
+        for gate_key in gate_keys[:self.num_course_gates]:
+            gate_cfg = self.track_config[gate_key]
+            pos = gate_cfg.get("pos", (0.0, 0.0, 1.0))
+            centers.append(
+                np.array(
+                    [float(pos[0]), float(pos[1]), float(pos[2]) + self.gate_height * 0.5],
+                    dtype=np.float64,
+                )
+            )
+
+        for gate_idx in range(self.num_course_gates):
+            prev_center = centers[(gate_idx - 1) % self.num_course_gates]
+            curr_center = centers[gate_idx]
+            next_center = centers[(gate_idx + 1) % self.num_course_gates]
+            radius = self._estimate_turn_radius(prev_center, curr_center, next_center)
+
+            if math.isinf(radius):
+                v_cons = self.controller_speed_budget_v_max
+                v_aggr = self.controller_speed_budget_v_max
+            else:
+                v_cons = math.sqrt(
+                    max(self.controller_speed_budget_a_lat_conservative * radius, 0.0)
+                )
+                v_aggr = math.sqrt(
+                    max(self.controller_speed_budget_a_lat_aggressive * radius, 0.0)
+                )
+
+            multiplier = 1.0
+            if abs(curr_center[2] - prev_center[2]) > 0.5 or abs(next_center[2] - curr_center[2]) > 0.5:
+                multiplier *= self.controller_speed_budget_vertical_discount
+            if gate_idx in self.stacked_reversal_entry_gates:
+                multiplier *= self.controller_speed_budget_entry_discount
+            if gate_idx in self.stacked_reversal_target_gates:
+                multiplier *= self.controller_speed_budget_target_discount
+
+            v_cons = float(
+                np.clip(
+                    v_cons * multiplier,
+                    self.controller_speed_budget_v_min,
+                    self.controller_speed_budget_v_max,
+                )
+            )
+            v_aggr = float(
+                np.clip(
+                    max(v_cons, v_aggr * multiplier),
+                    v_cons,
+                    self.controller_speed_budget_v_max,
+                )
+            )
+            cons[gate_idx] = v_cons
+            aggr[gate_idx] = v_aggr
+
+        self.controller_gate_speed_budget_cons = cons
+        self.controller_gate_speed_budget_aggr = torch.maximum(aggr, cons)
+
+    def _reset_controller_window_metrics(self):
+        self.controller_window_gate_step_count.zero_()
+        self.controller_window_gate_target_sum.zero_()
+        self.controller_window_gate_overspeed_count.zero_()
+        self.controller_window_gate_split_step_sum.zero_()
+        self.controller_window_gate_split_count.zero_()
+        self.controller_window_gate_exit_speed_sum.zero_()
+        self.controller_window_gate_exit_count.zero_()
+
+    def consume_controller_window_metrics(self):
+        metrics = {
+            "gate_speed_target_ms": [],
+            "gate_overspeed_rate": [],
+            "gate_split_time_steps": [],
+            "gate_exit_speed_ms": [],
+        }
+        for gate_idx in range(12):
+            step_count = float(self.controller_window_gate_step_count[gate_idx].item())
+            split_count = float(self.controller_window_gate_split_count[gate_idx].item())
+            exit_count = float(self.controller_window_gate_exit_count[gate_idx].item())
+            metrics["gate_speed_target_ms"].append(
+                float(self.controller_window_gate_target_sum[gate_idx].item() / step_count)
+                if step_count > 0.0 else 0.0
+            )
+            metrics["gate_overspeed_rate"].append(
+                float(self.controller_window_gate_overspeed_count[gate_idx].item() / step_count)
+                if step_count > 0.0 else 0.0
+            )
+            metrics["gate_split_time_steps"].append(
+                float(self.controller_window_gate_split_step_sum[gate_idx].item() / split_count)
+                if split_count > 0.0 else 0.0
+            )
+            metrics["gate_exit_speed_ms"].append(
+                float(self.controller_window_gate_exit_speed_sum[gate_idx].item() / exit_count)
+                if exit_count > 0.0 else 0.0
+            )
+        self._reset_controller_window_metrics()
+        return metrics
+
+    def set_constrained_speed_controller(
+        self,
+        phase: int,
+        speed_pressure: float,
+        exploration_pressure: float,
+        collapse_active: bool,
+        entropy_target: float = 0.0,
+    ):
+        self.curriculum_phase = int(max(0, phase))
+        self.controller_speed_pressure = float(np.clip(speed_pressure, 0.0, 1.0))
+        self.controller_exploration_pressure = float(np.clip(exploration_pressure, 0.0, 1.0))
+        self.controller_collapse_active = bool(collapse_active)
+        self.controller_entropy_target = float(entropy_target)
+        self.controller_explore_episode_rate = float(
+            np.clip(
+                self.controller_explore_episode_rate_max * self.controller_exploration_pressure,
+                0.0,
+                self.controller_explore_episode_rate_max,
+            )
+        )
+
+    def _get_controller_base_gate_targets(self):
+        targets = torch.zeros(12, device=self.device)
+        if self.curriculum_phase < 1:
+            return targets
+        delta = self.controller_gate_speed_budget_aggr - self.controller_gate_speed_budget_cons
+        targets[:self.num_course_gates] = (
+            self.controller_gate_speed_budget_cons[:self.num_course_gates]
+            + float(self.controller_speed_pressure) * delta[:self.num_course_gates]
+        )
+        return targets
+
+    def _get_active_gate_speed_targets(self):
+        targets = self._get_controller_base_gate_targets()
+        if self.curriculum_phase < 1 or self.num_course_gates <= 0:
+            return torch.zeros(self.num_envs, device=self.device)
+        active_gate_idx = self.gate_indices.remainder(self.num_course_gates)
+        active_targets = targets[active_gate_idx]
+        if self.curriculum_phase >= 2:
+            hard_gate_mask = self.controller_gate_is_hard[active_gate_idx]
+            conservative_targets = self.controller_gate_speed_budget_cons[active_gate_idx]
+            active_targets = torch.where(
+                self.controller_explore_episode & hard_gate_mask,
+                conservative_targets,
+                active_targets,
+            )
+            jitter = self.controller_gate_target_jitter.gather(
+                1, active_gate_idx.unsqueeze(1)
+            ).squeeze(1)
+            jittered_targets = active_targets * (1.0 + jitter)
+            active_targets = torch.where(
+                self.controller_explore_episode & (~hard_gate_mask),
+                jittered_targets,
+                active_targets,
+            )
+        return active_targets.clamp(min=0.0, max=self.controller_speed_budget_v_max)
+
     def _draw_gate_origins(self, gate_world_pos, gate_world_rot, env_idx=0):
         """
         Draw coordinate axes at gate positions to visualize where the gate frame origin is.
@@ -459,10 +736,295 @@ class DroneRaceEnv(IsaacEnv):
         central = self.envs_positions[self.central_env_idx].detach().cpu().numpy()
         c = self._track_cam_center_local + central
         span = float(self._track_cam_span)
-        # Isometric-style offset so a ~10 m square track stays in view.
-        eye = c + np.array([span * 1.15, -span * 1.05, span * 0.85], dtype=np.float64)
-        target = c + np.array([0.0, 0.0, 0.25 * span], dtype=np.float64)
+        camera_mode = str(self.cfg.get("play_camera_mode", "track")).lower()
+        if camera_mode == "follow":
+            self._update_follow_viewport_camera(force=True)
+            return
+        if camera_mode == "side":
+            eye = c + np.array([span * 1.55, 0.0, span * 0.28], dtype=np.float64)
+            target = c + np.array([0.0, 0.0, 0.10 * span], dtype=np.float64)
+        else:
+            # Isometric-style offset so the full course stays in view by default.
+            eye = c + np.array([span * 1.15, -span * 1.05, span * 0.85], dtype=np.float64)
+            target = c + np.array([0.0, 0.0, 0.25 * span], dtype=np.float64)
         set_camera_view(eye=eye, target=target)
+
+    def _update_follow_viewport_camera(self, force: bool = False):
+        """Track the central drone with a smoothed chase camera during playback."""
+        if not getattr(self, "enable_viewport", False):
+            return
+        if not hasattr(self, "drone") or not hasattr(self.drone, "pos") or not hasattr(self.drone, "rot"):
+            return
+        try:
+            from isaacsim.core.utils.viewports import set_camera_view
+        except ImportError:
+            return
+        try:
+            self.drone.get_state()
+        except Exception:
+            pass
+
+        env_idx = int(self.central_env_idx)
+        env_offset = self.envs_positions[env_idx].detach().cpu().numpy()
+        drone_pos = self.drone.pos[env_idx, 0].detach().cpu().numpy() + env_offset
+        drone_rot = self.drone.rot[env_idx, 0].detach()
+
+        body_heading = quat_axis(drone_rot.unsqueeze(0), axis=0)[0].detach().cpu().numpy()
+        body_heading[2] = 0.0
+        heading_norm = np.linalg.norm(body_heading)
+        if heading_norm > 1e-5:
+            body_heading = body_heading / heading_norm
+        else:
+            body_heading = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+        course_heading = body_heading.copy()
+        if hasattr(self, "gates") and hasattr(self, "gate_indices"):
+            try:
+                gate_world_pos, gate_world_rot = self.gates.get_world_poses()
+                target_idx = int(self.gate_indices[env_idx].item())
+                gate_pos = gate_world_pos[env_idx, target_idx].unsqueeze(0)
+                gate_rot = gate_world_rot[env_idx, target_idx].unsqueeze(0)
+                gate_center = self._get_gate_center(gate_pos, gate_rot)[0].detach().cpu().numpy()
+                gate_direction = gate_center - drone_pos
+                gate_direction[2] = 0.0
+                gate_direction_norm = np.linalg.norm(gate_direction)
+                if gate_direction_norm > 1e-5:
+                    course_heading = gate_direction / gate_direction_norm
+            except Exception:
+                pass
+
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        right = np.cross(course_heading, world_up)
+        right_norm = np.linalg.norm(right)
+        if right_norm < 1e-5:
+            right = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        else:
+            right = right / right_norm
+
+        follow_distance = float(self.cfg.get("play_follow_distance", 4.0))
+        follow_height = float(self.cfg.get("play_follow_height", 1.45))
+        follow_side_offset = float(self.cfg.get("play_follow_side_offset", 0.0))
+        follow_look_ahead = float(self.cfg.get("play_follow_look_ahead", 0.35))
+        follow_target_lift = float(self.cfg.get("play_follow_target_lift", 0.12))
+        eye_smoothing = float(self.cfg.get("play_follow_eye_smoothing", 0.35))
+        target_smoothing = float(self.cfg.get("play_follow_target_smoothing", 0.55))
+        eye_smoothing = float(np.clip(eye_smoothing, 0.0, 1.0))
+        target_smoothing = float(np.clip(target_smoothing, 0.0, 1.0))
+
+        desired_eye = (
+            drone_pos
+            - course_heading * follow_distance
+            + world_up * follow_height
+            + right * follow_side_offset
+        )
+        desired_target = drone_pos + course_heading * follow_look_ahead + world_up * follow_target_lift
+
+        if force or not hasattr(self, "_follow_cam_eye"):
+            eye = desired_eye
+            target = desired_target
+        else:
+            eye = (1.0 - eye_smoothing) * self._follow_cam_eye + eye_smoothing * desired_eye
+            target = (1.0 - target_smoothing) * self._follow_cam_target + target_smoothing * desired_target
+
+        self._follow_cam_eye = eye
+        self._follow_cam_target = target
+        set_camera_view(eye=eye, target=target)
+
+    def _add_visual_playback_payload(self, drone_prim_path: str):
+        if not bool(self.cfg.get("play_attach_payload", False)):
+            return
+        stage = stage_utils.get_current_stage()
+        if stage is None:
+            return
+
+        payload_root = f"{drone_prim_path}/base_link/PlaybackPayload"
+        if prim_utils.is_prim_path_valid(payload_root):
+            return
+
+        prim_utils.define_prim(payload_root, "Xform")
+
+        bar_length = float(self.cfg.get("play_payload_bar_length", 0.55))
+        bar_radius = float(self.cfg.get("play_payload_bar_radius", 0.018))
+        payload_radius = float(self.cfg.get("play_payload_radius", 0.085))
+        payload_drop = float(self.cfg.get("play_payload_drop", bar_length))
+
+        bar = UsdGeom.Capsule.Define(stage, f"{payload_root}/Bar")
+        bar.CreateHeightAttr(bar_length)
+        bar.CreateRadiusAttr(bar_radius)
+        bar.CreateAxisAttr("Z")
+        bar.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -bar_length * 0.5))
+        bar.CreateDisplayColorAttr().Set([Gf.Vec3f(0.96, 0.74, 0.16)])
+
+        load = UsdGeom.Sphere.Define(stage, f"{payload_root}/Load")
+        load.CreateRadiusAttr(payload_radius)
+        load.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -payload_drop))
+        load.CreateDisplayColorAttr().Set([Gf.Vec3f(1.00, 0.86, 0.24)])
+
+        payload_material = self._create_preview_surface_material(
+            "/World/Looks/DroneRacePlaybackPayload",
+            color=(0.98, 0.80, 0.20),
+            emissive=(0.16, 0.10, 0.02),
+            roughness=0.22,
+        )
+        self._bind_visual_material_recursive(
+            prim_utils.get_prim_at_path(payload_root), payload_material
+        )
+
+    def _add_visual_playback_body_shell(self, drone_prim_path: str):
+        if not bool(self.cfg.get("play_attach_body_shell", True)):
+            return
+        stage = stage_utils.get_current_stage()
+        if stage is None:
+            return
+
+        shell_root = f"{drone_prim_path}/base_link/PlaybackBodyShell"
+        if prim_utils.is_prim_path_valid(shell_root):
+            return
+
+        prim_utils.define_prim(shell_root, "Xform")
+
+        body_length = float(self.cfg.get("play_body_shell_length", 0.28))
+        body_width = float(self.cfg.get("play_body_shell_width", 0.08))
+        body_height = float(self.cfg.get("play_body_shell_height", 0.06))
+        arm_span = float(self.cfg.get("play_body_shell_arm_span", 0.42))
+        arm_radius = float(self.cfg.get("play_body_shell_arm_radius", 0.014))
+        rotor_radius = float(self.cfg.get("play_body_shell_rotor_radius", 0.045))
+        rotor_height = float(self.cfg.get("play_body_shell_rotor_height", 0.012))
+        shell_lift = float(self.cfg.get("play_body_shell_lift", 0.015))
+
+        body = UsdGeom.Cube.Define(stage, f"{shell_root}/Body")
+        body.CreateSizeAttr(1.0)
+        body.AddScaleOp().Set(Gf.Vec3f(body_length, body_width, body_height))
+        body.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, shell_lift))
+
+        arm_x = UsdGeom.Capsule.Define(stage, f"{shell_root}/ArmX")
+        arm_x.CreateHeightAttr(arm_span)
+        arm_x.CreateRadiusAttr(arm_radius)
+        arm_x.CreateAxisAttr("X")
+        arm_x.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, shell_lift))
+
+        arm_y = UsdGeom.Capsule.Define(stage, f"{shell_root}/ArmY")
+        arm_y.CreateHeightAttr(arm_span)
+        arm_y.CreateRadiusAttr(arm_radius)
+        arm_y.CreateAxisAttr("Y")
+        arm_y.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, shell_lift))
+
+        rotor_offsets = (
+            (arm_span * 0.5, arm_span * 0.5, shell_lift),
+            (arm_span * 0.5, -arm_span * 0.5, shell_lift),
+            (-arm_span * 0.5, arm_span * 0.5, shell_lift),
+            (-arm_span * 0.5, -arm_span * 0.5, shell_lift),
+        )
+        for idx, rotor_offset in enumerate(rotor_offsets):
+            rotor = UsdGeom.Cylinder.Define(stage, f"{shell_root}/Rotor_{idx}")
+            rotor.CreateHeightAttr(rotor_height)
+            rotor.CreateRadiusAttr(rotor_radius)
+            rotor.CreateAxisAttr("Z")
+            rotor.AddTranslateOp().Set(Gf.Vec3d(*rotor_offset))
+
+        nose = UsdGeom.Cone.Define(stage, f"{shell_root}/Nose")
+        nose.CreateHeightAttr(0.08)
+        nose.CreateRadiusAttr(0.032)
+        nose.CreateAxisAttr("X")
+        nose.AddTranslateOp().Set(Gf.Vec3d(body_length * 0.62, 0.0, shell_lift))
+
+        shell_material = self._create_preview_surface_material(
+            "/World/Looks/DroneRacePlaybackBodyShell",
+            color=(1.00, 0.42, 0.05),
+            emissive=(0.22, 0.08, 0.02),
+            roughness=0.18,
+            metallic=0.05,
+        )
+        self._bind_visual_material_recursive(
+            prim_utils.get_prim_at_path(shell_root), shell_material
+        )
+
+    def _create_preview_surface_material(
+        self,
+        material_path: str,
+        color: tuple[float, float, float],
+        emissive: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        roughness: float = 0.35,
+        metallic: float = 0.0,
+    ):
+        stage = stage_utils.get_current_stage()
+        material = UsdShade.Material.Define(stage, material_path)
+        shader = UsdShade.Shader.Define(stage, f"{material_path}/PreviewSurface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*emissive))
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(metallic))
+        shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(1.0)
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        return material
+
+    def _bind_visual_material_recursive(self, prim, material):
+        if prim is None or not prim.IsValid():
+            return
+        if prim.IsA(UsdGeom.Gprim):
+            UsdShade.MaterialBindingAPI(prim).Bind(
+                material,
+                bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+            )
+        for child in prim.GetChildren():
+            self._bind_visual_material_recursive(child, material)
+
+    def _add_viewer_lights_and_material_overrides(self, gate_prim_paths, drone_prim_paths):
+        if not getattr(self, "enable_viewport", False):
+            return
+
+        stage = stage_utils.get_current_stage()
+        if stage is None:
+            return
+
+        lights_root = "/World/DroneRaceViewerLights"
+        if not prim_utils.is_prim_path_valid(lights_root):
+            prim_utils.define_prim(lights_root, "Xform")
+
+        center = getattr(self, "_track_cam_center_local", np.zeros(3, dtype=np.float64))
+        span = float(getattr(self, "_track_cam_span", 12.0))
+        light_positions = (
+            center + np.array([span * 0.95, -span * 0.40, span * 0.80], dtype=np.float64),
+            center + np.array([-span * 0.80, -span * 0.55, span * 0.72], dtype=np.float64),
+            center + np.array([span * 0.20, span * 0.95, span * 0.78], dtype=np.float64),
+        )
+        light_colors = (
+            (1.00, 0.98, 0.95),
+            (0.92, 0.96, 1.00),
+            (1.00, 1.00, 1.00),
+        )
+        for idx, (pos, color) in enumerate(zip(light_positions, light_colors)):
+            light = UsdLux.SphereLight.Define(stage, f"{lights_root}/SphereLight_{idx}")
+            light.CreateIntensityAttr(65000.0)
+            light.CreateRadiusAttr(max(span * 0.10, 2.0))
+            light.CreateColorAttr(Gf.Vec3f(*color))
+            xform = UsdGeom.Xformable(light.GetPrim())
+            if not xform.GetOrderedXformOps():
+                xform.AddTranslateOp()
+            xform.GetOrderedXformOps()[0].Set(Gf.Vec3d(*pos))
+
+        dome = UsdLux.DomeLight.Define(stage, f"{lights_root}/DomeLight")
+        dome.CreateIntensityAttr(1800.0)
+        dome.CreateColorAttr(Gf.Vec3f(0.92, 0.95, 1.0))
+
+        gate_material = self._create_preview_surface_material(
+            "/World/Looks/DroneRaceGatePlayback",
+            color=(0.88, 0.94, 1.00),
+            emissive=(0.06, 0.08, 0.12),
+            roughness=0.25,
+        )
+        drone_material = self._create_preview_surface_material(
+            "/World/Looks/DroneRaceDronePlayback",
+            color=(1.00, 0.50, 0.08),
+            emissive=(0.18, 0.08, 0.02),
+            roughness=0.20,
+        )
+
+        for gate_prim_path in gate_prim_paths:
+            self._bind_visual_material_recursive(prim_utils.get_prim_at_path(gate_prim_path), gate_material)
+        for drone_prim_path in drone_prim_paths:
+            self._bind_visual_material_recursive(prim_utils.get_prim_at_path(drone_prim_path), drone_material)
 
     def _design_scene(self):
         print("Designing scene")
@@ -484,6 +1046,7 @@ class DroneRaceEnv(IsaacEnv):
         scale = torch.ones(3) * self.gate_scale
         gate_positions_list = []
         gate_orientations_list = []
+        gate_prim_paths = []
         
         # Config-based track: gates defined with positions and yaw angles
         # Sort gate keys to ensure correct order
@@ -524,6 +1087,7 @@ class DroneRaceEnv(IsaacEnv):
             )
             # Make gate static: disable gravity and make kinematic
             gate_prim_path = f"/World/envs/env_0/Gate_{i}"
+            gate_prim_paths.append(gate_prim_path)
             kit_utils.set_nested_rigid_body_properties(
                 gate_prim_path,
                 disable_gravity=True,
@@ -566,7 +1130,24 @@ class DroneRaceEnv(IsaacEnv):
         # Store first gate position as landing target after completing all laps
         self.first_gate_pos = first_gate_pos
         self.first_gate_rot = first_gate_rot
-        self.drone.spawn(translations=[(start_pos[0].item(), start_pos[1].item(), start_pos[2].item())])
+        drone_prims = self.drone.spawn(
+            translations=[(start_pos[0].item(), start_pos[1].item(), start_pos[2].item())],
+            orientations=[(
+                first_gate_rot[0].item(),
+                first_gate_rot[1].item(),
+                first_gate_rot[2].item(),
+                first_gate_rot[3].item(),
+            )],
+        )
+        drone_prim_paths = [prim_utils.get_prim_path(drone_prim) for drone_prim in drone_prims]
+        for drone_prim_path in drone_prim_paths:
+            self._add_visual_playback_body_shell(drone_prim_path)
+            self._add_visual_playback_payload(drone_prim_path)
+        if self.enable_viewport:
+            self._add_viewer_lights_and_material_overrides(
+                gate_prim_paths,
+                drone_prim_paths,
+            )
 
 
         return ["/World/defaultGroundPlane"]
@@ -575,7 +1156,7 @@ class DroneRaceEnv(IsaacEnv):
         # Custom robot state: linear_vel(3) + rotation_matrix_flat(9) + angular_vel(3) = 15
         # Note: linear_vel uses BODY-FRAME velocity (see _build_robot_state).
         robot_state_dim = 3 + 9 + 3  # 15
-        # Observation breakdown (33 total):
+        # Observation breakdown (36 total):
         #   robot_state(15): body_vel(3) + rot_mat(9) + ang_vel(3)
         #   prev_action(4): previous 4-dim action (body rates + thrust); helps learn smooth control
         #   dist_to_gate(1): scalar distance to gate center; pre-computed to avoid policy learning norm()
@@ -583,7 +1164,10 @@ class DroneRaceEnv(IsaacEnv):
         #   next_to_next_gate_pos(3): next-next gate CENTER in next gate's local frame
         #   next_gate_rot_mat_2col(6): gate orientation (x and y axes)
         #   gate_index_normalized(1): position on track [0,1] — required for gate-specific behaviour
-        observation_dim = robot_state_dim + 4 + 1 + 3 + 3 + 6 + 1  # 33
+        #   active_gate_speed_target_norm(1): normalized local speed target for the active gate
+        #   speed_pressure(1): current constrained-speed pressure rho_t
+        #   explore_episode_flag(1): whether this episode is a structured trajectory-search episode
+        observation_dim = robot_state_dim + 4 + 1 + 3 + 3 + 6 + 1 + 1 + 1 + 1  # 36
         self.observation_spec = Composite({
             "agents": {
                 "observation": Unbounded((1, observation_dim), device=self.device),
@@ -675,6 +1259,29 @@ class DroneRaceEnv(IsaacEnv):
             "gate_9_crosses": Unbounded(1),
             "gate_10_crosses": Unbounded(1),
             "gate_11_crosses": Unbounded(1),
+            "gate_12_crosses": Unbounded(1),
+            # Consecutive same-gate repeats ("cheating") per episode.
+            "cheating": Unbounded(1),
+            "cheating_gate_0": Unbounded(1),
+            "cheating_gate_1": Unbounded(1),
+            "cheating_gate_2": Unbounded(1),
+            "cheating_gate_3": Unbounded(1),
+            "cheating_gate_4": Unbounded(1),
+            "cheating_gate_5": Unbounded(1),
+            "cheating_gate_6": Unbounded(1),
+            "cheating_gate_7": Unbounded(1),
+            "cheating_gate_8": Unbounded(1),
+            "cheating_gate_9": Unbounded(1),
+            "cheating_gate_10": Unbounded(1),
+            "cheating_gate_11": Unbounded(1),
+            "cheating_gate_12": Unbounded(1),
+            # Controller diagnostics
+            "controller_speed_pressure": Unbounded(1),
+            "controller_exploration_pressure": Unbounded(1),
+            "controller_collapse_active": Unbounded(1),
+            "controller_explore_episode_flag": Unbounded(1),
+            "controller_active_speed_target_norm": Unbounded(1),
+            "controller_overspeed_fraction": Unbounded(1),
             # Furthest gate reached (max gate index seen before crash/timeout)
             "furthest_gate": Unbounded(1),
             # Distance to gate at episode end (how close drone was when ep terminated)
@@ -726,6 +1333,30 @@ class DroneRaceEnv(IsaacEnv):
             reset_bucket[prev_bucket] = 1
             reset_bucket[random_bucket] = 2
 
+        explore_mask = torch.zeros(n, device=self.device, dtype=torch.bool)
+        self.controller_gate_target_jitter[env_ids] = 0.0
+        if self.curriculum_phase >= 2 and self.controller_explore_episode_rate > 0.0:
+            gate0_start_mask = start_gates == 0
+            if gate0_start_mask.any():
+                explore_draw = torch.rand(n, device=self.device)
+                explore_mask = gate0_start_mask & (
+                    explore_draw < self.controller_explore_episode_rate
+                )
+                if explore_mask.any():
+                    num_explore = int(explore_mask.sum().item())
+                    jitter = torch.empty(
+                        num_explore, self.num_course_gates, device=self.device
+                    ).uniform_(
+                        self.controller_easy_gate_jitter_lo,
+                        self.controller_easy_gate_jitter_hi,
+                    )
+                    jitter *= float(self.controller_exploration_pressure)
+                    for gate_idx in self.controller_hard_gate_indices:
+                        jitter[:, gate_idx] = 0.0
+                    self.controller_gate_target_jitter[
+                        env_ids[explore_mask], :self.num_course_gates
+                    ] = jitter
+
         # Reset gate progress
         self.gate_indices[env_ids] = start_gates
         self.episode_start_gate[env_ids] = start_gates
@@ -740,6 +1371,11 @@ class DroneRaceEnv(IsaacEnv):
         self.stacked_reversal_grace[env_ids] = 0
         self.gates_crossed_this_ep[env_ids] = 0
         self.per_gate_crosses[env_ids] = 0
+        self.last_real_crossed_gate[env_ids] = -1
+        self.repeat_gate_events_this_ep[env_ids] = 0
+        self.repeat_gate_crosses[env_ids] = 0
+        self.controller_explore_episode[env_ids] = explore_mask
+        self.controller_episode_overspeed_acc[env_ids] = 0.0
         self.furthest_gate_this_ep[env_ids] = start_gates
         self.min_altitude_this_ep[env_ids] = float('inf')
         self.mean_altitude_acc[env_ids] = 0.0
@@ -774,10 +1410,20 @@ class DroneRaceEnv(IsaacEnv):
             drone_start_pos_with_agent = drone_start_pos.unsqueeze(1)             # (n, 1, 3)
             env_positions_with_agent = self.envs_positions[env_ids].unsqueeze(1)  # (n, 1, 3)
 
-            self.drone.set_world_poses(
-                drone_start_pos_with_agent + env_positions_with_agent,
-                drone_rot, env_ids
-            )
+            use_usd_pose_reset = bool(self.cfg.get("play_force_usd_pose_reset", False))
+            if use_usd_pose_reset:
+                XFormPrimView.set_world_poses(
+                    self.drone._view,
+                    positions=(drone_start_pos_with_agent + env_positions_with_agent).reshape(-1, 3),
+                    orientations=drone_rot.reshape(-1, 4),
+                    indices=env_ids,
+                    usd=True,
+                )
+            else:
+                self.drone.set_world_poses(
+                    drone_start_pos_with_agent + env_positions_with_agent,
+                    drone_rot, env_ids
+                )
         except Exception as e:
             import traceback
             print("=" * 80)
@@ -843,9 +1489,26 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["mean_altitude"][env_ids] = 0.
         self.stats["min_altitude"][env_ids] = 0.
         self.stats["mean_action_magnitude"][env_ids] = 0.
+        self.stats["cheating"][env_ids] = 0.
+        self.stats["controller_speed_pressure"][env_ids] = float(self.controller_speed_pressure)
+        self.stats["controller_exploration_pressure"][env_ids] = float(self.controller_exploration_pressure)
+        self.stats["controller_collapse_active"][env_ids] = float(self.controller_collapse_active)
+        self.stats["controller_explore_episode_flag"][env_ids] = explore_mask.float().unsqueeze(-1)
+        self.stats["controller_active_speed_target_norm"][env_ids] = 0.
+        self.stats["controller_overspeed_fraction"][env_ids] = 0.
         for gi in range(12):
             self.stats[f"reset_gate_{gi}_pass_ema"][env_ids] = float(self.reset_gate_pass_ema[gi].item())
+        for gi in range(13):
             self.stats[f"gate_{gi}_crosses"][env_ids] = 0.
+            self.stats[f"cheating_gate_{gi}"][env_ids] = 0.
+        if getattr(self, "enable_viewport", False):
+            camera_mode = str(self.cfg.get("play_camera_mode", "track")).lower()
+            if camera_mode == "follow":
+                try:
+                    self.drone.get_state()
+                    self._update_follow_viewport_camera(force=True)
+                except Exception:
+                    pass
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         '''
@@ -869,6 +1532,10 @@ class DroneRaceEnv(IsaacEnv):
         clamped = tensordict[("agents", "action")].clamp(-1.0, 1.0)
         self.effort = clamped
         self.last_action = clamped
+        if getattr(self, "enable_viewport", False):
+            camera_mode = str(self.cfg.get("play_camera_mode", "track")).lower()
+            if camera_mode == "follow":
+                self._update_follow_viewport_camera()
 
     def _build_robot_state(self) -> torch.Tensor:
         """Builds the custom robot state vector used for observations.
@@ -1068,6 +1735,16 @@ class DroneRaceEnv(IsaacEnv):
 
         # Scalar distance to gate center (pre-computed to save the policy from learning norm())
         dist_to_gate_center = next_gate_rpos_world.norm(dim=-1, keepdim=True)  # (N, 1, 1)
+        active_gate_speed_target_norm = (
+            self._get_active_gate_speed_targets()
+            / max(self.controller_speed_budget_v_max, 1e-6)
+        ).unsqueeze(1).unsqueeze(1)
+        speed_pressure_obs = torch.full(
+            (self.num_envs, 1, 1),
+            float(self.controller_speed_pressure),
+            device=self.device,
+        )
+        explore_episode_obs = self.controller_explore_episode.float().view(self.num_envs, 1, 1)
 
         # Build observation
         # All components need to have the agent dimension (middle dimension) to match spec (N, 1, obs_dim)
@@ -1079,9 +1756,12 @@ class DroneRaceEnv(IsaacEnv):
             next_to_next_gate_pos.unsqueeze(1),      # (N, 1, 3)  next-next gate CENTER in next gate frame
             next_gate_rot_mat_2col,                  # (N, 1, 6)  gate orientation
             gate_index_norm,                         # (N, 1, 1)  position on track [0,1]
+            active_gate_speed_target_norm,           # (N, 1, 1)  normalized local speed target
+            speed_pressure_obs,                      # (N, 1, 1)  current constrained-speed pressure
+            explore_episode_obs,                     # (N, 1, 1)  structured exploration-episode flag
         ]
 
-        # Concatenate along last dimension: (N, 1, 33)
+        # Concatenate along last dimension: (N, 1, 36)
         obs = torch.cat(obs, dim=-1)
 
         return TensorDict(
@@ -1137,7 +1817,7 @@ class DroneRaceEnv(IsaacEnv):
             gate_passed_this_step: (N,) bool — True for envs that just passed a gate.
             crossed_gate_idx:      (N,) long — gate index that was just crossed before any
                 target advance. The duplicated lap-closure gate remains `num_course_gates`
-                so downstream logging can exclude it from per-gate accounting.
+                so downstream logging can place it in the dedicated gate-13 bucket.
             gate_index_changed:    (N,) bool — True for envs whose target gate advanced.
             new_gate_center:       (N, 3) — centre of the (possibly new) target gate.
         """
@@ -1276,14 +1956,13 @@ class DroneRaceEnv(IsaacEnv):
         # -----------------------------------------------------------------------
         # ----- ADD YOUR REWARD CODE BELOW (replace the placeholder) -----
 
-        speed_shaping_enabled = self.curriculum_phase >= 1
-        speed_focus_phase = self.curriculum_phase >= 2
+        controller_phase = int(self.curriculum_phase)
+        speed_shaping_enabled = controller_phase >= 1
+        speed_focus_phase = controller_phase >= 2
         disable_dense_shaping = speed_focus_phase and self.phase2_disable_dense_shaping
         speed_phase_weight = 1.0 if speed_shaping_enabled else 0.0
-        current_speed_scale = self.reward_speed_scale_phase2 if speed_focus_phase else self.reward_speed_scale
-        current_speed_target = (
-            self.reward_speed_target_ms_phase2 if speed_focus_phase else self.reward_speed_target_ms
-        )
+        base_speed_scale = self.reward_speed_scale_phase2 if speed_focus_phase else self.reward_speed_scale
+        current_speed_scale = base_speed_scale * float(self.controller_speed_pressure)
         sparse_zone_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         for gate_idx in self.sparse_only_gate_indices:
             sparse_zone_mask |= self.gate_indices == gate_idx
@@ -1339,18 +2018,23 @@ class DroneRaceEnv(IsaacEnv):
         #    Only turns on in phase 1 and stays capped so sparse gate rewards remain dominant.
         lin_vel_world = self.drone.vel[:, 0, :3]  # (N, 3) linear velocity in world frame
         speed_along_racing_line = (lin_vel_world * gate_to_gate_norm).sum(dim=-1).clamp(min=0.0)  # (N,)
+        active_speed_target = self._get_active_gate_speed_targets()
         speed_reward = (
             speed_phase_weight
             * current_speed_scale
-            * speed_along_racing_line.clamp(max=current_speed_target)
+            * torch.minimum(speed_along_racing_line, active_speed_target)
             * self.step_dt
         )
-        speed_reward = torch.where(
-            sparse_zone_mask,
-            torch.zeros_like(speed_reward),
-            speed_reward,
+        overspeed_excess = (speed_along_racing_line - active_speed_target).clamp(min=0.0)
+        overspeed_penalty = (
+            speed_phase_weight
+            * 0.20
+            * self.step_dt
+            * overspeed_excess.pow(2)
+            / active_speed_target.clamp(min=1.0).pow(2)
         )
-        reward += speed_reward
+        speed_reward_total = speed_reward - overspeed_penalty
+        reward += speed_reward_total
 
         # 3. Sparse gate passage bonus.
         gate_reward = self.reward_gate_passage * gate_passed_this_step.float()
@@ -1625,23 +2309,8 @@ class DroneRaceEnv(IsaacEnv):
                 else:
                     self.active_reset_curriculum_gate = -1
 
-        # --- Curriculum phase transition ---
-        # Speed shaping can unlock on the first success, or fall back to the original
-        # accuracy-gated rule when phase_speed_unlock_on_first_success is disabled.
-        frames_in_phase = self.total_frames_counter - self._phase_started_at_frames
-        gate0_completed_any = bool((completed_task & (self.episode_start_gate == 0)).any().item())
-        if self.curriculum_phase == 0:
-            if self.phase_speed_unlock_on_first_success and gate0_completed_any:
-                self.curriculum_phase = 1
-                self._phase_started_at_frames = self.total_frames_counter
-            elif frames_in_phase >= self.curriculum_min_phase_frames and \
-               self.reset_gate_pass_ema[self.phase1_unlock_gate_index].item() >= self.phase1_unlock_gate_pass_rate:
-                self.curriculum_phase = 1
-                self._phase_started_at_frames = self.total_frames_counter
-        elif self.curriculum_phase == 1 and \
-             self.lap_completion_rate_ema >= self.phase2_speed_focus_accuracy_rate:
-            self.curriculum_phase = 2
-            self._phase_started_at_frames = self.total_frames_counter
+        # Curriculum / speed mode phase is now driven externally by the training
+        # controller. The env only tracks the controller-selected phase in stats.
 
         # --- stats ---
         self.stats["truncated"].add_(truncated.float())
@@ -1672,7 +2341,7 @@ class DroneRaceEnv(IsaacEnv):
         penalty_reward = angular_penalty + action_smooth_penalty  # (N,)
         crash_reward = self.reward_crash_scale * crashed.float()  # (N,)
         self.stats["reward_progress"].add_((progress_reward + hard_turn_direction_reward).unsqueeze(-1))
-        self.stats["reward_speed"].add_(speed_reward.unsqueeze(-1))
+        self.stats["reward_speed"].add_(speed_reward_total.unsqueeze(-1))
         self.stats["reward_gates"].add_(gate_reward_total.unsqueeze(-1))
         self.stats["reward_stacked_direction"].add_(stacked_direction_reward.unsqueeze(-1))
         self.stats["reward_stacked_bonus"].add_(stacked_bonus_reward.unsqueeze(-1))
@@ -1686,26 +2355,91 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["mean_ang_rate"].add_((ang_rate_mag.unsqueeze(-1) - self.stats["mean_ang_rate"]) / ep_len.unsqueeze(-1))
         # Angular penalty decay fraction (same scalar for all envs)
         self.stats["ang_penalty_decay_frac"][:] = ang_decay_frac
+        active_speed_target_norm = active_speed_target / max(self.controller_speed_budget_v_max, 1e-6)
+        overspeed_indicator = (overspeed_excess > 0.0).float()
+        self.controller_episode_overspeed_acc.add_(
+            (overspeed_indicator - self.controller_episode_overspeed_acc) / ep_len
+        )
+        self.stats["controller_speed_pressure"][:] = float(self.controller_speed_pressure)
+        self.stats["controller_exploration_pressure"][:] = float(self.controller_exploration_pressure)
+        self.stats["controller_collapse_active"][:] = float(self.controller_collapse_active)
+        self.stats["controller_explore_episode_flag"][:] = self.controller_explore_episode.float().unsqueeze(-1)
+        self.stats["controller_active_speed_target_norm"][:] = active_speed_target_norm.unsqueeze(-1)
+        self.stats["controller_overspeed_fraction"][:] = self.controller_episode_overspeed_acc.unsqueeze(-1)
+
+        active_real_gate_idx = self.gate_indices.remainder(self.num_course_gates)
+        step_counts = torch.bincount(active_real_gate_idx, minlength=self.num_course_gates).float()
+        target_sum = torch.zeros(self.num_course_gates, device=self.device)
+        target_sum.scatter_add_(0, active_real_gate_idx, active_speed_target)
+        overspeed_sum = torch.zeros(self.num_course_gates, device=self.device)
+        overspeed_sum.scatter_add_(0, active_real_gate_idx, overspeed_indicator)
+        self.controller_window_gate_step_count[:self.num_course_gates] += step_counts
+        self.controller_window_gate_target_sum[:self.num_course_gates] += target_sum
+        self.controller_window_gate_overspeed_count[:self.num_course_gates] += overspeed_sum
+        if gate_passed_this_step.any():
+            real_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_course_gates)
+            if real_cross_mask.any():
+                crossed_gate_idx_real = crossed_gate_idx[real_cross_mask]
+                split_sum = torch.zeros(self.num_course_gates, device=self.device)
+                split_count = torch.zeros(self.num_course_gates, device=self.device)
+                exit_speed_sum = torch.zeros(self.num_course_gates, device=self.device)
+                exit_speed_count = torch.zeros(self.num_course_gates, device=self.device)
+                split_sum.scatter_add_(0, crossed_gate_idx_real, self.progress_buf[real_cross_mask].float())
+                split_count.scatter_add_(
+                    0,
+                    crossed_gate_idx_real,
+                    torch.ones_like(self.progress_buf[real_cross_mask].float()),
+                )
+                exit_speed_sum.scatter_add_(0, crossed_gate_idx_real, speed_along_racing_line[real_cross_mask])
+                exit_speed_count.scatter_add_(
+                    0,
+                    crossed_gate_idx_real,
+                    torch.ones_like(speed_along_racing_line[real_cross_mask]),
+                )
+                self.controller_window_gate_split_step_sum[:self.num_course_gates] += split_sum
+                self.controller_window_gate_split_count[:self.num_course_gates] += split_count
+                self.controller_window_gate_exit_speed_sum[:self.num_course_gates] += exit_speed_sum
+                self.controller_window_gate_exit_count[:self.num_course_gates] += exit_speed_count
 
         # --- new rich diagnostics ---
         # Furthest gate reached this episode (max gate index seen)
         self.furthest_gate_this_ep = torch.maximum(self.furthest_gate_this_ep, self.gate_indices)
         self.stats["furthest_gate"][:] = self.furthest_gate_this_ep.float().unsqueeze(1)
 
-        # Per-gate crossing counts (gates 0–11). Keep lap-closure on the duplicated
-        # finish gate out of these stats so the human gate numbers stay unambiguous.
+        # Per-gate crossing counts. Keep a dedicated slot for the duplicated
+        # lap-closure gate so the final return crossing shows up on human gate 13
+        # instead of inflating gate 12.
         if gate_passed_this_step.any():
-            real_gate_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_course_gates)
-            safe_crossed_gate_idx = crossed_gate_idx.clamp(0, self.num_course_gates - 1)
-            per_gate_update = torch.zeros(self.num_envs, 12, device=self.device)
+            logged_gate_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_logged_gates)
+            safe_crossed_gate_idx = crossed_gate_idx.clamp(0, self.num_logged_gates - 1)
+            per_gate_update = torch.zeros(self.num_envs, 13, device=self.device)
             per_gate_update.scatter_add_(
                 1,
                 safe_crossed_gate_idx.unsqueeze(1),
-                real_gate_cross_mask.float().unsqueeze(1)
+                logged_gate_cross_mask.float().unsqueeze(1)
             )
             self.per_gate_crosses += per_gate_update.long()
-        for gi in range(12):
+            repeat_gate_mask = logged_gate_cross_mask & (
+                self.last_real_crossed_gate == safe_crossed_gate_idx
+            )
+            if repeat_gate_mask.any():
+                repeat_gate_update = torch.zeros(self.num_envs, 13, device=self.device)
+                repeat_gate_update.scatter_add_(
+                    1,
+                    safe_crossed_gate_idx.unsqueeze(1),
+                    repeat_gate_mask.float().unsqueeze(1),
+                )
+                self.repeat_gate_crosses += repeat_gate_update.long()
+                self.repeat_gate_events_this_ep += repeat_gate_mask.long()
+            self.last_real_crossed_gate = torch.where(
+                logged_gate_cross_mask,
+                safe_crossed_gate_idx,
+                self.last_real_crossed_gate,
+            )
+        for gi in range(13):
             self.stats[f"gate_{gi}_crosses"][:] = self.per_gate_crosses[:, gi].float().unsqueeze(1)
+            self.stats[f"cheating_gate_{gi}"][:] = self.repeat_gate_crosses[:, gi].float().unsqueeze(1)
+        self.stats["cheating"][:] = self.repeat_gate_events_this_ep.float().unsqueeze(1)
 
         # Curriculum phase (0=accuracy-first, 1=bridge-speed, 2=speed-focus).
         self.stats["curriculum_phase"][:] = float(self.curriculum_phase)

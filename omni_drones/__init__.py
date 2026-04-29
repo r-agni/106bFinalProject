@@ -32,6 +32,33 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), os.path.pardir, "cfg")
 def init_simulation_app(cfg):
     # launch the simulator
     config = {"headless": cfg["headless"], "anti_aliasing": 1}
+    sim_app_keys = (
+        "hide_ui",
+        "active_gpu",
+        "physics_gpu",
+        "multi_gpu",
+        "sync_loads",
+        "width",
+        "height",
+        "window_width",
+        "window_height",
+        "display_options",
+        "subdiv_refinement_level",
+        "renderer",
+        "anti_aliasing",
+        "samples_per_pixel_per_frame",
+        "denoiser",
+        "max_bounces",
+        "max_specular_transmission_bounces",
+        "max_volume_bounces",
+        "open_usd",
+        "livesync_usd",
+        "fast_shutdown",
+        "experience",
+    )
+    for key in sim_app_keys:
+        if key in cfg and cfg[key] is not None:
+            config[key] = cfg[key]
     from isaacsim import SimulationApp
     simulation_app = SimulationApp(config)
     return simulation_app

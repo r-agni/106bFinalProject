@@ -29,7 +29,7 @@ drone_model:
   controller: RateController
 
 total_frames: 800_000_000
-save_interval: 100 
+save_interval: 10  # keep resumes from going too long between checkpoints
 # seed: 0
 
 # Track configuration: config-based track with custom gate positions and orientations
@@ -205,6 +205,54 @@ stacked_reversal_entry_gates: [6, 10]     # elevated stacked gates that transiti
 stacked_reversal_target_gates: [7, 11]    # lower stacked gates that need extra local credit assignment
 stacked_reversal_dist_threshold: 35.0     # allow wider divergence while recovering through the stacked reversal
 stacked_reversal_grace_steps: 220         # suppress distance-crash briefly after entering the stacked reversal window
+
+# Constrained speed-mode controller.
+controller_completion_target: 0.78
+controller_completion_floor: 0.70
+controller_completion_recover: 0.60
+controller_hard_gate_target: 0.82
+controller_final_gate_target: 0.78
+controller_crash_target: 0.40
+controller_crash_recover: 0.60
+controller_speed_up_step: 0.015
+controller_speed_down_step: 0.08
+controller_speed_panic_step: 0.20
+controller_plateau_windows: 8
+controller_plateau_improvement_eps: 0.01
+controller_success_min_for_t20: 32
+controller_explore_episode_rate_max: 0.5
+controller_easy_gate_jitter_lo: -0.05
+controller_easy_gate_jitter_hi: 0.15
+controller_hard_gate_indices: [6, 7, 10, 11]
+controller_final_gate_indices: [10, 11]
+controller_metric_alpha: 0.08              # speed-controller EMA/window smoothing; much faster than the curriculum EMA
+controller_metric_window: 8                # number of recent controller windows used for speed decisions
+controller_stabilize_completion_target: 0.75 # unlock speed mode earlier once gate-0 full-lap completion is solid
+controller_stabilize_hard_gate_target: 0.75  # allow hard-gate stability to trigger speed mode sooner
+controller_stabilize_final_gate_target: 0.75 # allow late-gate stability to trigger speed mode sooner
+controller_stabilize_crash_target: 0.20      # phase-1 unlock requires low crash rate, not just high completion
+controller_phase2_completion_target: 0.84    # once unlocked, keep pushing speed as long as completion stays comfortably high
+controller_phase2_hard_gate_target: 0.86     # preserve stacked-gate quality while minimizing lap time
+controller_phase2_final_gate_target: 0.84    # preserve late-gate quality while minimizing lap time
+controller_phase2_completion_floor: 0.76     # drop below this and immediately back off speed pressure
+controller_phase2_final_gate_floor: 0.78     # late gates are the first collapse signal during high-speed training
+controller_phase2_crash_target: 0.18         # acceptable crash rate while aggressively searching for faster lines
+controller_phase2_crash_recover: 0.28        # panic threshold for high-speed collapse recovery
+controller_phase1_initial_speed_pressure: 0.10 # mild speed pressure as soon as the course is learned
+controller_phase2_initial_speed_pressure: 0.35 # start phase 2 already moving faster instead of ramping from zero
+controller_phase2_speed_up_step: 0.03          # accelerate speed pressure more aggressively in lap-time mode
+controller_phase2_speed_down_step: 0.06        # back off if completion / late-gate quality slips
+controller_phase2_panic_step: 0.18             # hard rollback when high-speed behavior destabilizes
+controller_phase2_plateau_start_pressure: 0.45 # only start structured line-search once speed pressure is meaningfully high
+controller_completion_drop_recover: 0.10       # detect real performance collapses quickly from recent history
+controller_min_phase_frames: 0                 # no extra dwell once the 90%+ stability window is satisfied; unlock speed mode quickly on strong resumes
+speed_budget_a_lat_conservative: 4.5
+speed_budget_a_lat_aggressive: 8.0
+speed_budget_vertical_discount: 0.90
+speed_budget_entry_discount: 0.92
+speed_budget_target_discount: 0.85
+speed_budget_v_min: 3.5
+speed_budget_v_max: 12.0
 
 # Safety / penalty schedule.
 angular_penalty_decay_frames: 100_000_000 # keep angular damping active through the early learning stages

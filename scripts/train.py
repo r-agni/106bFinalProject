@@ -52,6 +52,25 @@ def set_global_reproducibility(seed: int, deterministic: bool = True):
     else:
         torch.use_deterministic_algorithms(False)
 
+
+def _checkpoint_sidecar_path(checkpoint_path: str) -> str:
+    root, ext = os.path.splitext(checkpoint_path)
+    if not ext:
+        ext = ".pt"
+    return f"{root}.trainer{ext}"
+
+
+def _recursive_to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _recursive_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_recursive_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_recursive_to_cpu(v) for v in value)
+    return value
+
 @hydra.main(version_base=None, config_path=".", config_name="train")
 def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
@@ -76,9 +95,11 @@ def main(cfg):
 
     set_global_reproducibility(cfg.seed, deterministic=cfg.get("deterministic", False))
 
-    simulation_app = init_simulation_app(cfg)
+    # Start WandB before Isaac Sim boot so resumed runs appear online even while
+    # extension sync and simulator startup are still in progress.
     run = init_wandb(cfg)
     setproctitle(run.name)
+    simulation_app = init_simulation_app(cfg)
     print(OmegaConf.to_yaml(cfg))
     
     # Save config.yaml early to ensure it's available even if interrupted
@@ -100,10 +121,32 @@ def main(cfg):
     save_config_early()
 
     run.summary["curriculum/phase2_trigger_rule"] = (
-        "phase==1 and gate0-start lap_completion_rate_ema >= phase2_speed_focus_accuracy_rate"
+        "controller-driven: phase==1, stabilize_window stays true, and "
+        "controller_phase2_ready_windows reaches controller_plateau_windows"
     )
     run.summary["curriculum/phase2_trigger_threshold"] = float(
+        cfg.task.get("controller_plateau_windows", 8)
+    )
+    run.summary["curriculum/phase2_accuracy_gate_rule"] = (
+        "legacy heuristic: gate0-start lap_completion_rate_ema >= "
+        "phase2_speed_focus_accuracy_rate"
+    )
+    run.summary["curriculum/phase2_accuracy_gate_threshold"] = float(
         cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
+    )
+    run.summary["gates_helper/lap_closure_bucket_note"] = (
+        "LapClosureHelper is a non-rewardable helper bucket; only G1-G12 are real lap gates."
+    )
+    race_objective_completion_target = 0.90
+    race_objective_lap_time_target_sec = 13.0
+    run.summary["race_objective/target_completion_rate"] = (
+        race_objective_completion_target
+    )
+    run.summary["race_objective/target_lap_time_sec"] = (
+        race_objective_lap_time_target_sec
+    )
+    run.summary["race_objective/goal"] = (
+        ">=90% gate0-start full-lap completion with <=13.0s full-lap time"
     )
     
     # Set up signal handler to ensure config is saved on Ctrl+C
@@ -180,6 +223,58 @@ def main(cfg):
         )
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
+
+    resume_sidecar_state = None
+    loaded_policy_resume_state = {}
+    loaded_trainer_resume_state = {}
+    loaded_env_resume_state = {}
+    if cfg.algo.get("checkpoint_path", None):
+        resume_sidecar_path = _checkpoint_sidecar_path(str(cfg.algo.checkpoint_path))
+        run.summary["resume/sidecar_path"] = resume_sidecar_path
+        if os.path.exists(resume_sidecar_path):
+            try:
+                resume_sidecar_state = torch.load(
+                    resume_sidecar_path, map_location="cpu"
+                )
+                logging.info(
+                    "Loaded trainer sidecar state from %s", resume_sidecar_path
+                )
+                run.summary["resume/sidecar_loaded"] = 1.0
+            except Exception as e:
+                logging.warning(
+                    "Could not load trainer sidecar state from %s: %s",
+                    resume_sidecar_path,
+                    e,
+                )
+                run.summary["resume/sidecar_loaded"] = 0.0
+        else:
+            logging.info("No trainer sidecar state found at %s", resume_sidecar_path)
+            run.summary["resume/sidecar_loaded"] = 0.0
+
+    if isinstance(resume_sidecar_state, dict):
+        if any(
+            key in resume_sidecar_state for key in ("policy", "trainer", "env")
+        ):
+            loaded_policy_resume_state = dict(
+                resume_sidecar_state.get("policy", {}) or {}
+            )
+            loaded_trainer_resume_state = dict(
+                resume_sidecar_state.get("trainer", {}) or {}
+            )
+            loaded_env_resume_state = dict(resume_sidecar_state.get("env", {}) or {})
+        else:
+            loaded_trainer_resume_state = dict(resume_sidecar_state)
+
+    for attr_name, attr_state in loaded_policy_resume_state.items():
+        target = getattr(policy, attr_name, None)
+        if target is None or not hasattr(target, "load_state_dict"):
+            continue
+        try:
+            target.load_state_dict(attr_state)
+        except Exception as e:
+            logging.warning(
+                "Could not restore policy sidecar state for %s: %s", attr_name, e
+            )
 
     adaptive_entropy_cfg = cfg.algo.get("adaptive_entropy", {})
     entropy_controller_enabled = bool(adaptive_entropy_cfg.get("enabled", False))
@@ -343,6 +438,105 @@ def main(cfg):
     controller_completion_recent = deque(maxlen=controller_metric_window)
     controller_gate0_crash_recent = deque(maxlen=controller_metric_window)
     controller_phase_start_frames = 0
+    if loaded_trainer_resume_state:
+        controller_phase = int(
+            loaded_trainer_resume_state.get("controller_phase", controller_phase)
+        )
+        controller_speed_pressure = float(
+            loaded_trainer_resume_state.get(
+                "controller_speed_pressure", controller_speed_pressure
+            )
+        )
+        controller_exploration_pressure = float(
+            loaded_trainer_resume_state.get(
+                "controller_exploration_pressure",
+                controller_exploration_pressure,
+            )
+        )
+        controller_collapse_active = bool(
+            loaded_trainer_resume_state.get(
+                "controller_collapse_active", controller_collapse_active
+            )
+        )
+        controller_completion_ema = float(
+            loaded_trainer_resume_state.get(
+                "controller_completion_ema", controller_completion_ema
+            )
+        )
+        controller_gate0_crash_ema = float(
+            loaded_trainer_resume_state.get(
+                "controller_gate0_crash_ema", controller_gate0_crash_ema
+            )
+        )
+        controller_completion_signal = float(
+            loaded_trainer_resume_state.get(
+                "controller_completion_signal", controller_completion_signal
+            )
+        )
+        controller_crash_signal = float(
+            loaded_trainer_resume_state.get(
+                "controller_crash_signal", controller_crash_signal
+            )
+        )
+        controller_t20_lap_time_sec = loaded_trainer_resume_state.get(
+            "controller_t20_lap_time_sec", controller_t20_lap_time_sec
+        )
+        controller_t20_best_stable_lap_time_sec = loaded_trainer_resume_state.get(
+            "controller_t20_best_stable_lap_time_sec",
+            controller_t20_best_stable_lap_time_sec,
+        )
+        controller_phase2_ready_count = int(
+            loaded_trainer_resume_state.get(
+                "controller_phase2_ready_count", controller_phase2_ready_count
+            )
+        )
+        controller_plateau_count = int(
+            loaded_trainer_resume_state.get(
+                "controller_plateau_count", controller_plateau_count
+            )
+        )
+        controller_phase_start_frames = int(
+            loaded_trainer_resume_state.get(
+                "controller_phase_start_frames", controller_phase_start_frames
+            )
+        )
+        controller_completion_history = deque(
+            [
+                float(v)
+                for v in loaded_trainer_resume_state.get(
+                    "controller_completion_history", []
+                )
+            ],
+            maxlen=controller_completion_history.maxlen,
+        )
+        controller_completion_recent = deque(
+            [
+                float(v)
+                for v in loaded_trainer_resume_state.get(
+                    "controller_completion_recent", []
+                )
+            ],
+            maxlen=controller_metric_window,
+        )
+        controller_gate0_crash_recent = deque(
+            [
+                float(v)
+                for v in loaded_trainer_resume_state.get(
+                    "controller_gate0_crash_recent", []
+                )
+            ],
+            maxlen=controller_metric_window,
+        )
+        current_entropy_coef = float(
+            loaded_trainer_resume_state.get(
+                "current_entropy_coef", current_entropy_coef
+            )
+        )
+        target_entropy_coef = float(
+            loaded_trainer_resume_state.get(
+                "target_entropy_coef", target_entropy_coef
+            )
+        )
     base_env.set_constrained_speed_controller(
         phase=controller_phase,
         speed_pressure=controller_speed_pressure,
@@ -350,6 +544,17 @@ def main(cfg):
         collapse_active=controller_collapse_active,
         entropy_target=target_entropy_coef,
     )
+    if loaded_env_resume_state and hasattr(base_env, "load_resume_state"):
+        base_env.load_resume_state(loaded_env_resume_state)
+        base_env.set_constrained_speed_controller(
+            phase=controller_phase,
+            speed_pressure=controller_speed_pressure,
+            exploration_pressure=controller_exploration_pressure,
+            collapse_active=controller_collapse_active,
+            entropy_target=target_entropy_coef,
+        )
+    if hasattr(policy, "entropy_coef"):
+        policy.entropy_coef = current_entropy_coef
 
     def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, value))
@@ -405,6 +610,35 @@ def main(cfg):
     phase2_started_env_frames = None
     phase2_started_iter = None
     phase2_started_accuracy_ema = None
+    if loaded_trainer_resume_state:
+        logged_curriculum_phase = int(
+            loaded_trainer_resume_state.get(
+                "logged_curriculum_phase", logged_curriculum_phase
+            )
+        )
+        phase2_started_env_frames = loaded_trainer_resume_state.get(
+            "phase2_started_env_frames", phase2_started_env_frames
+        )
+        if phase2_started_env_frames is not None:
+            phase2_started_env_frames = int(phase2_started_env_frames)
+        phase2_started_iter = loaded_trainer_resume_state.get(
+            "phase2_started_iter", phase2_started_iter
+        )
+        if phase2_started_iter is not None:
+            phase2_started_iter = int(phase2_started_iter)
+        phase2_started_accuracy_ema = loaded_trainer_resume_state.get(
+            "phase2_started_accuracy_ema", phase2_started_accuracy_ema
+        )
+        if phase2_started_env_frames is not None:
+            run.summary["curriculum/phase2_started_env_frames"] = (
+                phase2_started_env_frames
+            )
+        if phase2_started_iter is not None:
+            run.summary["curriculum/phase2_started_iter"] = phase2_started_iter
+        if phase2_started_accuracy_ema is not None:
+            run.summary["curriculum/phase2_started_accuracy_ema"] = (
+                phase2_started_accuracy_ema
+            )
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -424,9 +658,80 @@ def main(cfg):
         match = re.search(r"checkpoint_(\d+)\.pt$", os.path.basename(str(cfg.algo.checkpoint_path)))
         if match:
             resume_frame_offset = int(match.group(1))
+    if resume_frame_offset <= 0 and loaded_trainer_resume_state:
+        resume_frame_offset = int(
+            loaded_trainer_resume_state.get("collector_frames", resume_frame_offset)
+        )
     if resume_frame_offset > 0:
         collector._initial_frames = resume_frame_offset
         logging.info("Resuming collector frame count from %s", resume_frame_offset)
+
+    def _capture_policy_resume_state():
+        state = {}
+        for attr_name in (
+            "actor_opt",
+            "critic_opt",
+            "actor_opt_scheduler",
+            "critic_opt_scheduler",
+        ):
+            target = getattr(policy, attr_name, None)
+            if target is None or not hasattr(target, "state_dict"):
+                continue
+            try:
+                state[attr_name] = _recursive_to_cpu(target.state_dict())
+            except Exception as e:
+                logging.warning(
+                    "Could not capture policy sidecar state for %s: %s",
+                    attr_name,
+                    e,
+                )
+        return state
+
+    def _build_resume_bundle():
+        bundle = {
+            "version": 1,
+            "policy": _capture_policy_resume_state(),
+            "trainer": {
+                "collector_frames": int(collector._frames),
+                "controller_phase": int(controller_phase),
+                "controller_speed_pressure": float(controller_speed_pressure),
+                "controller_exploration_pressure": float(
+                    controller_exploration_pressure
+                ),
+                "controller_collapse_active": bool(controller_collapse_active),
+                "controller_completion_ema": float(controller_completion_ema),
+                "controller_gate0_crash_ema": float(controller_gate0_crash_ema),
+                "controller_completion_signal": float(controller_completion_signal),
+                "controller_crash_signal": float(controller_crash_signal),
+                "controller_t20_lap_time_sec": controller_t20_lap_time_sec,
+                "controller_t20_best_stable_lap_time_sec": (
+                    controller_t20_best_stable_lap_time_sec
+                ),
+                "controller_phase2_ready_count": int(controller_phase2_ready_count),
+                "controller_plateau_count": int(controller_plateau_count),
+                "controller_phase_start_frames": int(controller_phase_start_frames),
+                "controller_completion_history": list(controller_completion_history),
+                "controller_completion_recent": list(controller_completion_recent),
+                "controller_gate0_crash_recent": list(
+                    controller_gate0_crash_recent
+                ),
+                "current_entropy_coef": float(current_entropy_coef),
+                "target_entropy_coef": float(target_entropy_coef),
+                "logged_curriculum_phase": int(logged_curriculum_phase),
+                "phase2_started_env_frames": phase2_started_env_frames,
+                "phase2_started_iter": phase2_started_iter,
+                "phase2_started_accuracy_ema": phase2_started_accuracy_ema,
+            },
+        }
+        if hasattr(base_env, "get_resume_state"):
+            bundle["env"] = _recursive_to_cpu(base_env.get_resume_state())
+        return _recursive_to_cpu(bundle)
+
+    def _save_checkpoint_bundle(checkpoint_path: str):
+        torch.save(policy.state_dict(), checkpoint_path)
+        sidecar_path = _checkpoint_sidecar_path(checkpoint_path)
+        torch.save(_build_resume_bundle(), sidecar_path)
+        return sidecar_path
 
     @torch.no_grad()
     def evaluate(
@@ -646,6 +951,12 @@ def main(cfg):
                 derived["simple/full_course_completion_time_sec_fastest"] = 0.0
                 derived["simple/full_course_completion_mean_speed_ms"] = 0.0
                 derived["simple/full_course_completion_peak_speed_ms"] = 0.0
+                derived["race_objective/target_completion_rate"] = (
+                    race_objective_completion_target
+                )
+                derived["race_objective/target_lap_time_sec"] = (
+                    race_objective_lap_time_target_sec
+                )
                 effective_lap_time = lap_time
                 if effective_lap_time is None and success_rate and success_rate > 0:
                     effective_lap_time = lap_time_all
@@ -662,6 +973,15 @@ def main(cfg):
                     if task_success_rate is not None:
                         derived["simple/full_course_completion_rate"] = task_success_rate
                         derived["simple/full_course_completion_pct"] = 100.0 * task_success_rate
+                        derived["race_objective/full_lap_completion_rate"] = (
+                            task_success_rate
+                        )
+                        derived["race_objective/full_lap_completion_margin"] = (
+                            task_success_rate - race_objective_completion_target
+                        )
+                        derived["race_objective/full_lap_completion_goal_met"] = float(
+                            task_success_rate >= race_objective_completion_target
+                        )
                     if task_ep_len is not None:
                         derived["simple/episode_time_sec"] = task_ep_len * cfg.sim.dt * cfg.sim.substeps
                 if gate0_success_count > 0 and task_completion_time_steps is not None:
@@ -670,6 +990,15 @@ def main(cfg):
                     derived["simple/completion_time_sec_mean"] = completion_time_sec_mean
                     derived["simple/full_course_completion_time_steps_mean"] = task_completion_time_steps
                     derived["simple/full_course_completion_time_sec_mean"] = completion_time_sec_mean
+                    derived["race_objective/full_lap_time_sec_mean"] = (
+                        completion_time_sec_mean
+                    )
+                    derived["race_objective/full_lap_time_margin_to_13s"] = (
+                        race_objective_lap_time_target_sec - completion_time_sec_mean
+                    )
+                    derived["race_objective/full_lap_time_goal_met"] = float(
+                        completion_time_sec_mean <= race_objective_lap_time_target_sec
+                    )
                 if gate0_success_count > 0 and task_completion_time_steps_fastest is not None:
                     completion_time_sec_fastest = (
                         task_completion_time_steps_fastest * cfg.sim.dt * cfg.sim.substeps
@@ -680,10 +1009,23 @@ def main(cfg):
                     derived["simple/full_course_completion_time_sec_fastest"] = (
                         completion_time_sec_fastest
                     )
+                    derived["race_objective/full_lap_time_sec_fastest"] = (
+                        completion_time_sec_fastest
+                    )
                 if gate0_success_count > 0 and task_success_mean_speed is not None:
                     derived["simple/full_course_completion_mean_speed_ms"] = task_success_mean_speed
                 if gate0_success_count > 0 and task_success_peak_speed is not None:
                     derived["simple/full_course_completion_peak_speed_ms"] = task_success_peak_speed
+                if (
+                    "race_objective/full_lap_completion_rate" in derived
+                    and "race_objective/full_lap_time_sec_mean" in derived
+                ):
+                    derived["race_objective/goal_met"] = float(
+                        derived["race_objective/full_lap_completion_rate"]
+                        >= race_objective_completion_target
+                        and derived["race_objective/full_lap_time_sec_mean"]
+                        <= race_objective_lap_time_target_sec
+                    )
                 if cheating_rate is not None:
                     derived["simple/cheating"] = cheating_rate
                     derived["cheating/episode_rate"] = cheating_rate
@@ -756,20 +1098,24 @@ def main(cfg):
                 if curriculum_accuracy is not None: derived["curriculum/accuracy_ema"] = curriculum_accuracy
                 if curriculum_furthest is not None: derived["curriculum/furthest_gate_ema"] = curriculum_furthest
                 derived["curriculum/speed_focus_accuracy_rate"] = cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
-                phase2_threshold = float(cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40))
+                phase2_accuracy_threshold = float(
+                    cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
+                )
                 if curriculum_phase is not None:
                     current_phase = int(round(float(curriculum_phase)))
                     phase2_active = current_phase >= 2
                     phase2_just_unlocked = logged_curriculum_phase < 2 <= current_phase
                     derived["curriculum/phase2_active"] = float(phase2_active)
                     derived["curriculum/phase2_just_unlocked"] = float(phase2_just_unlocked)
-                    derived["curriculum/phase2_trigger_threshold"] = phase2_threshold
                     if curriculum_accuracy is not None:
-                        derived["curriculum/phase2_trigger_met"] = float(
-                            curriculum_accuracy >= phase2_threshold
+                        derived["curriculum/phase2_accuracy_gate_threshold"] = (
+                            phase2_accuracy_threshold
                         )
-                        derived["curriculum/phase2_accuracy_margin"] = (
-                            curriculum_accuracy - phase2_threshold
+                        derived["curriculum/phase2_accuracy_gate_met"] = float(
+                            curriculum_accuracy >= phase2_accuracy_threshold
+                        )
+                        derived["curriculum/phase2_accuracy_gate_margin"] = (
+                            curriculum_accuracy - phase2_accuracy_threshold
                         )
                     if phase2_just_unlocked:
                         phase2_started_env_frames = int(collector._frames)
@@ -787,11 +1133,10 @@ def main(cfg):
                             )
                         logging.info(
                             "Curriculum entered phase 2 at env_frames=%s iteration=%s "
-                            "accuracy_ema=%s threshold=%s",
+                            "accuracy_ema=%s after the controller unlock rule was satisfied",
                             phase2_started_env_frames,
                             phase2_started_iter,
                             phase2_started_accuracy_ema,
-                            phase2_threshold,
                         )
                     if phase2_started_env_frames is not None:
                         derived["curriculum/phase2_started_env_frames"] = float(
@@ -1139,19 +1484,61 @@ def main(cfg):
                 derived["controller/phase2_ready_windows"] = float(
                     controller_phase2_ready_count
                 )
-                derived["controller/plateau_windows"] = float(controller_plateau_count)
+                derived["controller/plateau_count"] = float(controller_plateau_count)
+                derived["controller/plateau_windows"] = float(controller_plateau_windows)
                 derived["controller/min_phase_frames"] = float(controller_min_phase_frames)
                 derived["controller/stabilize_completion_target"] = (
                     controller_stabilize_completion_target
                 )
+                derived["controller/stabilize_hard_gate_target"] = (
+                    controller_stabilize_hard_gate_target
+                )
+                derived["controller/stabilize_final_gate_target"] = (
+                    controller_stabilize_final_gate_target
+                )
+                derived["controller/stabilize_crash_target"] = (
+                    controller_stabilize_crash_target
+                )
                 derived["controller/phase2_completion_target"] = (
                     controller_phase2_completion_target
+                )
+                derived["controller/phase2_hard_gate_target"] = (
+                    controller_phase2_hard_gate_target
+                )
+                derived["controller/phase2_final_gate_target"] = (
+                    controller_phase2_final_gate_target
                 )
                 derived["controller/phase2_completion_floor"] = (
                     controller_phase2_completion_floor
                 )
+                derived["controller/phase2_crash_target"] = (
+                    controller_phase2_crash_target
+                )
+                derived["curriculum/phase2_trigger_met"] = float(
+                    controller_phase >= 2
+                )
+                derived["curriculum/phase2_trigger_threshold"] = float(
+                    controller_plateau_windows
+                )
+                derived["curriculum/phase2_trigger_ready_window"] = float(
+                    phase2_ready_window
+                )
+                derived["curriculum/phase2_trigger_ready_windows"] = float(
+                    controller_phase2_ready_count
+                )
                 if controller_t20_lap_time_sec is not None:
                     derived["controller/t20_lap_time_sec"] = controller_t20_lap_time_sec
+                    derived["race_objective/t20_lap_time_sec"] = (
+                        controller_t20_lap_time_sec
+                    )
+                    derived["race_objective/t20_lap_time_margin_to_13s"] = (
+                        race_objective_lap_time_target_sec
+                        - controller_t20_lap_time_sec
+                    )
+                    derived["race_objective/t20_goal_met"] = float(
+                        controller_t20_lap_time_sec
+                        <= race_objective_lap_time_target_sec
+                    )
                 if controller_t20_best_stable_lap_time_sec is not None:
                     derived["controller/t20_best_stable_lap_time_sec"] = (
                         controller_t20_best_stable_lap_time_sec
@@ -1192,26 +1579,55 @@ def main(cfg):
                         controller_window_metrics["gate_exit_speed_ms"][gi]
                     )
 
-                # Per-gate crossing heatmap data — log as individual metrics for WandB bar chart
-                for gi in range(13):
+                logged_gate_count = max(
+                    int(getattr(base_env, "num_logged_gates", controller_gate_count)),
+                    controller_gate_count,
+                )
+
+                # Per-gate crossing heatmap data — log the real race gates as the
+                # human-facing sequence and keep the extra lap-closure helper in a
+                # dedicated helper namespace to avoid implying a 13th rewardable gate.
+                for gi in range(logged_gate_count):
                     v = _mean(f"gate_{gi}_crosses")
                     if v is not None:
                         derived[f"gates/gate_{gi:02d}_crosses"] = v
-                        derived[f"gates_human/gate_{gi + 1:02d}_crosses"] = v
+                        if gi < controller_gate_count:
+                            derived[f"gates_human/gate_{gi + 1:02d}_crosses"] = v
+                        else:
+                            derived["gates_helper/lap_closure_crosses"] = v
 
                 # WandB bar chart for per-gate distribution
-                gate_counts = [_mean(f"gate_{gi}_crosses") or 0.0 for gi in range(13)]
-                gate_labels = [f"G{gi + 1}" for gi in range(13)]
-                gate_table = wandb.Table(columns=["gate", "mean_crosses"], data=[[label, val] for label, val in zip(gate_labels, gate_counts)])
-                derived["gates/crossing_distribution"] = wandb.plot.bar(gate_table, "gate", "mean_crosses", title="Gate Crossing Distribution")
+                gate_counts = [
+                    _mean(f"gate_{gi}_crosses") or 0.0 for gi in range(logged_gate_count)
+                ]
+                gate_labels = [
+                    f"G{gi + 1}" if gi < controller_gate_count else "LapCloseHelper"
+                    for gi in range(logged_gate_count)
+                ]
+                gate_table = wandb.Table(
+                    columns=["gate", "mean_crosses"],
+                    data=[[label, val] for label, val in zip(gate_labels, gate_counts)],
+                )
+                derived["gates/crossing_distribution"] = wandb.plot.bar(
+                    gate_table,
+                    "gate",
+                    "mean_crosses",
+                    title="Gate Crossing Distribution",
+                )
 
-                for gi in range(13):
+                for gi in range(logged_gate_count):
                     v = _mean(f"cheating_gate_{gi}")
                     if v is not None:
                         derived[f"cheating/gate_{gi:02d}_repeat_events"] = v
-                        derived[f"cheating_human/gate_{gi + 1:02d}_repeat_events"] = v
+                        if gi < controller_gate_count:
+                            derived[f"cheating_human/gate_{gi + 1:02d}_repeat_events"] = v
+                        else:
+                            derived["cheating_helper/lap_closure_repeat_events"] = v
 
-                cheating_gate_counts = [_mean(f"cheating_gate_{gi}") or 0.0 for gi in range(13)]
+                cheating_gate_counts = [
+                    _mean(f"cheating_gate_{gi}") or 0.0
+                    for gi in range(logged_gate_count)
+                ]
                 cheating_gate_table = wandb.Table(
                     columns=["gate", "repeat_events"],
                     data=[[label, val] for label, val in zip(gate_labels, cheating_gate_counts)],
@@ -1287,8 +1703,12 @@ def main(cfg):
             if save_interval > 0 and i % save_interval == 0:
                 try:
                     ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
-                    torch.save(policy.state_dict(), ckpt_path)
-                    logging.info(f"Saved checkpoint to {str(ckpt_path)}")
+                    sidecar_path = _save_checkpoint_bundle(ckpt_path)
+                    logging.info(
+                        "Saved checkpoint to %s and trainer state to %s",
+                        str(ckpt_path),
+                        str(sidecar_path),
+                    )
                 except AttributeError:
                     logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
@@ -1316,7 +1736,7 @@ def main(cfg):
 
         try:
             ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
-            torch.save(policy.state_dict(), ckpt_path)
+            sidecar_path = _save_checkpoint_bundle(ckpt_path)
 
             model_artifact = wandb.Artifact(
                 f"{cfg.task.name}-{cfg.algo.name.lower()}",
@@ -1325,10 +1745,16 @@ def main(cfg):
                 metadata=dict(cfg))
 
             model_artifact.add_file(ckpt_path)
+            model_artifact.add_file(sidecar_path)
             wandb.save(ckpt_path)
+            wandb.save(sidecar_path)
             run.log_artifact(model_artifact)
 
-            logging.info(f"Saved checkpoint to {str(ckpt_path)}")
+            logging.info(
+                "Saved checkpoint to %s and trainer state to %s",
+                str(ckpt_path),
+                str(sidecar_path),
+            )
         except AttributeError:
             logging.warning(f"Policy {policy} does not implement `.state_dict()`")
     except BaseException as e:

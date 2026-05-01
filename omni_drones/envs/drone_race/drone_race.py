@@ -623,6 +623,79 @@ class DroneRaceEnv(IsaacEnv):
             )
         )
 
+    def get_resume_state(self):
+        return {
+            "curriculum_phase": int(self.curriculum_phase),
+            "lap_completion_rate_ema": float(self.lap_completion_rate_ema),
+            "furthest_gate_ema": float(self.furthest_gate_ema),
+            "phase_started_at_frames": int(self._phase_started_at_frames),
+            "reset_gate_pass_ema": self.reset_gate_pass_ema.detach().cpu(),
+            "active_reset_curriculum_gate": int(self.active_reset_curriculum_gate),
+            "controller_speed_pressure": float(self.controller_speed_pressure),
+            "controller_exploration_pressure": float(
+                self.controller_exploration_pressure
+            ),
+            "controller_collapse_active": bool(self.controller_collapse_active),
+            "controller_entropy_target": float(self.controller_entropy_target),
+        }
+
+    def load_resume_state(self, state):
+        if not isinstance(state, dict):
+            return
+
+        reset_gate_pass_ema = state.get("reset_gate_pass_ema")
+        if reset_gate_pass_ema is not None:
+            reset_gate_pass_ema = torch.as_tensor(
+                reset_gate_pass_ema,
+                device=self.device,
+                dtype=self.reset_gate_pass_ema.dtype,
+            ).flatten()
+            loaded_count = min(
+                reset_gate_pass_ema.numel(), self.reset_gate_pass_ema.numel()
+            )
+            if loaded_count > 0:
+                self.reset_gate_pass_ema[:loaded_count] = (
+                    reset_gate_pass_ema[:loaded_count]
+                )
+
+        self.lap_completion_rate_ema = float(
+            state.get("lap_completion_rate_ema", self.lap_completion_rate_ema)
+        )
+        self.furthest_gate_ema = float(
+            state.get("furthest_gate_ema", self.furthest_gate_ema)
+        )
+        self._phase_started_at_frames = int(
+            state.get("phase_started_at_frames", self._phase_started_at_frames)
+        )
+        active_reset_gate = int(
+            state.get(
+                "active_reset_curriculum_gate", self.active_reset_curriculum_gate
+            )
+        )
+        self.active_reset_curriculum_gate = int(
+            np.clip(active_reset_gate, -1, self.num_course_gates - 1)
+        )
+        self.set_constrained_speed_controller(
+            phase=int(state.get("curriculum_phase", self.curriculum_phase)),
+            speed_pressure=float(
+                state.get("controller_speed_pressure", self.controller_speed_pressure)
+            ),
+            exploration_pressure=float(
+                state.get(
+                    "controller_exploration_pressure",
+                    self.controller_exploration_pressure,
+                )
+            ),
+            collapse_active=bool(
+                state.get(
+                    "controller_collapse_active", self.controller_collapse_active
+                )
+            ),
+            entropy_target=float(
+                state.get("controller_entropy_target", self.controller_entropy_target)
+            ),
+        )
+
     def _get_controller_base_gate_targets(self):
         targets = torch.zeros(12, device=self.device)
         if self.curriculum_phase < 1:
@@ -1140,10 +1213,13 @@ class DroneRaceEnv(IsaacEnv):
             )],
         )
         drone_prim_paths = [prim_utils.get_prim_path(drone_prim) for drone_prim in drone_prims]
-        for drone_prim_path in drone_prim_paths:
-            self._add_visual_playback_body_shell(drone_prim_path)
-            self._add_visual_playback_payload(drone_prim_path)
         if self.enable_viewport:
+            # Playback shells are viewer-only decoration. Keeping them out of
+            # headless training avoids multiplying non-essential scene prims
+            # across every cloned environment.
+            for drone_prim_path in drone_prim_paths:
+                self._add_visual_playback_body_shell(drone_prim_path)
+                self._add_visual_playback_payload(drone_prim_path)
             self._add_viewer_lights_and_material_overrides(
                 gate_prim_paths,
                 drone_prim_paths,
@@ -2264,6 +2340,45 @@ class DroneRaceEnv(IsaacEnv):
         completed_task = self.track_completed
         done = truncated | completed_task.unsqueeze(-1) | crashed.unsqueeze(-1)
 
+        # Record gate-cross diagnostics before any terminal EMA updates so the
+        # final gate on a completed lap is visible to the curriculum/controller
+        # metrics in the same step that ends the episode.
+        if gate_passed_this_step.any():
+            logged_gate_cross_mask = gate_passed_this_step & (
+                crossed_gate_idx < self.num_logged_gates
+            )
+            safe_crossed_gate_idx = crossed_gate_idx.clamp(
+                0, self.per_gate_crosses.shape[1] - 1
+            )
+            per_gate_update = torch.zeros_like(self.per_gate_crosses)
+            per_gate_update.scatter_add_(
+                1,
+                safe_crossed_gate_idx.unsqueeze(1),
+                logged_gate_cross_mask.long().unsqueeze(1),
+            )
+            self.per_gate_crosses += per_gate_update
+            repeat_gate_mask = logged_gate_cross_mask & (
+                self.last_real_crossed_gate == safe_crossed_gate_idx
+            )
+            if repeat_gate_mask.any():
+                repeat_gate_update = torch.zeros_like(self.repeat_gate_crosses)
+                repeat_gate_update.scatter_add_(
+                    1,
+                    safe_crossed_gate_idx.unsqueeze(1),
+                    repeat_gate_mask.long().unsqueeze(1),
+                )
+                self.repeat_gate_crosses += repeat_gate_update
+                self.repeat_gate_events_this_ep += repeat_gate_mask.long()
+            self.last_real_crossed_gate = torch.where(
+                logged_gate_cross_mask,
+                safe_crossed_gate_idx,
+                self.last_real_crossed_gate,
+            )
+
+        self.furthest_gate_this_ep = torch.maximum(
+            self.furthest_gate_this_ep, self.gate_indices
+        )
+
         # --- Accuracy-first curriculum EMA update ---
         # On each episode termination, update the rolling averages used to decide when
         # to enable speed shaping. The unlock metric is full ordered-lap completion rate.
@@ -2403,39 +2518,7 @@ class DroneRaceEnv(IsaacEnv):
 
         # --- new rich diagnostics ---
         # Furthest gate reached this episode (max gate index seen)
-        self.furthest_gate_this_ep = torch.maximum(self.furthest_gate_this_ep, self.gate_indices)
         self.stats["furthest_gate"][:] = self.furthest_gate_this_ep.float().unsqueeze(1)
-
-        # Per-gate crossing counts. Keep a dedicated slot for the duplicated
-        # lap-closure gate so the final return crossing shows up on human gate 13
-        # instead of inflating gate 12.
-        if gate_passed_this_step.any():
-            logged_gate_cross_mask = gate_passed_this_step & (crossed_gate_idx < self.num_logged_gates)
-            safe_crossed_gate_idx = crossed_gate_idx.clamp(0, self.num_logged_gates - 1)
-            per_gate_update = torch.zeros(self.num_envs, 13, device=self.device)
-            per_gate_update.scatter_add_(
-                1,
-                safe_crossed_gate_idx.unsqueeze(1),
-                logged_gate_cross_mask.float().unsqueeze(1)
-            )
-            self.per_gate_crosses += per_gate_update.long()
-            repeat_gate_mask = logged_gate_cross_mask & (
-                self.last_real_crossed_gate == safe_crossed_gate_idx
-            )
-            if repeat_gate_mask.any():
-                repeat_gate_update = torch.zeros(self.num_envs, 13, device=self.device)
-                repeat_gate_update.scatter_add_(
-                    1,
-                    safe_crossed_gate_idx.unsqueeze(1),
-                    repeat_gate_mask.float().unsqueeze(1),
-                )
-                self.repeat_gate_crosses += repeat_gate_update.long()
-                self.repeat_gate_events_this_ep += repeat_gate_mask.long()
-            self.last_real_crossed_gate = torch.where(
-                logged_gate_cross_mask,
-                safe_crossed_gate_idx,
-                self.last_real_crossed_gate,
-            )
         for gi in range(13):
             self.stats[f"gate_{gi}_crosses"][:] = self.per_gate_crosses[:, gi].float().unsqueeze(1)
             self.stats[f"cheating_gate_{gi}"][:] = self.repeat_gate_crosses[:, gi].float().unsqueeze(1)

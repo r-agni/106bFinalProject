@@ -242,6 +242,15 @@ class DroneRaceEnv(IsaacEnv):
         self.hard_turn_corridor_height = float(
             cfg.task.get("hard_turn_corridor_height", self.gate_height * 2.0)
         )
+        self.reward_hard_turn_wrong_side_scale = float(
+            cfg.task.get("reward_hard_turn_wrong_side_scale", 0.0)
+        )
+        self.hard_turn_wrong_side_x_min = float(
+            cfg.task.get("hard_turn_wrong_side_x_min", 0.25)
+        )
+        self.hard_turn_wrong_side_x_max = float(
+            cfg.task.get("hard_turn_wrong_side_x_max", 3.0)
+        )
         self.hard_turn_penalty_scale = float(
             cfg.task.get("hard_turn_penalty_scale", 1.0)
         )
@@ -810,6 +819,10 @@ class DroneRaceEnv(IsaacEnv):
         c = self._track_cam_center_local + central
         span = float(self._track_cam_span)
         camera_mode = str(self.cfg.get("play_camera_mode", "track")).lower()
+        if camera_mode == "fixed":
+            # Respect cfg.viewer.eye/lookat from IsaacEnv without applying the
+            # course-framing camera override.
+            return
         if camera_mode == "follow":
             self._update_follow_viewport_camera(force=True)
             return
@@ -2189,6 +2202,31 @@ class DroneRaceEnv(IsaacEnv):
         if disable_dense_shaping:
             hard_turn_direction_reward = torch.zeros_like(hard_turn_direction_reward)
         reward += hard_turn_direction_reward
+
+        # Penalize backside approaches through the gate aperture. The crossing test
+        # already enforces correct direction, but this teaches the policy not to
+        # loop onto the exit side and try to recover through the gate backward.
+        hard_turn_wrong_side_mask = (
+            hard_turn_target_mask
+            & (~gate_index_changed)
+            & (current_gate_local[:, 0] >= self.hard_turn_wrong_side_x_min)
+            & (current_gate_local[:, 0] <= self.hard_turn_wrong_side_x_max)
+            & (current_gate_local[:, 1].abs() <= self.gate_width)
+            & (current_gate_local[:, 2].abs() <= self.gate_height)
+        )
+        hard_turn_wrong_side_penalty = torch.where(
+            hard_turn_wrong_side_mask,
+            self.reward_hard_turn_wrong_side_scale
+            * current_gate_local[:, 0].clamp(
+                min=0.0, max=self.hard_turn_wrong_side_x_max
+            ),
+            torch.zeros_like(current_gate_local[:, 0]),
+        )
+        if disable_dense_shaping:
+            hard_turn_wrong_side_penalty = torch.zeros_like(
+                hard_turn_wrong_side_penalty
+            )
+        reward -= hard_turn_wrong_side_penalty
 
         # 6. Altitude mismatch penalty.
         #    Race track has two elevated gates (z=3.0) at gates 7 and 11. The path-projection

@@ -61,8 +61,8 @@ class DroneRaceEnv(IsaacEnv):
       position is **not** included.
     - `next_gate_rpos` (3): The relative position of the next gate to the drone in the drone's local frame.
     - `next_to_next_gate_pos` (3): The position of the gate after the immediate next gate, expressed in
-      the next gate's local frame. When the immediate next gate is the last real lap gate, this wraps
-      back to gate 0 so the policy still sees the lap-closure turn.
+      the next gate's local frame. When the immediate next gate is the finish-line gate, this wraps
+      back to gate 0 so the policy still sees the next-lap opening turn.
     - `next_gate_rot_mat_2col` (6): The first two columns of the next gate's rotation matrix in the world frame
       (i.e. the gate's local x- and y-axes expressed in world coordinates), flattened to a 6-vector.
 
@@ -203,7 +203,11 @@ class DroneRaceEnv(IsaacEnv):
             self.gate_spacing = cfg.task.gate_spacing
             self.gate_height = cfg.task.gate_height
             self.track_type = "circular"
-        self.num_course_gates = max(min(self.num_gates - 1, 12), 1)
+        # All configured gates are part of the ordered lap. On the 13-gate
+        # YAML race track, gate 13 is the finish line and must be crossed
+        # before the episode is marked successful.
+        self.num_logged_gates = max(min(self.num_gates, 13), 1)
+        self.num_course_gates = max(min(self.num_gates, self.num_logged_gates), 1)
         self.phase1_unlock_gate_index = int(
             cfg.task.get("phase1_unlock_gate_index", min(5, self.num_course_gates - 1))
         )
@@ -254,7 +258,6 @@ class DroneRaceEnv(IsaacEnv):
         self.hard_turn_penalty_scale = float(
             cfg.task.get("hard_turn_penalty_scale", 1.0)
         )
-        self.num_logged_gates = max(min(self.num_gates, 13), 1)
         default_hard_gates = (6, 7, 10, 11)
         default_final_gates = (10, 11)
         self.controller_completion_target = float(cfg.task.get("controller_completion_target", 0.78))
@@ -356,8 +359,8 @@ class DroneRaceEnv(IsaacEnv):
         self.crash_grace_steps = int(cfg.task.get("crash_grace_steps", 100))
         self.stacked_reversal_grace = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.gates_crossed_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        # Per-gate crossing counters (13 gates total on this track, including the
-        # duplicated lap-closure gate 13 at the same pose as gate 1).
+        # Per-gate crossing counters for the full ordered lap. On the race YAML,
+        # gate 13 shares gate 1's pose and acts as the real finish line.
         self.per_gate_crosses = torch.zeros(self.num_envs, 13, device=self.device, dtype=torch.long)
         # Consecutive same-gate repeat detection ("cheating"): how often the same
         # logged gate bucket is reported on back-to-back successful gate-cross events.
@@ -372,7 +375,7 @@ class DroneRaceEnv(IsaacEnv):
         )
         self.episode_start_gate = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.episode_reset_bucket = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.reset_gate_pass_ema = torch.ones(12, device=self.device)
+        self.reset_gate_pass_ema = torch.ones(self.num_course_gates, device=self.device)
         self.active_reset_curriculum_gate = -1
         # Furthest gate index reached this episode
         self.furthest_gate_this_ep = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -391,19 +394,39 @@ class DroneRaceEnv(IsaacEnv):
             self.num_envs, device=self.device, dtype=torch.bool
         )
         self.controller_gate_target_jitter = torch.zeros(
-            self.num_envs, 12, device=self.device
+            self.num_envs, self.num_course_gates, device=self.device
         )
-        self.controller_gate_speed_budget_cons = torch.zeros(12, device=self.device)
-        self.controller_gate_speed_budget_aggr = torch.zeros(12, device=self.device)
-        self.controller_gate_is_hard = torch.zeros(12, device=self.device, dtype=torch.bool)
+        self.controller_gate_speed_budget_cons = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
+        self.controller_gate_speed_budget_aggr = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
+        self.controller_gate_is_hard = torch.zeros(
+            self.num_course_gates, device=self.device, dtype=torch.bool
+        )
         self.controller_episode_overspeed_acc = torch.zeros(self.num_envs, device=self.device)
-        self.controller_window_gate_step_count = torch.zeros(12, device=self.device)
-        self.controller_window_gate_target_sum = torch.zeros(12, device=self.device)
-        self.controller_window_gate_overspeed_count = torch.zeros(12, device=self.device)
-        self.controller_window_gate_split_step_sum = torch.zeros(12, device=self.device)
-        self.controller_window_gate_split_count = torch.zeros(12, device=self.device)
-        self.controller_window_gate_exit_speed_sum = torch.zeros(12, device=self.device)
-        self.controller_window_gate_exit_count = torch.zeros(12, device=self.device)
+        self.controller_window_gate_step_count = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
+        self.controller_window_gate_target_sum = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
+        self.controller_window_gate_overspeed_count = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
+        self.controller_window_gate_split_step_sum = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
+        self.controller_window_gate_split_count = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
+        self.controller_window_gate_exit_speed_sum = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
+        self.controller_window_gate_exit_count = torch.zeros(
+            self.num_course_gates, device=self.device
+        )
         self._build_controller_speed_budget_tables()
         for gate_idx in self.controller_hard_gate_indices:
             self.controller_gate_is_hard[gate_idx] = True
@@ -503,8 +526,8 @@ class DroneRaceEnv(IsaacEnv):
         return float(ab_norm * bc_norm * ac_norm / max(4.0 * area, 1e-9))
 
     def _build_controller_speed_budget_tables(self):
-        cons = torch.zeros(12, device=self.device)
-        aggr = torch.zeros(12, device=self.device)
+        cons = torch.zeros(self.num_course_gates, device=self.device)
+        aggr = torch.zeros(self.num_course_gates, device=self.device)
         if self.track_config is None:
             cons[:self.num_course_gates] = float(self.reward_speed_target_ms)
             aggr[:self.num_course_gates] = max(
@@ -588,7 +611,7 @@ class DroneRaceEnv(IsaacEnv):
             "gate_split_time_steps": [],
             "gate_exit_speed_ms": [],
         }
-        for gate_idx in range(12):
+        for gate_idx in range(self.num_course_gates):
             step_count = float(self.controller_window_gate_step_count[gate_idx].item())
             split_count = float(self.controller_window_gate_split_count[gate_idx].item())
             exit_count = float(self.controller_window_gate_exit_count[gate_idx].item())
@@ -706,7 +729,7 @@ class DroneRaceEnv(IsaacEnv):
         )
 
     def _get_controller_base_gate_targets(self):
-        targets = torch.zeros(12, device=self.device)
+        targets = torch.zeros(self.num_course_gates, device=self.device)
         if self.curriculum_phase < 1:
             return targets
         delta = self.controller_gate_speed_budget_aggr - self.controller_gate_speed_budget_cons
@@ -1335,6 +1358,7 @@ class DroneRaceEnv(IsaacEnv):
             "reset_gate_9_pass_ema": Unbounded(1),
             "reset_gate_10_pass_ema": Unbounded(1),
             "reset_gate_11_pass_ema": Unbounded(1),
+            "reset_gate_12_pass_ema": Unbounded(1),
             # Per-gate visit counts — how many times each gate was crossed in the episode
             "gate_0_crosses": Unbounded(1),
             "gate_1_crosses": Unbounded(1),
@@ -1585,7 +1609,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["controller_explore_episode_flag"][env_ids] = explore_mask.float().unsqueeze(-1)
         self.stats["controller_active_speed_target_norm"][env_ids] = 0.
         self.stats["controller_overspeed_fraction"][env_ids] = 0.
-        for gi in range(12):
+        for gi in range(self.num_course_gates):
             self.stats[f"reset_gate_{gi}_pass_ema"][env_ids] = float(self.reset_gate_pass_ema[gi].item())
         for gi in range(13):
             self.stats[f"gate_{gi}_crosses"][env_ids] = 0.
@@ -1766,8 +1790,8 @@ class DroneRaceEnv(IsaacEnv):
 
         gate_env_pos, gate_env_rot = self.get_env_poses((gate_world_pos, gate_world_rot))  # (N, num_gates, 3), (N, num_gates, 4)
         
-        # Track completion terminates the episode on the last real gate, so the active
-        # target always stays within the real course gates during normal rollouts.
+        # Track completion terminates the episode on the finish-line gate, so the active
+        # target always stays within the configured course gates during normal rollouts.
         track_completed = self.track_completed  # (N,)
         
         # Get current gate positions for each environment
@@ -1779,9 +1803,9 @@ class DroneRaceEnv(IsaacEnv):
             )
         )
         
-        # Get next-to-next gate positions. When the immediate next gate is the last real lap gate,
-        # wrap the lookahead back to gate 0 so the policy still sees the closure turn without ever
-        # targeting the duplicated helper gate.
+        # Get next-to-next gate positions. When the immediate next gate is the
+        # finish-line gate, wrap the lookahead back to gate 0 so the policy
+        # still sees the next-lap opening turn immediately after the finish.
         next_to_next_gate_indices = torch.where(
             target_gate_indices == self.num_course_gates - 1,
             torch.zeros_like(target_gate_indices),
@@ -1905,8 +1929,8 @@ class DroneRaceEnv(IsaacEnv):
         Returns:
             gate_passed_this_step: (N,) bool — True for envs that just passed a gate.
             crossed_gate_idx:      (N,) long — gate index that was just crossed before any
-                target advance. The duplicated lap-closure gate remains `num_course_gates`
-                so downstream logging can place it in the dedicated gate-13 bucket.
+                target advance. On the YAML race track, index 12 is gate 13, the
+                lap-completing finish line.
             gate_index_changed:    (N,) bool — True for envs whose target gate advanced.
             new_gate_center:       (N, 3) — centre of the (possibly new) target gate.
         """
@@ -2570,7 +2594,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reset_from_gate0"][:] = (self.episode_reset_bucket == 0).float().unsqueeze(-1)
         self.stats["reset_from_prev_gate"][:] = (self.episode_reset_bucket == 1).float().unsqueeze(-1)
         self.stats["reset_from_random_gate"][:] = (self.episode_reset_bucket == 2).float().unsqueeze(-1)
-        for gi in range(12):
+        for gi in range(self.num_course_gates):
             self.stats[f"reset_gate_{gi}_pass_ema"][:] = float(self.reset_gate_pass_ema[gi].item())
 
         # Distance to current gate at end of episode (meaningful when episode ends)

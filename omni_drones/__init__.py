@@ -51,6 +51,7 @@ def init_simulation_app(cfg):
         "max_bounces",
         "max_specular_transmission_bounces",
         "max_volume_bounces",
+        "offscreen_render",
         "open_usd",
         "livesync_usd",
         "fast_shutdown",

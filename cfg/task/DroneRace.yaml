@@ -190,7 +190,7 @@ reset_curriculum_prev_gate_prob: 0.50  # focused practice starts from the gate i
 reset_curriculum_random_gate_prob: 0.10 # small amount of broad coverage from uniformly random real course gates
 reset_curriculum_metric_alpha: 0.01    # EMA smoothing for gate-0-start per-gate passage reliability
 hard_turn_target_gates: [4, 5]         # zero-based sharp-turn bottleneck spans actual gates 5 and 6
-wrong_side_penalty_target_gates: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] # keep wrong-side entry penalties active across the full 13-gate lap
+wrong_side_penalty_target_gates: [4, 5] # zero-based gates 5 and 6 are the only gates that need wrong-side entry penalties
 reward_hard_turn_direction_scale: 2.5  # signed gate-frame progress shaping through the gate-5 setup corridor
 reward_hard_turn_clear_bonus: 18.0     # extra sparse reward for actually clearing the gate-5 bottleneck
 hard_turn_corridor_x_min: -10.0        # start guiding the drone earlier on the gate-5 approach

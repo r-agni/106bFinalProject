@@ -134,8 +134,8 @@ def main(cfg):
     run.summary["curriculum/phase2_accuracy_gate_threshold"] = float(
         cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
     )
-    run.summary["gates_helper/lap_closure_bucket_note"] = (
-        "LapClosureHelper is a non-rewardable helper bucket; only G1-G12 are real lap gates."
+    run.summary["gates_human/finish_line_note"] = (
+        "G13 is the finish line; full-lap success requires crossing it."
     )
     race_objective_completion_target = 0.90
     race_objective_lap_time_target_sec = 13.0
@@ -1166,7 +1166,7 @@ def main(cfg):
                 if reset_from_random_gate is not None:
                     derived["curriculum/reset_from_random_rate"] = reset_from_random_gate
                 reset_gate_pass_emas = {}
-                for gi in range(12):
+                for gi in range(required_gate_count):
                     reset_gate_ema = _mean(f"reset_gate_{gi}_pass_ema")
                     if reset_gate_ema is not None:
                         reset_gate_pass_emas[gi] = float(reset_gate_ema)
@@ -1584,26 +1584,19 @@ def main(cfg):
                     controller_gate_count,
                 )
 
-                # Per-gate crossing heatmap data — log the real race gates as the
-                # human-facing sequence and keep the extra lap-closure helper in a
-                # dedicated helper namespace to avoid implying a 13th rewardable gate.
+                # Per-gate crossing heatmap data — every configured gate is part of
+                # the ordered lap, and on the YAML race track G13 is the finish line.
                 for gi in range(logged_gate_count):
                     v = _mean(f"gate_{gi}_crosses")
                     if v is not None:
                         derived[f"gates/gate_{gi:02d}_crosses"] = v
-                        if gi < controller_gate_count:
-                            derived[f"gates_human/gate_{gi + 1:02d}_crosses"] = v
-                        else:
-                            derived["gates_helper/lap_closure_crosses"] = v
+                        derived[f"gates_human/gate_{gi + 1:02d}_crosses"] = v
 
                 # WandB bar chart for per-gate distribution
                 gate_counts = [
                     _mean(f"gate_{gi}_crosses") or 0.0 for gi in range(logged_gate_count)
                 ]
-                gate_labels = [
-                    f"G{gi + 1}" if gi < controller_gate_count else "LapCloseHelper"
-                    for gi in range(logged_gate_count)
-                ]
+                gate_labels = [f"G{gi + 1}" for gi in range(logged_gate_count)]
                 gate_table = wandb.Table(
                     columns=["gate", "mean_crosses"],
                     data=[[label, val] for label, val in zip(gate_labels, gate_counts)],
@@ -1619,10 +1612,7 @@ def main(cfg):
                     v = _mean(f"cheating_gate_{gi}")
                     if v is not None:
                         derived[f"cheating/gate_{gi:02d}_repeat_events"] = v
-                        if gi < controller_gate_count:
-                            derived[f"cheating_human/gate_{gi + 1:02d}_repeat_events"] = v
-                        else:
-                            derived["cheating_helper/lap_closure_repeat_events"] = v
+                        derived[f"cheating_human/gate_{gi + 1:02d}_repeat_events"] = v
 
                 cheating_gate_counts = [
                     _mean(f"cheating_gate_{gi}") or 0.0

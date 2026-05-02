@@ -190,13 +190,14 @@ reset_curriculum_prev_gate_prob: 0.50  # focused practice starts from the gate i
 reset_curriculum_random_gate_prob: 0.10 # small amount of broad coverage from uniformly random real course gates
 reset_curriculum_metric_alpha: 0.01    # EMA smoothing for gate-0-start per-gate passage reliability
 hard_turn_target_gates: [4, 5]         # zero-based sharp-turn bottleneck spans actual gates 5 and 6
+wrong_side_penalty_target_gates: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] # keep wrong-side entry penalties active across the full 13-gate lap
 reward_hard_turn_direction_scale: 2.5  # signed gate-frame progress shaping through the gate-5 setup corridor
 reward_hard_turn_clear_bonus: 18.0     # extra sparse reward for actually clearing the gate-5 bottleneck
 hard_turn_corridor_x_min: -10.0        # start guiding the drone earlier on the gate-5 approach
 hard_turn_corridor_x_max: 4.0
 hard_turn_corridor_halfwidth: 4.5      # allow a wide turning arc before centering penalties fully apply
 hard_turn_corridor_height: 3.0
-reward_hard_turn_wrong_side_scale: 4.0 # penalize drifting onto the gate exit side before a legal crossing
+reward_hard_turn_wrong_side_scale: 4.0 # penalize drifting onto a target gate's exit side before a legal crossing
 hard_turn_wrong_side_x_min: 0.25       # ignore tiny post-plane jitter; focus on real backside approaches
 hard_turn_wrong_side_x_max: 3.0        # only punish the local gate neighborhood, not the far downstream path
 hard_turn_penalty_scale: 0.25          # suppress most near-gate penalties in the gate-5 corridor
@@ -205,6 +206,7 @@ sparse_disable_smoothness_penalties: true # allow harsher maneuvers inside spars
 reward_speed_scale_phase2: 0.75        # stronger dense speed reward once reliable full laps are achieved
 reward_speed_target_ms_phase2: 8.0     # higher speed target for the final speed-focused phase
 phase2_disable_dense_shaping: true     # turn off dense shaping / penalty helpers in the final speed phase
+phase2_disable_wrong_side_penalty: false # keep the wrong-side gate-entry penalty on during the final speed phase
 stacked_reversal_entry_gates: [6, 10]     # elevated stacked gates that transition into the hard lower reversal gates
 stacked_reversal_target_gates: [7, 11]    # lower stacked gates that need extra local credit assignment
 stacked_reversal_dist_threshold: 35.0     # allow wider divergence while recovering through the stacked reversal

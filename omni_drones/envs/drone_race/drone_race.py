@@ -228,6 +228,22 @@ class DroneRaceEnv(IsaacEnv):
                 }
             )
         )
+        wrong_side_targets_cfg = cfg.task.get("wrong_side_penalty_target_gates")
+        if wrong_side_targets_cfg is None:
+            wrong_side_targets = range(self.num_course_gates)
+        else:
+            wrong_side_targets = (
+                int(idx) for idx in wrong_side_targets_cfg
+            )
+        self.wrong_side_penalty_target_gates = tuple(
+            sorted(
+                {
+                    gate_idx
+                    for gate_idx in wrong_side_targets
+                    if 0 <= gate_idx < self.num_course_gates
+                }
+            )
+        )
         self.reward_hard_turn_direction_scale = float(
             cfg.task.get("reward_hard_turn_direction_scale", 0.0)
         )
@@ -254,6 +270,9 @@ class DroneRaceEnv(IsaacEnv):
         )
         self.hard_turn_wrong_side_x_max = float(
             cfg.task.get("hard_turn_wrong_side_x_max", 3.0)
+        )
+        self.phase2_disable_wrong_side_penalty = bool(
+            cfg.task.get("phase2_disable_wrong_side_penalty", False)
         )
         self.hard_turn_penalty_scale = float(
             cfg.task.get("hard_turn_penalty_scale", 1.0)
@@ -1329,6 +1348,7 @@ class DroneRaceEnv(IsaacEnv):
             "reward_stacked_direction": Unbounded(1), # cumulative signed stacked-gate local progress shaping
             "reward_stacked_bonus": Unbounded(1),     # cumulative stacked-gate entry/clear sparse bonuses
             "reward_penalties": Unbounded(1),   # cumulative angular + smoothness penalties
+            "reward_wrong_side": Unbounded(1),  # cumulative wrong-side gate-entry penalties
             "reward_altitude": Unbounded(1),    # cumulative altitude penalty term
             "reward_approach": Unbounded(1),    # cumulative near-gate retreat penalty term
             "reward_centering": Unbounded(1),   # cumulative near-gate centerline penalty term
@@ -1498,6 +1518,11 @@ class DroneRaceEnv(IsaacEnv):
         gate_velocities = torch.zeros(n, self.num_gates, 6, device=self.device)
         self.gates.set_velocities(gate_velocities, env_indices=env_ids)
 
+        bootstrap_from_spawn = (
+            bool(self.cfg.get("play_bootstrap_from_spawn", False))
+            and not getattr(self, "_play_bootstrap_consumed", False)
+        )
+
         try:
             gate_world_pos, gate_world_rot = self.gates.get_world_poses()
             gate_env_pos, gate_env_rot = self.get_env_poses((gate_world_pos, gate_world_rot))
@@ -1509,34 +1534,44 @@ class DroneRaceEnv(IsaacEnv):
             start_gate_pos = gate_env_pos_reset[batch_local, start_gates]  # (n, 3)
             start_gate_rot = gate_env_rot_reset[batch_local, start_gates]  # (n, 4)
 
-            # Spawn drone 1.5m behind the start gate in gate-local frame
-            offset_local_expanded = self.offset_local.unsqueeze(0).expand(n, -1)  # (n, 3)
-            offset_world = quat_rotate(start_gate_rot, offset_local_expanded)     # (n, 3)
-            drone_start_pos = start_gate_pos + offset_world                        # (n, 3)
-            local_rpy_noise = self.init_rpy_dist.sample((*env_ids.shape, 1))
-            local_rot_noise = euler_to_quaternion(local_rpy_noise)
-            drone_rot = quat_mul(start_gate_rot.unsqueeze(1), local_rot_noise)
+            if bootstrap_from_spawn:
+                # Playback-only escape hatch: Isaac 4.5 on the current stack can
+                # reject articulation teleports during the first post-start reset.
+                # The scene already spawns the drone behind gate 0, so we can
+                # bootstrap the first episode from that pose without moving it.
+                drone_world_pos, drone_world_rot = self.drone.get_world_poses(clone=True)
+                drone_env_pos, _ = self.get_env_poses((drone_world_pos, drone_world_rot))
+                drone_start_pos = drone_env_pos[env_ids, 0]
+                self._play_bootstrap_consumed = True
+            else:
+                # Spawn drone 1.5m behind the start gate in gate-local frame
+                offset_local_expanded = self.offset_local.unsqueeze(0).expand(n, -1)  # (n, 3)
+                offset_world = quat_rotate(start_gate_rot, offset_local_expanded)     # (n, 3)
+                drone_start_pos = start_gate_pos + offset_world                        # (n, 3)
+                local_rpy_noise = self.init_rpy_dist.sample((*env_ids.shape, 1))
+                local_rot_noise = euler_to_quaternion(local_rpy_noise)
+                drone_rot = quat_mul(start_gate_rot.unsqueeze(1), local_rot_noise)
+
+                drone_start_pos_with_agent = drone_start_pos.unsqueeze(1)             # (n, 1, 3)
+                env_positions_with_agent = self.envs_positions[env_ids].unsqueeze(1)  # (n, 1, 3)
+
+                use_usd_pose_reset = bool(self.cfg.get("play_force_usd_pose_reset", False))
+                if use_usd_pose_reset:
+                    XFormPrimView.set_world_poses(
+                        self.drone._view,
+                        positions=(drone_start_pos_with_agent + env_positions_with_agent).reshape(-1, 3),
+                        orientations=drone_rot.reshape(-1, 4),
+                        indices=env_ids,
+                        usd=True,
+                    )
+                else:
+                    self.drone.set_world_poses(
+                        drone_start_pos_with_agent + env_positions_with_agent,
+                        drone_rot, env_ids
+                    )
 
             # Store prev_drone_pos for path-projection reward
             self.prev_drone_pos[env_ids] = drone_start_pos
-
-            drone_start_pos_with_agent = drone_start_pos.unsqueeze(1)             # (n, 1, 3)
-            env_positions_with_agent = self.envs_positions[env_ids].unsqueeze(1)  # (n, 1, 3)
-
-            use_usd_pose_reset = bool(self.cfg.get("play_force_usd_pose_reset", False))
-            if use_usd_pose_reset:
-                XFormPrimView.set_world_poses(
-                    self.drone._view,
-                    positions=(drone_start_pos_with_agent + env_positions_with_agent).reshape(-1, 3),
-                    orientations=drone_rot.reshape(-1, 4),
-                    indices=env_ids,
-                    usd=True,
-                )
-            else:
-                self.drone.set_world_poses(
-                    drone_start_pos_with_agent + env_positions_with_agent,
-                    drone_rot, env_ids
-                )
         except Exception as e:
             import traceback
             print("=" * 80)
@@ -1551,11 +1586,15 @@ class DroneRaceEnv(IsaacEnv):
                 f"DroneRaceEnv._reset_idx failed (num_envs={self.num_envs}, num_gates={self.num_gates})"
             ) from e
 
-        self.drone.set_velocities(
-            torch.zeros(n, 1, 6, device=self.device), env_ids
-        )
-        self.drone.set_joint_positions(torch.zeros(n, 1, 4, device=self.device), env_ids)
-        self.drone.set_joint_velocities(torch.zeros(n, 1, 4, device=self.device), env_ids)
+        if not bootstrap_from_spawn:
+            self.drone.set_velocities(
+                torch.zeros(n, 1, 6, device=self.device), env_ids
+            )
+            # Teleporting articulation joints on GPU PhysX can trigger illegal
+            # PxArticulationLink::setGlobalPose() calls during playback resets.
+            # For the race drone, the joints are just rotor visuals, so zeroing their
+            # spin state is sufficient and avoids corrupting the root reset.
+            self.drone.set_joint_velocities(torch.zeros(n, 1, 4, device=self.device), env_ids)
 
         # Compute start gate center for prev_distance_to_gate and crossing detection init
         gate_center_offset_local = torch.tensor([0.0, 0.0, self.gate_height / 2.0], device=self.device)
@@ -1585,6 +1624,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_stacked_direction"][env_ids] = 0.
         self.stats["reward_stacked_bonus"][env_ids] = 0.
         self.stats["reward_penalties"][env_ids] = 0.
+        self.stats["reward_wrong_side"][env_ids] = 0.
         self.stats["reward_altitude"][env_ids] = 0.
         self.stats["reward_approach"][env_ids] = 0.
         self.stats["reward_centering"][env_ids] = 0.
@@ -2073,6 +2113,9 @@ class DroneRaceEnv(IsaacEnv):
         speed_shaping_enabled = controller_phase >= 1
         speed_focus_phase = controller_phase >= 2
         disable_dense_shaping = speed_focus_phase and self.phase2_disable_dense_shaping
+        disable_wrong_side_penalty = (
+            speed_focus_phase and self.phase2_disable_wrong_side_penalty
+        )
         speed_phase_weight = 1.0 if speed_shaping_enabled else 0.0
         base_speed_scale = self.reward_speed_scale_phase2 if speed_focus_phase else self.reward_speed_scale
         current_speed_scale = base_speed_scale * float(self.controller_speed_pressure)
@@ -2082,6 +2125,11 @@ class DroneRaceEnv(IsaacEnv):
         hard_turn_target_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         for gate_idx in self.hard_turn_target_gates:
             hard_turn_target_mask |= self.gate_indices == gate_idx
+        wrong_side_target_mask = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        for gate_idx in self.wrong_side_penalty_target_gates:
+            wrong_side_target_mask |= self.gate_indices == gate_idx
         stacked_target_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         for gate_idx in self.stacked_reversal_target_gates:
             stacked_target_mask |= self.gate_indices == gate_idx
@@ -2231,7 +2279,7 @@ class DroneRaceEnv(IsaacEnv):
         # already enforces correct direction, but this teaches the policy not to
         # loop onto the exit side and try to recover through the gate backward.
         hard_turn_wrong_side_mask = (
-            hard_turn_target_mask
+            wrong_side_target_mask
             & (~gate_index_changed)
             & (current_gate_local[:, 0] >= self.hard_turn_wrong_side_x_min)
             & (current_gate_local[:, 0] <= self.hard_turn_wrong_side_x_max)
@@ -2246,7 +2294,7 @@ class DroneRaceEnv(IsaacEnv):
             ),
             torch.zeros_like(current_gate_local[:, 0]),
         )
-        if disable_dense_shaping:
+        if disable_wrong_side_penalty:
             hard_turn_wrong_side_penalty = torch.zeros_like(
                 hard_turn_wrong_side_penalty
             )
@@ -2523,6 +2571,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_stacked_direction"].add_(stacked_direction_reward.unsqueeze(-1))
         self.stats["reward_stacked_bonus"].add_(stacked_bonus_reward.unsqueeze(-1))
         self.stats["reward_penalties"].add_(penalty_reward.unsqueeze(-1))
+        self.stats["reward_wrong_side"].add_((-hard_turn_wrong_side_penalty).unsqueeze(-1))
         self.stats["reward_altitude"].add_((-altitude_penalty).unsqueeze(-1))
         self.stats["reward_approach"].add_((-approach_penalty).unsqueeze(-1))
         self.stats["reward_centering"].add_((-centering_penalty).unsqueeze(-1))

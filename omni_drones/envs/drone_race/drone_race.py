@@ -208,6 +208,21 @@ class DroneRaceEnv(IsaacEnv):
         # before the episode is marked successful.
         self.num_logged_gates = max(min(self.num_gates, 13), 1)
         self.num_course_gates = max(min(self.num_gates, self.num_logged_gates), 1)
+        self.reset_curriculum_excluded_start_gate = None
+        if self.track_config is not None and self.num_course_gates > 1:
+            gate_keys = sorted(self.track_config.keys(), key=lambda x: int(x))
+            course_gate_keys = gate_keys[:self.num_course_gates]
+            first_gate_cfg = self.track_config[course_gate_keys[0]]
+            last_gate_cfg = self.track_config[course_gate_keys[-1]]
+            first_pos = np.asarray(first_gate_cfg.get("pos", (0.0, 0.0, 1.0)), dtype=np.float32)
+            last_pos = np.asarray(last_gate_cfg.get("pos", (0.0, 0.0, 1.0)), dtype=np.float32)
+            first_yaw = float(first_gate_cfg.get("yaw", 0.0))
+            last_yaw = float(last_gate_cfg.get("yaw", 0.0))
+            # The race track duplicates gate 1 as the final finish-line gate.
+            # Exclude that duplicate from reset-curriculum starts so practice
+            # stays focused on learning the real course opening.
+            if np.allclose(first_pos, last_pos, atol=1e-4) and abs(first_yaw - last_yaw) <= 1e-4:
+                self.reset_curriculum_excluded_start_gate = self.num_course_gates - 1
         self.phase1_unlock_gate_index = int(
             cfg.task.get("phase1_unlock_gate_index", min(5, self.num_course_gates - 1))
         )
@@ -1481,11 +1496,19 @@ class DroneRaceEnv(IsaacEnv):
                 >= self.reset_curriculum_gate0_prob + self.reset_curriculum_prev_gate_prob
             )
             prev_gate = (self.active_reset_curriculum_gate - 1) % self.num_course_gates
+            if (
+                self.reset_curriculum_excluded_start_gate is not None
+                and prev_gate == self.reset_curriculum_excluded_start_gate
+            ):
+                prev_gate = 0
             start_gates[prev_bucket] = prev_gate
             if random_bucket.any():
+                random_start_gate_count = self.num_course_gates
+                if self.reset_curriculum_excluded_start_gate == self.num_course_gates - 1:
+                    random_start_gate_count = max(self.num_course_gates - 1, 1)
                 start_gates[random_bucket] = torch.randint(
                     0,
-                    self.num_course_gates,
+                    random_start_gate_count,
                     (int(random_bucket.sum().item()),),
                     device=self.device,
                 )

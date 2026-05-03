@@ -109,6 +109,8 @@ class DroneRaceEnv(IsaacEnv):
         "reward_altitude_scale",
         "reward_approach_scale",
         "reward_gate_centering_scale",
+        "reward_gate_reentry_scale",
+        "reward_exit_anchor_scale",
     )
     TERMINATION_CONFIG_KEYS = (
         "crash_dist_threshold",
@@ -295,6 +297,55 @@ class DroneRaceEnv(IsaacEnv):
         self.hard_turn_penalty_scale = float(
             cfg.task.get("hard_turn_penalty_scale", 1.0)
         )
+        self.gate_reentry_target_gates = tuple(
+            sorted(
+                {
+                    gate_idx
+                    for gate_idx in (
+                        int(idx)
+                        for idx in cfg.task.get("gate_reentry_target_gates", [4, 5, 11])
+                    )
+                    if 0 <= gate_idx < self.num_course_gates
+                }
+            )
+        )
+        self.gate_reentry_monitor_substeps = int(
+            cfg.task.get("gate_reentry_monitor_substeps", 200)
+        )
+        self.gate_reentry_clearance_x = float(
+            cfg.task.get("gate_reentry_clearance_x", 0.05)
+        )
+        self.gate_reentry_backtrack_x = float(
+            cfg.task.get("gate_reentry_backtrack_x", -0.05)
+        )
+        default_exit_anchor_gates = (
+            self.gate_reentry_target_gates
+            if len(self.gate_reentry_target_gates) > 0
+            else (4, 5, 11)
+        )
+        self.exit_anchor_target_gates = tuple(
+            sorted(
+                {
+                    gate_idx
+                    for gate_idx in (
+                        int(idx)
+                        for idx in cfg.task.get(
+                            "exit_anchor_target_gates", default_exit_anchor_gates
+                        )
+                    )
+                    if 0 <= gate_idx < self.num_course_gates
+                }
+            )
+        )
+        self.exit_anchor_distance = float(
+            cfg.task.get("exit_anchor_distance", 1.5)
+        )
+        self.exit_anchor_radius = float(
+            cfg.task.get("exit_anchor_radius", 0.60)
+        )
+        self.exit_anchor_max_steps = int(
+            cfg.task.get("exit_anchor_max_steps", 30)
+        )
         default_hard_gates = (6, 7, 10, 11)
         default_final_gates = (10, 11)
         self.controller_completion_target = float(cfg.task.get("controller_completion_target", 0.78))
@@ -410,6 +461,49 @@ class DroneRaceEnv(IsaacEnv):
         self.repeat_gate_crosses = torch.zeros(
             self.num_envs, 13, device=self.device, dtype=torch.long
         )
+        self.gate_reentry_events_this_ep = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.gate_reentry_crosses = torch.zeros(
+            self.num_envs, 13, device=self.device, dtype=torch.long
+        )
+        self.gate_reentry_monitor_gate = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.long
+        )
+        self.gate_reentry_monitor_steps_left = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.gate_reentry_monitor_center = torch.zeros(
+            self.num_envs, 3, device=self.device
+        )
+        self.gate_reentry_monitor_rot = torch.zeros(
+            self.num_envs, 4, device=self.device
+        )
+        self.gate_reentry_monitor_rot[:, 0] = 1.0
+        self.gate_reentry_monitor_cleared = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.gate_reentry_event_this_step = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.gate_reentry_event_gate = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.long
+        )
+        self.exit_anchor_active = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.exit_anchor_gate = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.long
+        )
+        self.exit_anchor_pos = torch.zeros(
+            self.num_envs, 3, device=self.device
+        )
+        self.exit_anchor_prev_dist = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.exit_anchor_steps_left = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
         self.wrong_side_violation_latched = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -473,6 +567,16 @@ class DroneRaceEnv(IsaacEnv):
         self.controller_window_gate_exit_count = torch.zeros(
             self.num_course_gates, device=self.device
         )
+        self.gate_reentry_target_mask = torch.zeros(
+            self.num_course_gates, device=self.device, dtype=torch.bool
+        )
+        for gate_idx in self.gate_reentry_target_gates:
+            self.gate_reentry_target_mask[gate_idx] = True
+        self.exit_anchor_target_mask = torch.zeros(
+            self.num_course_gates, device=self.device, dtype=torch.bool
+        )
+        for gate_idx in self.exit_anchor_target_gates:
+            self.exit_anchor_target_mask[gate_idx] = True
         self._build_controller_speed_budget_tables()
         for gate_idx in self.controller_hard_gate_indices:
             self.controller_gate_is_hard[gate_idx] = True
@@ -773,6 +877,89 @@ class DroneRaceEnv(IsaacEnv):
                 state.get("controller_entropy_target", self.controller_entropy_target)
             ),
         )
+
+    def _arm_gate_reentry_monitor(
+        self,
+        env_mask: torch.Tensor,
+        crossed_gate_idx: torch.Tensor,
+        crossed_gate_center: torch.Tensor,
+        crossed_gate_rot: torch.Tensor,
+    ):
+        if env_mask.numel() == 0 or not env_mask.any():
+            return
+        env_ids = env_mask.nonzero(as_tuple=False).squeeze(-1)
+        self.gate_reentry_monitor_gate[env_ids] = crossed_gate_idx[env_ids]
+        self.gate_reentry_monitor_steps_left[env_ids] = self.gate_reentry_monitor_substeps
+        self.gate_reentry_monitor_center[env_ids] = crossed_gate_center[env_ids]
+        self.gate_reentry_monitor_rot[env_ids] = crossed_gate_rot[env_ids]
+        self.gate_reentry_monitor_cleared[env_ids] = False
+        self.gate_reentry_event_this_step[env_ids] = False
+        self.gate_reentry_event_gate[env_ids] = -1
+
+    def _arm_exit_anchor(
+        self,
+        env_mask: torch.Tensor,
+        crossed_gate_idx: torch.Tensor,
+        crossed_gate_center: torch.Tensor,
+        next_gate_center: torch.Tensor,
+        drone_pos_flat: torch.Tensor,
+    ):
+        if env_mask.numel() == 0 or not env_mask.any():
+            return
+        env_ids = env_mask.nonzero(as_tuple=False).squeeze(-1)
+        seg_vec = next_gate_center[env_ids] - crossed_gate_center[env_ids]
+        seg_dir = seg_vec / (seg_vec.norm(dim=-1, keepdim=True) + 1e-6)
+        anchor_pos = crossed_gate_center[env_ids] + self.exit_anchor_distance * seg_dir
+        self.exit_anchor_active[env_ids] = True
+        self.exit_anchor_gate[env_ids] = crossed_gate_idx[env_ids]
+        self.exit_anchor_pos[env_ids] = anchor_pos
+        self.exit_anchor_prev_dist[env_ids] = torch.norm(
+            drone_pos_flat[env_ids] - anchor_pos, dim=-1
+        )
+        self.exit_anchor_steps_left[env_ids] = self.exit_anchor_max_steps
+
+    def _post_sim_substep(self, tensordict: TensorDictBase, substep: int):
+        active_mask = self.gate_reentry_monitor_steps_left > 0
+        if not active_mask.any():
+            return
+
+        root_state = self.drone.get_state()[..., :13]
+        drone_pos = root_state[..., :3].squeeze(1)
+        rel = quat_rotate_inverse(
+            self.gate_reentry_monitor_rot[active_mask],
+            drone_pos[active_mask] - self.gate_reentry_monitor_center[active_mask],
+        )
+        rel_x = rel[:, 0]
+        rel_y = rel[:, 1]
+        rel_z = rel[:, 2]
+
+        self.gate_reentry_monitor_cleared[active_mask] |= (
+            rel_x > self.gate_reentry_clearance_x
+        )
+        in_opening = (
+            (rel_y.abs() < (self.gate_width / 2.0))
+            & (rel_z.abs() < (self.gate_height / 2.0))
+        )
+        reentry_local = (
+            self.gate_reentry_monitor_cleared[active_mask]
+            & (rel_x < self.gate_reentry_backtrack_x)
+            & in_opening
+        )
+        if reentry_local.any():
+            active_ids = active_mask.nonzero(as_tuple=False).squeeze(-1)
+            env_ids = active_ids[reentry_local]
+            self.gate_reentry_event_this_step[env_ids] = True
+            self.gate_reentry_event_gate[env_ids] = self.gate_reentry_monitor_gate[env_ids]
+            self.gate_reentry_monitor_steps_left[env_ids] = 0
+            self.exit_anchor_active[env_ids] = False
+            self.exit_anchor_steps_left[env_ids] = 0
+            self.exit_anchor_gate[env_ids] = -1
+
+        still_active = self.gate_reentry_monitor_steps_left > 0
+        self.gate_reentry_monitor_steps_left[still_active] -= 1
+        expired = self.gate_reentry_monitor_steps_left <= 0
+        self.gate_reentry_monitor_gate[expired] = -1
+        self.gate_reentry_monitor_cleared[expired] = False
 
     def _get_controller_base_gate_targets(self):
         targets = torch.zeros(self.num_course_gates, device=self.device)
@@ -1379,6 +1566,8 @@ class DroneRaceEnv(IsaacEnv):
             "reward_altitude": Unbounded(1),    # cumulative altitude penalty term
             "reward_approach": Unbounded(1),    # cumulative near-gate retreat penalty term
             "reward_centering": Unbounded(1),   # cumulative near-gate centerline penalty term
+            "reward_gate_reentry": Unbounded(1),# cumulative post-cross gate re-entry penalties
+            "reward_exit_anchor": Unbounded(1), # cumulative post-cross exit-anchor reward
             "reward_crash": Unbounded(1),       # cumulative crash penalties
             "wrong_side_violation": Unbounded(1),
             # Angular rate magnitude
@@ -1436,6 +1625,20 @@ class DroneRaceEnv(IsaacEnv):
             "cheating_gate_10": Unbounded(1),
             "cheating_gate_11": Unbounded(1),
             "cheating_gate_12": Unbounded(1),
+            "gate_reentry": Unbounded(1),
+            "gate_reentry_gate_0": Unbounded(1),
+            "gate_reentry_gate_1": Unbounded(1),
+            "gate_reentry_gate_2": Unbounded(1),
+            "gate_reentry_gate_3": Unbounded(1),
+            "gate_reentry_gate_4": Unbounded(1),
+            "gate_reentry_gate_5": Unbounded(1),
+            "gate_reentry_gate_6": Unbounded(1),
+            "gate_reentry_gate_7": Unbounded(1),
+            "gate_reentry_gate_8": Unbounded(1),
+            "gate_reentry_gate_9": Unbounded(1),
+            "gate_reentry_gate_10": Unbounded(1),
+            "gate_reentry_gate_11": Unbounded(1),
+            "gate_reentry_gate_12": Unbounded(1),
             "wrong_side_gate_0": Unbounded(1),
             "wrong_side_gate_1": Unbounded(1),
             "wrong_side_gate_2": Unbounded(1),
@@ -1556,6 +1759,21 @@ class DroneRaceEnv(IsaacEnv):
         self.last_real_crossed_gate[env_ids] = -1
         self.repeat_gate_events_this_ep[env_ids] = 0
         self.repeat_gate_crosses[env_ids] = 0
+        self.gate_reentry_events_this_ep[env_ids] = 0
+        self.gate_reentry_crosses[env_ids] = 0
+        self.gate_reentry_monitor_gate[env_ids] = -1
+        self.gate_reentry_monitor_steps_left[env_ids] = 0
+        self.gate_reentry_monitor_center[env_ids] = 0.0
+        self.gate_reentry_monitor_rot[env_ids] = 0.0
+        self.gate_reentry_monitor_rot[env_ids, 0] = 1.0
+        self.gate_reentry_monitor_cleared[env_ids] = False
+        self.gate_reentry_event_this_step[env_ids] = False
+        self.gate_reentry_event_gate[env_ids] = -1
+        self.exit_anchor_active[env_ids] = False
+        self.exit_anchor_gate[env_ids] = -1
+        self.exit_anchor_pos[env_ids] = 0.0
+        self.exit_anchor_prev_dist[env_ids] = 0.0
+        self.exit_anchor_steps_left[env_ids] = 0
         self.wrong_side_violation_latched[env_ids] = False
         self.wrong_side_violation_events_this_ep[env_ids] = 0
         self.wrong_side_violation_crosses[env_ids] = 0
@@ -1680,6 +1898,8 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_altitude"][env_ids] = 0.
         self.stats["reward_approach"][env_ids] = 0.
         self.stats["reward_centering"][env_ids] = 0.
+        self.stats["reward_gate_reentry"][env_ids] = 0.
+        self.stats["reward_exit_anchor"][env_ids] = 0.
         self.stats["reward_crash"][env_ids] = 0.
         self.stats["wrong_side_violation"][env_ids] = 0.
         self.stats["mean_ang_rate"][env_ids] = 0.
@@ -1696,6 +1916,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["min_altitude"][env_ids] = 0.
         self.stats["mean_action_magnitude"][env_ids] = 0.
         self.stats["cheating"][env_ids] = 0.
+        self.stats["gate_reentry"][env_ids] = 0.
         self.stats["controller_speed_pressure"][env_ids] = float(self.controller_speed_pressure)
         self.stats["controller_exploration_pressure"][env_ids] = float(self.controller_exploration_pressure)
         self.stats["controller_collapse_active"][env_ids] = float(self.controller_collapse_active)
@@ -1707,6 +1928,7 @@ class DroneRaceEnv(IsaacEnv):
         for gi in range(13):
             self.stats[f"gate_{gi}_crosses"][env_ids] = 0.
             self.stats[f"cheating_gate_{gi}"][env_ids] = 0.
+            self.stats[f"gate_reentry_gate_{gi}"][env_ids] = 0.
             self.stats[f"wrong_side_gate_{gi}"][env_ids] = 0.
         if getattr(self, "enable_viewport", False):
             camera_mode = str(self.cfg.get("play_camera_mode", "track")).lower()
@@ -2155,6 +2377,39 @@ class DroneRaceEnv(IsaacEnv):
 
         # Increment per-episode gate crossing counter (actual crossings, not init index).
         self.gates_crossed_this_ep[gate_passed_this_step] += 1
+        crossed_gate_center = current_gate_center.clone()
+        crossed_gate_rot = current_gate_rot.clone()
+
+        gate_reentry_violation_this_step = self.gate_reentry_event_this_step.clone()
+        gate_reentry_violation_gate_idx = self.gate_reentry_event_gate.clone()
+        self.gate_reentry_event_this_step.zero_()
+        self.gate_reentry_event_gate.fill_(-1)
+
+        clamped_crossed_gate_idx = crossed_gate_idx.clamp(0, self.num_course_gates - 1)
+        reentry_target_cross_mask = (
+            gate_passed_this_step
+            & self.gate_reentry_target_mask[clamped_crossed_gate_idx]
+        )
+        if reentry_target_cross_mask.any():
+            self._arm_gate_reentry_monitor(
+                reentry_target_cross_mask,
+                crossed_gate_idx,
+                crossed_gate_center,
+                crossed_gate_rot,
+            )
+        exit_anchor_cross_mask = (
+            gate_passed_this_step
+            & gate_index_changed
+            & self.exit_anchor_target_mask[clamped_crossed_gate_idx]
+        )
+        if exit_anchor_cross_mask.any():
+            self._arm_exit_anchor(
+                exit_anchor_cross_mask,
+                crossed_gate_idx,
+                crossed_gate_center,
+                new_gate_center,
+                drone_pos_flat,
+            )
 
         # Grace period after gate crossing: reset counter for envs that just advanced,
         # then decrement all. Dist-crash is disabled during the grace window so the drone
@@ -2282,6 +2537,33 @@ class DroneRaceEnv(IsaacEnv):
         )
         speed_reward_total = speed_reward - overspeed_penalty
         reward += speed_reward_total
+
+        gate_reentry_penalty = self.reward_gate_reentry_scale * gate_reentry_violation_this_step.float()
+        reward -= gate_reentry_penalty
+
+        exit_anchor_reward = torch.zeros_like(reward)
+        active_exit_anchor = self.exit_anchor_active & (self.exit_anchor_steps_left > 0)
+        if active_exit_anchor.any():
+            anchor_dist_now = torch.norm(
+                drone_pos_flat[active_exit_anchor] - self.exit_anchor_pos[active_exit_anchor],
+                dim=-1,
+            )
+            anchor_progress = self.exit_anchor_prev_dist[active_exit_anchor] - anchor_dist_now
+            exit_anchor_reward[active_exit_anchor] = (
+                self.reward_exit_anchor_scale * anchor_progress
+            )
+            self.exit_anchor_prev_dist[active_exit_anchor] = anchor_dist_now
+            reached_anchor = torch.zeros_like(active_exit_anchor)
+            reached_anchor[active_exit_anchor] = anchor_dist_now <= self.exit_anchor_radius
+            self.exit_anchor_steps_left[active_exit_anchor] = (
+                self.exit_anchor_steps_left[active_exit_anchor] - 1
+            ).clamp(min=0)
+            expired_anchor = self.exit_anchor_active & (self.exit_anchor_steps_left <= 0)
+            deactivate_anchor = reached_anchor | expired_anchor
+            self.exit_anchor_active[deactivate_anchor] = False
+            self.exit_anchor_steps_left[deactivate_anchor] = 0
+            self.exit_anchor_gate[deactivate_anchor] = -1
+        reward += exit_anchor_reward
 
         # 3. Sparse gate passage bonus.
         gate_reward = self.reward_gate_passage * gate_passed_this_step.float()
@@ -2573,6 +2855,23 @@ class DroneRaceEnv(IsaacEnv):
                 safe_crossed_gate_idx,
                 self.last_real_crossed_gate,
             )
+        if gate_reentry_violation_this_step.any():
+            logged_reentry_mask = (
+                gate_reentry_violation_this_step
+                & (gate_reentry_violation_gate_idx >= 0)
+                & (gate_reentry_violation_gate_idx < self.num_logged_gates)
+            )
+            safe_reentry_gate_idx = gate_reentry_violation_gate_idx.clamp(
+                0, self.gate_reentry_crosses.shape[1] - 1
+            )
+            reentry_update = torch.zeros_like(self.gate_reentry_crosses)
+            reentry_update.scatter_add_(
+                1,
+                safe_reentry_gate_idx.unsqueeze(1),
+                logged_reentry_mask.long().unsqueeze(1),
+            )
+            self.gate_reentry_crosses += reentry_update
+            self.gate_reentry_events_this_ep += gate_reentry_violation_this_step.long()
 
         self.furthest_gate_this_ep = torch.maximum(
             self.furthest_gate_this_ep, self.gate_indices
@@ -2664,6 +2963,8 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_altitude"].add_((-altitude_penalty).unsqueeze(-1))
         self.stats["reward_approach"].add_((-approach_penalty).unsqueeze(-1))
         self.stats["reward_centering"].add_((-centering_penalty).unsqueeze(-1))
+        self.stats["reward_gate_reentry"].add_((-gate_reentry_penalty).unsqueeze(-1))
+        self.stats["reward_exit_anchor"].add_(exit_anchor_reward.unsqueeze(-1))
         self.stats["reward_crash"].add_(crash_reward.unsqueeze(-1))
         # Angular rate magnitude (incremental mean)
         ang_rate_mag = ang_vel.norm(dim=-1)  # (N,)
@@ -2722,8 +3023,10 @@ class DroneRaceEnv(IsaacEnv):
         for gi in range(13):
             self.stats[f"gate_{gi}_crosses"][:] = self.per_gate_crosses[:, gi].float().unsqueeze(1)
             self.stats[f"cheating_gate_{gi}"][:] = self.repeat_gate_crosses[:, gi].float().unsqueeze(1)
+            self.stats[f"gate_reentry_gate_{gi}"][:] = self.gate_reentry_crosses[:, gi].float().unsqueeze(1)
             self.stats[f"wrong_side_gate_{gi}"][:] = self.wrong_side_violation_crosses[:, gi].float().unsqueeze(1)
         self.stats["cheating"][:] = self.repeat_gate_events_this_ep.float().unsqueeze(1)
+        self.stats["gate_reentry"][:] = self.gate_reentry_events_this_ep.float().unsqueeze(1)
         self.stats["wrong_side_violation"][:] = self.wrong_side_violation_events_this_ep.float().unsqueeze(1)
 
         # Curriculum phase (0=accuracy-first, 1=bridge-speed, 2=speed-focus).

@@ -163,6 +163,8 @@ reward_lap_speed_bonus: 300.0     # extra bonus scaled by episode time remaining
 reward_altitude_scale: 0.5        # bounded penalty for altitude mismatch at elevated gates 7 and 11
 reward_approach_scale: 0.5        # penalty for moving away from the gate when already within 6m
 reward_gate_centering_scale: 0.03 # bounded per-step penalty for missing the gate centerline near any gate
+reward_gate_reentry_scale: 35.0   # one-shot penalty when the drone backs back into the same monitored gate opening after crossing
+reward_exit_anchor_scale: 6.0     # local post-gate reward that nudges the drone onto the next segment after monitored gates
 
 # Penalties and crash termination thresholds.
 reward_angular_penalty: 0.1       # penalize squared angular rates
@@ -198,6 +200,14 @@ hard_turn_wrong_side_x_min: 0.25       # ignore tiny post-plane jitter; focus on
 hard_turn_wrong_side_x_max: 3.0        # only punish the local gate neighborhood, not the far downstream path
 wrong_side_violation_ends_episode: false # keep wrong-side termination off until this track's bottlenecks are re-measured
 hard_turn_penalty_scale: 1.0           # restore default near-gate penalties for the original-track scratch baseline
+gate_reentry_target_gates: [4, 5, 11] # zero-based gates G5, G6, G12; monitor these for post-cross backing through the same opening
+gate_reentry_monitor_substeps: 200     # keep watching the crossed gate for ~0.4 s after scoring it
+gate_reentry_clearance_x: 0.05         # require a small forward commit before a later negative-x sample counts as a re-entry
+gate_reentry_backtrack_x: -0.05        # backing back through the monitored gate opening beyond this plane triggers the penalty
+exit_anchor_target_gates: [4, 5, 11]   # zero-based gates that get a short-lived downstream exit anchor reward
+exit_anchor_distance: 1.5              # meters downstream of the crossed gate along the next-gate segment
+exit_anchor_radius: 0.6                # once the drone gets this close to the exit anchor, the local reward turns off
+exit_anchor_max_steps: 30              # keep the exit anchor alive for ~0.3 s after the monitored gate crossing
 sparse_only_gate_indices: [6, 7, 10, 11] # zero-based target gates in the stacked sections; dense shaping is disabled here
 sparse_disable_smoothness_penalties: true # allow harsher maneuvers inside sparse-only stacked-gate sections
 reward_speed_scale_phase2: 0.75        # stronger dense speed reward once reliable full laps are achieved

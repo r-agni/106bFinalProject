@@ -286,6 +286,7 @@ class IsaacEnv(EnvBase):
         for substep in range(self.substeps):
             self._pre_sim_step(tensordict)
             self.sim.step(self._should_render(substep))
+            self._post_sim_substep(tensordict, substep)
 
         self._post_sim_step(tensordict)
         self.progress_buf += 1
@@ -299,6 +300,9 @@ class IsaacEnv(EnvBase):
         pass
 
     def _post_sim_step(self, tensordict: TensorDictBase):
+        pass
+
+    def _post_sim_substep(self, tensordict: TensorDictBase, substep: int):
         pass
 
     @abc.abstractmethod

@@ -60,6 +60,14 @@ def _checkpoint_sidecar_path(checkpoint_path: str) -> str:
     return f"{root}.trainer{ext}"
 
 
+def _should_log_wandb_stat_key(key) -> bool:
+    flat_key = ".".join(key) if isinstance(key, tuple) else str(key)
+    return not (
+        flat_key == "stats.cheating"
+        or flat_key.startswith("stats.cheating_gate_")
+    )
+
+
 def _recursive_to_cpu(value):
     if isinstance(value, torch.Tensor):
         return value.detach().cpu()
@@ -770,6 +778,7 @@ def main(cfg):
             traj_stats = {
                 k: take_first_episode(v)
                 for k, v in trajs[("next", "stats")].cpu().items()
+                if _should_log_wandb_stat_key(("stats", k))
             }
 
             info = {
@@ -825,6 +834,7 @@ def main(cfg):
                 stats = {
                     "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
                     for k, v in raw_stats.items(True, True)
+                    if _should_log_wandb_stat_key(k)
                 }
                 info.update(stats)
 
@@ -916,6 +926,8 @@ def main(cfg):
                 rew_altitude     = _mean("reward_altitude")
                 rew_approach     = _mean("reward_approach")
                 rew_centering    = _mean("reward_centering")
+                rew_gate_reentry = _mean("reward_gate_reentry")
+                rew_exit_anchor  = _mean("reward_exit_anchor")
                 curriculum_phase = _mean("curriculum_phase")
                 curriculum_accuracy = _mean("curriculum_accuracy_ema")
                 curriculum_furthest = _mean("curriculum_furthest_ema")
@@ -923,11 +935,11 @@ def main(cfg):
                 reset_from_gate0 = _mean("reset_from_gate0")
                 reset_from_prev_gate = _mean("reset_from_prev_gate")
                 reset_from_random_gate = _mean("reset_from_random_gate")
-                cheating_events = _mean("cheating")
-                cheating_values = _stats_tensor("cheating")
-                cheating_rate = None
-                if cheating_values is not None:
-                    cheating_rate = cheating_values.gt(0).float().mean().item()
+                reentry_events = _mean("gate_reentry")
+                reentry_values = _stats_tensor("gate_reentry")
+                reentry_rate = None
+                if reentry_values is not None:
+                    reentry_rate = reentry_values.gt(0).float().mean().item()
 
                 derived = {}
 
@@ -1026,12 +1038,17 @@ def main(cfg):
                         and derived["race_objective/full_lap_time_sec_mean"]
                         <= race_objective_lap_time_target_sec
                     )
-                if cheating_rate is not None:
-                    derived["simple/cheating"] = cheating_rate
-                    derived["cheating/episode_rate"] = cheating_rate
-                if cheating_events is not None:
-                    derived["simple/cheating_events_per_ep"] = cheating_events
-                    derived["cheating/events_per_episode"] = cheating_events
+                if reentry_rate is not None:
+                    derived["simple/gate_reentry"] = reentry_rate
+                    derived["reentry/episode_rate"] = reentry_rate
+                if reentry_events is not None:
+                    derived["reentry/events_per_episode"] = reentry_events
+                if rew_gate_reentry is not None:
+                    derived["reentry/reward_gate_reentry"] = rew_gate_reentry
+                    derived["fixes/reward_gate_reentry"] = rew_gate_reentry
+                if rew_exit_anchor is not None:
+                    derived["reentry/reward_exit_anchor"] = rew_exit_anchor
+                    derived["fixes/reward_exit_anchor"] = rew_exit_anchor
                 if furthest_gate is not None:
                     derived["race/furthest_gate_reached"] = furthest_gate
                     derived["race/furthest_gate_number"] = furthest_gate + 1.0
@@ -1584,15 +1601,15 @@ def main(cfg):
                     controller_gate_count,
                 )
 
-                # Per-gate crossing heatmap data — every configured gate is part of
-                # the ordered lap, and on the YAML race track G13 is the finish line.
+                # Use a single consistent scalar naming scheme for per-gate
+                # crossing rates.
                 for gi in range(logged_gate_count):
                     v = _mean(f"gate_{gi}_crosses")
                     if v is not None:
-                        derived[f"gates/gate_{gi:02d}_crosses"] = v
-                        derived[f"gates_human/gate_{gi + 1:02d}_crosses"] = v
+                        derived[f"gates/gate_cross_{gi + 1}"] = v
 
-                # WandB bar chart for per-gate distribution
+                # Keep a compact per-gate crossing summary for quick visual
+                # comparison in W&B.
                 gate_counts = [
                     _mean(f"gate_{gi}_crosses") or 0.0 for gi in range(logged_gate_count)
                 ]
@@ -1609,24 +1626,42 @@ def main(cfg):
                 )
 
                 for gi in range(logged_gate_count):
-                    v = _mean(f"cheating_gate_{gi}")
+                    v = _mean(f"gate_reentry_gate_{gi}")
                     if v is not None:
-                        derived[f"cheating/gate_{gi:02d}_repeat_events"] = v
-                        derived[f"cheating_human/gate_{gi + 1:02d}_repeat_events"] = v
+                        derived[f"reentry/gate_{gi:02d}_events"] = v
+                        derived[f"reentry_human/gate_{gi + 1:02d}_events"] = v
 
-                cheating_gate_counts = [
-                    _mean(f"cheating_gate_{gi}") or 0.0
+                target_gate_aliases = {
+                    4: "05",
+                    5: "06",
+                    11: "12",
+                }
+                target_gate_total = 0.0
+                target_gate_total_seen = False
+                for zero_based_gate_idx, human_gate_label in target_gate_aliases.items():
+                    v = _mean(f"gate_reentry_gate_{zero_based_gate_idx}")
+                    if v is None:
+                        continue
+                    target_gate_total += v
+                    target_gate_total_seen = True
+                    derived[f"fixes/gate_{human_gate_label}_reentry_events"] = v
+                    derived[f"fixes/human_gate_{human_gate_label}_reentry_events"] = v
+                if target_gate_total_seen:
+                    derived["fixes/target_gate_reentry_events"] = target_gate_total
+
+                reentry_gate_counts = [
+                    _mean(f"gate_reentry_gate_{gi}") or 0.0
                     for gi in range(logged_gate_count)
                 ]
-                cheating_gate_table = wandb.Table(
-                    columns=["gate", "repeat_events"],
-                    data=[[label, val] for label, val in zip(gate_labels, cheating_gate_counts)],
+                reentry_gate_table = wandb.Table(
+                    columns=["gate", "reentry_events"],
+                    data=[[label, val] for label, val in zip(gate_labels, reentry_gate_counts)],
                 )
-                derived["cheating/repeat_gate_distribution"] = wandb.plot.bar(
-                    cheating_gate_table,
+                derived["reentry/gate_distribution"] = wandb.plot.bar(
+                    reentry_gate_table,
                     "gate",
-                    "repeat_events",
-                    title="Consecutive Same-Gate Repeat Events",
+                    "reentry_events",
+                    title="Gate Re-entry Events",
                 )
 
                 info.update(derived)

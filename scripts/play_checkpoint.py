@@ -9,7 +9,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from omni_drones import init_simulation_app
-from torchrl.envs.utils import set_exploration_type, ExplorationType
+from torchrl.envs.utils import set_exploration_type, ExplorationType, step_mdp
 from omni_drones.utils.torchrl import SyncDataCollector, RenderCallback
 from omni_drones.utils.torchrl.transforms import (
     FromMultiDiscreteAction,
@@ -33,6 +33,36 @@ def _checkpoint_sidecar_path(checkpoint_path: str) -> str:
     if not ext:
         ext = ".pt"
     return f"{root}.trainer{ext}"
+
+
+def _manual_episode_rollout(env, policy, max_steps: int, exploration: ExplorationType):
+    """Run a single episode with explicit reset/step control.
+
+    Isaac playback was unstable when chaining episodes through env.rollout with
+    auto_reset=True. Driving each episode manually keeps resets isolated and
+    produces one clean stats snapshot per episode.
+    """
+
+    tensordict = env.reset()
+    final_stats = None
+
+    with set_exploration_type(exploration):
+        for _ in range(max_steps):
+            policy_output = policy(tensordict)
+            step_td = env.step(policy_output)
+            next_td = step_td.get("next")
+            final_stats = next_td["stats"].clone().cpu()
+
+            done = next_td.get("done")
+            if torch.any(done):
+                break
+
+            tensordict = step_mdp(step_td)
+
+    if final_stats is None:
+        raise RuntimeError("Playback episode produced no stats.")
+
+    return final_stats
 
 
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
@@ -234,27 +264,12 @@ def main(cfg):
         target_episodes = max_episodes if max_episodes is not None else 1
 
         for episode_idx in range(target_episodes):
-            env.reset()
-            with set_exploration_type(exploration):
-                trajs = env.rollout(
-                    max_steps=base_env.max_episode_length,
-                    policy=policy,
-                    auto_reset=True,
-                    break_when_any_done=True,
-                    return_contiguous=False,
-                )
-
-            done = trajs.get(("next", "done"))
-            first_done = torch.argmax(done.long(), dim=1).cpu()
-
-            def take_first_episode(tensor: torch.Tensor):
-                indices = first_done.reshape(first_done.shape + (1,) * (tensor.ndim - 2))
-                return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
-
-            traj_stats = {
-                k: take_first_episode(v)
-                for k, v in trajs[("next", "stats")].cpu().items()
-            }
+            traj_stats = _manual_episode_rollout(
+                env=env,
+                policy=policy,
+                max_steps=base_env.max_episode_length,
+                exploration=exploration,
+            )
             completed_episodes += base_env.num_envs
             if "success" in traj_stats:
                 successful_episodes += int(traj_stats["success"].sum().item())

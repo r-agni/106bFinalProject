@@ -274,6 +274,9 @@ class DroneRaceEnv(IsaacEnv):
         self.phase2_disable_wrong_side_penalty = bool(
             cfg.task.get("phase2_disable_wrong_side_penalty", False)
         )
+        self.wrong_side_violation_ends_episode = bool(
+            cfg.task.get("wrong_side_violation_ends_episode", True)
+        )
         self.hard_turn_penalty_scale = float(
             cfg.task.get("hard_turn_penalty_scale", 1.0)
         )
@@ -390,6 +393,15 @@ class DroneRaceEnv(IsaacEnv):
             self.num_envs, device=self.device, dtype=torch.long
         )
         self.repeat_gate_crosses = torch.zeros(
+            self.num_envs, 13, device=self.device, dtype=torch.long
+        )
+        self.wrong_side_violation_latched = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.wrong_side_violation_events_this_ep = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.wrong_side_violation_crosses = torch.zeros(
             self.num_envs, 13, device=self.device, dtype=torch.long
         )
         self.episode_start_gate = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -1353,6 +1365,7 @@ class DroneRaceEnv(IsaacEnv):
             "reward_approach": Unbounded(1),    # cumulative near-gate retreat penalty term
             "reward_centering": Unbounded(1),   # cumulative near-gate centerline penalty term
             "reward_crash": Unbounded(1),       # cumulative crash penalties
+            "wrong_side_violation": Unbounded(1),
             # Angular rate magnitude
             "mean_ang_rate": Unbounded(1),      # mean ||ang_vel|| over episode
             # Angular penalty decay (scalar, same for all envs)
@@ -1408,6 +1421,19 @@ class DroneRaceEnv(IsaacEnv):
             "cheating_gate_10": Unbounded(1),
             "cheating_gate_11": Unbounded(1),
             "cheating_gate_12": Unbounded(1),
+            "wrong_side_gate_0": Unbounded(1),
+            "wrong_side_gate_1": Unbounded(1),
+            "wrong_side_gate_2": Unbounded(1),
+            "wrong_side_gate_3": Unbounded(1),
+            "wrong_side_gate_4": Unbounded(1),
+            "wrong_side_gate_5": Unbounded(1),
+            "wrong_side_gate_6": Unbounded(1),
+            "wrong_side_gate_7": Unbounded(1),
+            "wrong_side_gate_8": Unbounded(1),
+            "wrong_side_gate_9": Unbounded(1),
+            "wrong_side_gate_10": Unbounded(1),
+            "wrong_side_gate_11": Unbounded(1),
+            "wrong_side_gate_12": Unbounded(1),
             # Controller diagnostics
             "controller_speed_pressure": Unbounded(1),
             "controller_exploration_pressure": Unbounded(1),
@@ -1507,6 +1533,9 @@ class DroneRaceEnv(IsaacEnv):
         self.last_real_crossed_gate[env_ids] = -1
         self.repeat_gate_events_this_ep[env_ids] = 0
         self.repeat_gate_crosses[env_ids] = 0
+        self.wrong_side_violation_latched[env_ids] = False
+        self.wrong_side_violation_events_this_ep[env_ids] = 0
+        self.wrong_side_violation_crosses[env_ids] = 0
         self.controller_explore_episode[env_ids] = explore_mask
         self.controller_episode_overspeed_acc[env_ids] = 0.0
         self.furthest_gate_this_ep[env_ids] = start_gates
@@ -1629,6 +1658,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_approach"][env_ids] = 0.
         self.stats["reward_centering"][env_ids] = 0.
         self.stats["reward_crash"][env_ids] = 0.
+        self.stats["wrong_side_violation"][env_ids] = 0.
         self.stats["mean_ang_rate"][env_ids] = 0.
         self.stats["ang_penalty_decay_frac"][env_ids] = 0.
         self.stats["curriculum_phase"][env_ids] = float(self.curriculum_phase)
@@ -1654,6 +1684,7 @@ class DroneRaceEnv(IsaacEnv):
         for gi in range(13):
             self.stats[f"gate_{gi}_crosses"][env_ids] = 0.
             self.stats[f"cheating_gate_{gi}"][env_ids] = 0.
+            self.stats[f"wrong_side_gate_{gi}"][env_ids] = 0.
         if getattr(self, "enable_viewport", False):
             camera_mode = str(self.cfg.get("play_camera_mode", "track")).lower()
             if camera_mode == "follow":
@@ -1994,10 +2025,42 @@ class DroneRaceEnv(IsaacEnv):
         gates_passed_successfully = crossed_plane & in_bounds_y & in_bounds_z
         # ----- END STUDENT CODE -----
         
-        gate_passed_this_step = gates_passed_successfully & (~self.gate_passed)
+        old_gate_indices = self.gate_indices.clone()
+        wrong_side_target_mask = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        for gate_idx in self.wrong_side_penalty_target_gates:
+            wrong_side_target_mask |= old_gate_indices == gate_idx
+        wrong_side_violation_now = (
+            wrong_side_target_mask
+            & (~self.gate_passed)
+            & (~self.wrong_side_violation_latched)
+            & (~gates_passed_successfully)
+            & (curr_in_gate[..., 0] >= self.hard_turn_wrong_side_x_min)
+            & (curr_in_gate[..., 0] <= self.hard_turn_wrong_side_x_max)
+            & (curr_in_gate[..., 1].abs() <= self.gate_width)
+            & (curr_in_gate[..., 2].abs() <= self.gate_height)
+        )
+        if wrong_side_violation_now.any():
+            self.wrong_side_violation_latched[wrong_side_violation_now] = True
+            self.wrong_side_violation_events_this_ep[wrong_side_violation_now] += 1
+            safe_wrong_side_gate_idx = old_gate_indices.clamp(
+                0, self.wrong_side_violation_crosses.shape[1] - 1
+            )
+            wrong_side_update = torch.zeros_like(self.wrong_side_violation_crosses)
+            wrong_side_update.scatter_add_(
+                1,
+                safe_wrong_side_gate_idx.unsqueeze(1),
+                wrong_side_violation_now.long().unsqueeze(1),
+            )
+            self.wrong_side_violation_crosses += wrong_side_update
+        gate_passed_this_step = (
+            gates_passed_successfully
+            & (~self.gate_passed)
+            & (~self.wrong_side_violation_latched)
+        )
         self.gate_passed[gate_passed_this_step] = True
 
-        old_gate_indices = self.gate_indices.clone()
         crossed_gate_idx = old_gate_indices.clone()
         last_gate_passed = gate_passed_this_step & (crossed_gate_idx == self.num_course_gates - 1)
         self.track_completed[last_gate_passed] = True
@@ -2440,7 +2503,10 @@ class DroneRaceEnv(IsaacEnv):
         dist_crash &= ~in_grace
         dist_crash &= ~stacked_reversal_in_grace
 
-        crashed = phys_crash | ground_crash | dist_crash
+        wrong_side_crash = (
+            self.wrong_side_violation_latched & self.wrong_side_violation_ends_episode
+        )
+        crashed = phys_crash | ground_crash | dist_crash | wrong_side_crash
 
         # Apply crash penalty to reward.
         reward -= self.reward_crash_scale * crashed.float()
@@ -2633,7 +2699,9 @@ class DroneRaceEnv(IsaacEnv):
         for gi in range(13):
             self.stats[f"gate_{gi}_crosses"][:] = self.per_gate_crosses[:, gi].float().unsqueeze(1)
             self.stats[f"cheating_gate_{gi}"][:] = self.repeat_gate_crosses[:, gi].float().unsqueeze(1)
+            self.stats[f"wrong_side_gate_{gi}"][:] = self.wrong_side_violation_crosses[:, gi].float().unsqueeze(1)
         self.stats["cheating"][:] = self.repeat_gate_events_this_ep.float().unsqueeze(1)
+        self.stats["wrong_side_violation"][:] = self.wrong_side_violation_events_this_ep.float().unsqueeze(1)
 
         # Curriculum phase (0=accuracy-first, 1=bridge-speed, 2=speed-focus).
         self.stats["curriculum_phase"][:] = float(self.curriculum_phase)

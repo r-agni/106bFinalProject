@@ -81,68 +81,64 @@ save_interval: 10  # keep resumes from going too long between checkpoints
 #     yaw: 1.57
 
 # Race track — 13 YAML gate entries (original EECS106B positions).
-# Gates 1-13 are the full ordered lap. Gate 13 intentionally duplicates Gate 1
-# so the finish line coincides with the start line, but it is a real rewardable
-# finish gate and must be crossed to complete the lap.
-# Elevated gates at 7 and 11 (z=3.0).
-# Sharp turns at gates 5→6 and 7→8 (180° reversal).
+# Race track
 track_config:
   "1":
-    pos: [14.0, 34.0, 1.0]
-    yaw: 0.0
-
-  "2":
-    pos: [20.0, 30.0, 1.0]
-    yaw: -0.78
-
-  "3":
-    pos: [21.0, 22.0, 1.0]
-    yaw: -1.049
-
-  "4":
-    pos: [24.0, 12.0, 1.0]
-    yaw: -1.57
-
-  "5":
-    pos: [19.0, 6.0, 1.0]
-    yaw: 2.97
-
-  "6":
-    pos: [14.0, 14.0, 1.0]
+    pos: [12.5, 2.0, 1.0]
     yaw: 3.14
 
+  "2":
+    pos: [6.5, 6.0, 1.0]
+    yaw: 2.36
+
+  "3":
+    pos: [5.5, 14.0, 1.0]
+    yaw: 2.093
+
+  "4":
+    pos: [2.5, 24.0, 1.0]
+    yaw: 1.57
+
+  "5":
+    pos: [7.5, 30.0, 1.0]
+    yaw: 6.11
+
+  "6":
+    pos: [12.2, 22.0, 1.0]
+    yaw: 6.28
+
   "7":
-    pos: [9.0, 6.0, 3.0]     # elevated gate — climb here
-    yaw: 4.54
+    pos: [17.5, 30.0, 3.0]
+    yaw: 7.68
 
   "8":
-    pos: [9.0, 6.0, 1.0]     # same XY as gate 7, drop back to z=1; 180° reversal
-    yaw: 1.40
+    pos: [17.5, 30.0, 1.0]
+    yaw: 4.54
 
   "9":
-    pos: [8.0, 14.0, 1.0]
-    yaw: 1.74
+    pos: [18.0, 22.0, 1.0]
+    yaw: 4.88
 
   "10":
-    pos: [6.0, 22.0, 1.0]
-    yaw: 1.40
+    pos: [20.5, 14.0, 1.0]
+    yaw: 4.54
 
   "11":
-    pos: [8.0, 30.0, 3.0]    # elevated gate — climb here
-    yaw: 0.78
+    pos: [18.5, 6.0, 3.0]
+    yaw: 3.92
 
   "12":
-    pos: [8.0, 30.0, 1.0]    # same XY as gate 11, drop back to z=1; yaw reversed 180° so crossing detection works
-    yaw: 3.921               # = 0.78 + pi; must face OPPOSITE to gate 11 (same as gate 7/8 design)
+    pos: [18.5, 6.0, 1.0]
+    yaw: 3.92
 
   "13":
-    pos: [14.0, 34.0, 1.0]   # duplicated gate-1 finish line; this crossing completes the lap
-    yaw: 0.0
+    pos: [12.5, 2.0, 1.0]
+    yaw: 3.14
     
 # Gate settings
 gate_scale: 1.0
-gate_height: 1.5   # original gate design — do not change
-gate_width: 1.5    # original gate design — do not change 
+gate_height: 2.5
+gate_width: 2.5
 
 # ---- Reward hyperparameters (tuned for the 13-gate race track) ----
 # Phase 0: learn the ordered lap with gate / sequence rewards plus light guidance.
@@ -189,18 +185,19 @@ reset_curriculum_gate0_prob: 0.40      # keep some full-lap pressure, but spend 
 reset_curriculum_prev_gate_prob: 0.50  # focused practice starts from the gate immediately before the active weak gate
 reset_curriculum_random_gate_prob: 0.10 # small amount of broad coverage from uniformly random real course gates
 reset_curriculum_metric_alpha: 0.01    # EMA smoothing for gate-0-start per-gate passage reliability
-hard_turn_target_gates: [4, 5]         # zero-based sharp-turn bottleneck spans actual gates 5 and 6
-wrong_side_penalty_target_gates: [4, 5] # zero-based gates 5 and 6 are the only gates that need wrong-side entry penalties
-reward_hard_turn_direction_scale: 2.5  # signed gate-frame progress shaping through the gate-5 setup corridor
-reward_hard_turn_clear_bonus: 18.0     # extra sparse reward for actually clearing the gate-5 bottleneck
+hard_turn_target_gates: []             # no gate-specific hard-turn shaping in the original-track scratch baseline
+wrong_side_penalty_target_gates: []    # disable previous-track wrong-side targeting for the original-track scratch baseline
+reward_hard_turn_direction_scale: 0.0  # disable gate-5/6-specific corridor shaping for the original-track scratch baseline
+reward_hard_turn_clear_bonus: 0.0      # disable gate-5/6-specific sparse bonus for the original-track scratch baseline
 hard_turn_corridor_x_min: -10.0        # start guiding the drone earlier on the gate-5 approach
 hard_turn_corridor_x_max: 4.0
 hard_turn_corridor_halfwidth: 4.5      # allow a wide turning arc before centering penalties fully apply
 hard_turn_corridor_height: 3.0
-reward_hard_turn_wrong_side_scale: 4.0 # penalize drifting onto a target gate's exit side before a legal crossing
+reward_hard_turn_wrong_side_scale: 0.0 # disable previous-track wrong-side shaping for the original-track scratch baseline
 hard_turn_wrong_side_x_min: 0.25       # ignore tiny post-plane jitter; focus on real backside approaches
 hard_turn_wrong_side_x_max: 3.0        # only punish the local gate neighborhood, not the far downstream path
-hard_turn_penalty_scale: 0.25          # suppress most near-gate penalties in the gate-5 corridor
+wrong_side_violation_ends_episode: false # keep wrong-side termination off until this track's bottlenecks are re-measured
+hard_turn_penalty_scale: 1.0           # restore default near-gate penalties for the original-track scratch baseline
 sparse_only_gate_indices: [6, 7, 10, 11] # zero-based target gates in the stacked sections; dense shaping is disabled here
 sparse_disable_smoothness_penalties: true # allow harsher maneuvers inside sparse-only stacked-gate sections
 reward_speed_scale_phase2: 0.75        # stronger dense speed reward once reliable full laps are achieved

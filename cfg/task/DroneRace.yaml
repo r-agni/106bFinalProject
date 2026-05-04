@@ -10,8 +10,9 @@ defaults:
 ppo_cfg: DroneRace.yaml
 
 env:
-  num_envs: 500            # <-- EDIT: number of parallel environments
-  max_episode_length: 500 # <-- EDIT: max steps per episode before truncation
+  num_envs: 2048
+  env_spacing: 45
+  max_episode_length: 2500
 
 sim:
   substeps: 5   # overrides the default of 5
@@ -21,8 +22,9 @@ drone_model:
   name: Iris
   controller: RateController
 
-total_frames: 200_000_000
-save_interval: 100 
+total_frames: 400_000_000
+save_interval: 50
+eval_interval: -1
 # seed: 0
 
 # Track configuration: config-based track with custom gate positions and orientations
@@ -30,22 +32,22 @@ save_interval: 100
 # IMPORTANT: The last gate should be the exact same pos and yaw as the first gate. 
 
 # Circular track 
-track_config:
-  "1":
-    pos: [0.0, 0.0, 1.0]
-    yaw: 1.57
-  "2":
-    pos: [5.0, 5.0, 1.0]
-    yaw: 0
-  "3":
-    pos: [10.0, 0.0, 1.0]
-    yaw: -1.57
-  "4":
-    pos: [5.0, -5.0, 1.0]
-    yaw: 3.14  # pi
-  "5":
-    pos: [0.0, 0.0, 1.0]
-    yaw: 1.57
+# track_config:
+#   "1":
+#     pos: [0.0, 0.0, 1.0]
+#     yaw: 1.57
+#   "2":
+#     pos: [5.0, 5.0, 1.0]
+#     yaw: 0
+#   "3":
+#     pos: [10.0, 0.0, 1.0]
+#     yaw: -1.57
+#   "4":
+#     pos: [5.0, -5.0, 1.0]
+#     yaw: 3.14  # pi
+#   "5":
+#     pos: [0.0, 0.0, 1.0]
+#     yaw: 1.57
 
 # Figure 8 
 # track_config:
@@ -71,74 +73,110 @@ track_config:
 #     pos: [0.0, 0.0, 1.0]
 #     yaw: 1.57
 
-# Race track
-# track_config:
-#   "1":
-#     pos: [12.5, 2.0, 1.0]
-#     yaw: 3.14
+# Race track. Do not move these gates: this is the target course.
+track_config:
+  "1":
+    pos: [12.5, 2.0, 1.0]
+    yaw: 3.14
 
-#   "2":
-#     pos: [6.5, 6.0, 1.0]
-#     yaw: 2.36
+  "2":
+    pos: [6.5, 6.0, 1.0]
+    yaw: 2.36
 
-#   "3":
-#     pos: [5.5, 14.0, 1.0]
-#     yaw: 2.093
+  "3":
+    pos: [5.5, 14.0, 1.0]
+    yaw: 2.093
 
-#   "4":
-#     pos: [2.5, 24.0, 1.0]
-#     yaw: 1.57
+  "4":
+    pos: [2.5, 24.0, 1.0]
+    yaw: 1.57
 
-#   "5":
-#     pos: [7.5, 30.0, 1.0]
-#     yaw: 6.11
+  "5":
+    pos: [7.5, 30.0, 1.0]
+    yaw: 6.11
 
-#   "6":
-#     pos: [12.2, 22.0, 1.0]
-#     yaw: 6.28
+  "6":
+    pos: [12.2, 22.0, 1.0]
+    yaw: 6.28
 
-#   "7":
-#     pos: [17.5, 30.0, 3.0]
-#     yaw: 7.68
+  "7":
+    pos: [17.5, 30.0, 3.0]
+    yaw: 7.68
 
-#   "8":
-#     pos: [17.5, 30.0, 1.0]
-#     yaw: 4.54
+  "8":
+    pos: [17.5, 30.0, 1.0]
+    yaw: 4.54
 
-#   "9":
-#     pos: [18.0, 22.0, 1.0]
-#     yaw: 4.88
+  "9":
+    pos: [18.0, 22.0, 1.0]
+    yaw: 4.88
 
-#   "10":
-#     pos: [20.5, 14.0, 1.0]
-#     yaw: 4.54
+  "10":
+    pos: [20.5, 14.0, 1.0]
+    yaw: 4.54
 
-#   "11":
-#     pos: [18.5, 6.0, 3.0]
-#     yaw: 3.92
+  "11":
+    pos: [18.5, 6.0, 3.0]
+    yaw: 3.92
 
-#   "12":
-#     pos: [18.5, 6.0, 1.0]
-#     yaw: 3.92
+  "12":
+    pos: [18.5, 6.0, 1.0]
+    yaw: 3.92
 
-#   "13":
-#     pos: [12.5, 2.0, 1.0]
-#     yaw: 3.14
+  "13":
+    pos: [12.5, 2.0, 1.0]
+    yaw: 3.14
     
 # Gate settings
 gate_scale: 1.0
 gate_height: 2.5 
 gate_width: 2.5 
 
-# ---- STUDENT EDIT: reward hyperparameters --------------------------------
-# Add one line per reward scale you define in drone_race.py __init__.
-# They are read via cfg.task.get("key", default). Rename / extend as needed.
-#
-reward_example: 0.5          # <-- EDIT or replace with your own reward scales
-# reward_progress_scale: 1.0
-# reward_gate_passage: 10.0
-# reward_crash_scale: 5.0
-# --------------------------------------------------------------------------
+lookahead_gates: 3
+waypoint_offset: 1.75
+start_distance: 2.0
+start_lateral_noise: 0.15
+start_vertical_noise: 0.10
+
+payload:
+  enabled: true
+  bar_length: 1.0
+  mass: 0.30
+  radius: 0.04
+
+# Curriculum stage:
+#   1: random gate starts
+#   2: mixed starts, controlled by random_start_prob
+#   3: gate-0-only full laps
+curriculum_stage: 1
+random_start_prob: 0.7
+
+reward_progress_scale: 4.0
+reward_centerline_scale: 0.7
+reward_payload_centerline_scale: 0.9
+reward_gate_passage: 25.0
+reward_drone_gate_entry: 5.0
+reward_completion: 250.0
+reward_time_penalty: 0.015
+reward_speed_scale: 0.04
+reward_effort_weight: 0.002
+reward_action_smoothness_weight: 0.01
+reward_payload_swing_weight: 0.08
+reward_payload_lateral_velocity_weight: 0.02
+reward_crash: 80.0
+reward_wrong_gate: 120.0
+reward_payload_miss: 120.0
+reward_stall: 30.0
+
+progress_clamp: 3.0
+speed_reward_cap: 20.0
+bounds_margin_xy: 8.0
+bounds_min_z: 0.15
+bounds_max_z: 7.0
+contact_force_threshold: 1.0e-4
+stall_speed: 0.2
+stall_grace_steps: 150
+stall_distance: 2.0
 
 debug_gate_origins: false
 debug_axis_length: 0.5

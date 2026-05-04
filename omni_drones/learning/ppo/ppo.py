@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -342,7 +342,24 @@ class PPOPolicy(TensorDictModuleBase):
         if self.cfg.checkpoint_path is not None:
             state_dict = torch.load(self.cfg.checkpoint_path, map_location=self.device)
             state_dict = _adapt_checkpoint_state_dict(self.state_dict(), state_dict)
-            self.load_state_dict(state_dict, strict=False)
+            incompatible = self.load_state_dict(state_dict, strict=False)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                logging.warning(
+                    "Checkpoint %s loaded with %d missing keys and %d unexpected keys.",
+                    self.cfg.checkpoint_path,
+                    len(incompatible.missing_keys),
+                    len(incompatible.unexpected_keys),
+                )
+                if incompatible.missing_keys:
+                    logging.warning(
+                        "Missing keys (first 20): %s",
+                        incompatible.missing_keys[:20],
+                    )
+                if incompatible.unexpected_keys:
+                    logging.warning(
+                        "Unexpected keys (first 20): %s",
+                        incompatible.unexpected_keys[:20],
+                    )
         else:
             print(f"\n\n--------------------")
             print("No model loaded, using an random initial policy")
@@ -391,8 +408,12 @@ class PPOPolicy(TensorDictModuleBase):
         with torch.no_grad():
             next_values = self.critic(next_tensordict)["state_value"]
         rewards = tensordict[("next", "agents", "reward")]
+        terminal_done = (
+            tensordict[("next", "done")]
+            & ~tensordict[("next", "truncated")]
+        )
         dones = einops.repeat(
-            tensordict[("next", "terminated")],
+            terminal_done,
             "t e 1 -> t e a 1",
             a=self.n_agents
         )

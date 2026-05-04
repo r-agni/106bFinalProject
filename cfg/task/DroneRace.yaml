@@ -157,7 +157,7 @@ reward_stacked_clear_bonus: 30.0    # extra sparse bonus for actually clearing t
 reward_gate_passage: 60.0         # per-gate reward; crossing gates should dominate phase-0 learning
 reward_gate_sequence_scale: 20.0  # stronger bonus for longer ordered gate streaks within the episode
 reward_lap_completion: 530.0      # safely restore the old accidental lap-closure bonus without corrupting gate-11 bookkeeping
-reward_lap_speed_bonus: 300.0     # extra bonus scaled by episode time remaining; enabled only after unlock
+reward_lap_speed_bonus: 600.0     # larger sparse incentive for completing fast clean laps once the course is learned
 
 # Auxiliary penalties for local mistakes.
 reward_altitude_scale: 0.5        # bounded penalty for altitude mismatch at elevated gates 7 and 11
@@ -183,8 +183,8 @@ curriculum_min_phase_frames: 2_000_000 # minimum frames before the speed phase c
 curriculum_ema_alpha: 0.01             # EMA smoothing for curriculum metrics
 reset_curriculum_enabled: true         # allocate some resets to the earliest unsolved gate bottleneck once gate-0-start passage drops below threshold
 reset_curriculum_gate_pass_threshold: 0.90 # activate practice resets when the earliest gate-0-start passage EMA falls below this
-reset_curriculum_gate0_prob: 0.40      # keep some full-lap pressure, but spend much more time near the weak gate
-reset_curriculum_prev_gate_prob: 0.50  # focused practice starts from the gate immediately before the active weak gate
+reset_curriculum_gate0_prob: 0.70      # bias the speed run toward true gate-0 full laps once the course is learned
+reset_curriculum_prev_gate_prob: 0.20  # keep some bottleneck practice, but do not let it dominate the speed-focused stage
 reset_curriculum_random_gate_prob: 0.10 # small amount of broad coverage from uniformly random real course gates
 reset_curriculum_metric_alpha: 0.01    # EMA smoothing for gate-0-start per-gate passage reliability
 hard_turn_target_gates: []             # no gate-specific hard-turn shaping in the original-track scratch baseline
@@ -210,9 +210,9 @@ exit_anchor_radius: 0.6                # once the drone gets this close to the e
 exit_anchor_max_steps: 30              # keep the exit anchor alive for ~0.3 s after the monitored gate crossing
 sparse_only_gate_indices: [6, 7, 10, 11] # zero-based target gates in the stacked sections; dense shaping is disabled here
 sparse_disable_smoothness_penalties: true # allow harsher maneuvers inside sparse-only stacked-gate sections
-reward_speed_scale_phase2: 0.75        # stronger dense speed reward once reliable full laps are achieved
-reward_speed_target_ms_phase2: 8.0     # higher speed target for the final speed-focused phase
-phase2_disable_dense_shaping: true     # turn off dense shaping / penalty helpers in the final speed phase
+reward_speed_scale_phase2: 1.10        # stronger dense speed reward once reliable full laps are achieved
+reward_speed_target_ms_phase2: 10.0    # higher speed target for the final speed-focused phase
+phase2_disable_dense_shaping: false    # keep dense shaping on during the speed run so the policy gets cleaner lap-time gradients
 phase2_disable_wrong_side_penalty: false # keep the wrong-side gate-entry penalty on during the final speed phase
 stacked_reversal_entry_gates: [6, 10]     # elevated stacked gates that transition into the hard lower reversal gates
 stacked_reversal_target_gates: [7, 11]    # lower stacked gates that need extra local credit assignment
@@ -247,25 +247,25 @@ controller_stabilize_crash_target: 0.20      # phase-1 unlock requires low crash
 controller_phase2_completion_target: 0.84    # once unlocked, keep pushing speed as long as completion stays comfortably high
 controller_phase2_hard_gate_target: 0.86     # preserve stacked-gate quality while minimizing lap time
 controller_phase2_final_gate_target: 0.84    # preserve late-gate quality while minimizing lap time
-controller_phase2_completion_floor: 0.76     # drop below this and immediately back off speed pressure
+controller_phase2_completion_floor: 0.73     # tolerate a small completion dip before panicking during the speed push
 controller_phase2_final_gate_floor: 0.78     # late gates are the first collapse signal during high-speed training
 controller_phase2_crash_target: 0.18         # acceptable crash rate while aggressively searching for faster lines
 controller_phase2_crash_recover: 0.28        # panic threshold for high-speed collapse recovery
 controller_phase1_initial_speed_pressure: 0.10 # mild speed pressure as soon as the course is learned
-controller_phase2_initial_speed_pressure: 0.35 # start phase 2 already moving faster instead of ramping from zero
-controller_phase2_speed_up_step: 0.03          # accelerate speed pressure more aggressively in lap-time mode
-controller_phase2_speed_down_step: 0.06        # back off if completion / late-gate quality slips
+controller_phase2_initial_speed_pressure: 0.55 # start phase 2 closer to an actually fast regime instead of rebuilding pressure slowly
+controller_phase2_speed_up_step: 0.045         # accelerate speed pressure more aggressively in lap-time mode
+controller_phase2_speed_down_step: 0.045       # soften the rollback so the controller keeps searching for faster lines
 controller_phase2_panic_step: 0.18             # hard rollback when high-speed behavior destabilizes
 controller_phase2_plateau_start_pressure: 0.45 # only start structured line-search once speed pressure is meaningfully high
 controller_completion_drop_recover: 0.10       # detect real performance collapses quickly from recent history
 controller_min_phase_frames: 0                 # no extra dwell once the 90%+ stability window is satisfied; unlock speed mode quickly on strong resumes
 speed_budget_a_lat_conservative: 4.5
-speed_budget_a_lat_aggressive: 8.0
+speed_budget_a_lat_aggressive: 9.5
 speed_budget_vertical_discount: 0.90
 speed_budget_entry_discount: 0.92
-speed_budget_target_discount: 0.85
+speed_budget_target_discount: 0.90
 speed_budget_v_min: 3.5
-speed_budget_v_max: 12.0
+speed_budget_v_max: 13.0
 
 # Safety / penalty schedule.
 angular_penalty_decay_frames: 100_000_000 # keep angular damping active through the early learning stages

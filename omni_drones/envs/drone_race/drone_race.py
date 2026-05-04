@@ -346,6 +346,23 @@ class DroneRaceEnv(IsaacEnv):
         self.exit_anchor_max_steps = int(
             cfg.task.get("exit_anchor_max_steps", 30)
         )
+        self.gate_reentry_probe_body_length = float(
+            cfg.task.get("play_body_shell_length", 0.28)
+        )
+        self.gate_reentry_probe_shell_lift = float(
+            cfg.task.get("play_body_shell_lift", 0.015)
+        )
+        self.gate_reentry_probe_arm_span = float(
+            cfg.task.get("play_body_shell_arm_span", 0.42)
+        )
+        self.gate_reentry_invalidate_mask = torch.zeros(
+            self.num_course_gates, device=self.device, dtype=torch.bool
+        )
+        if self.num_course_gates > 11:
+            # Only Gate 12 uses strict pass invalidation; Gate 5/6 keep the lighter
+            # penalty-only behavior that was already working well.
+            self.gate_reentry_invalidate_mask[11] = True
+        self.gate_reentry_probe_offsets = self._build_gate_monitor_probe_offsets()
         default_hard_gates = (6, 7, 10, 11)
         default_final_gates = (10, 11)
         self.controller_completion_target = float(cfg.task.get("controller_completion_target", 0.78))
@@ -918,6 +935,79 @@ class DroneRaceEnv(IsaacEnv):
         )
         self.exit_anchor_steps_left[env_ids] = self.exit_anchor_max_steps
 
+    def _build_gate_monitor_probe_offsets(self) -> torch.Tensor:
+        body_length = self.gate_reentry_probe_body_length
+        shell_lift = self.gate_reentry_probe_shell_lift
+        arm_span = self.gate_reentry_probe_arm_span
+        rotor_extent = arm_span * 0.5
+        return torch.tensor(
+            [
+                [body_length * 0.50, 0.0, shell_lift],
+                [-body_length * 0.45, 0.0, shell_lift],
+                [rotor_extent, rotor_extent, shell_lift],
+                [rotor_extent, -rotor_extent, shell_lift],
+                [-rotor_extent, rotor_extent, shell_lift],
+                [-rotor_extent, -rotor_extent, shell_lift],
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+    def _gate_probe_points_in_frame(
+        self,
+        env_ids: torch.Tensor,
+        drone_pos: torch.Tensor,
+        drone_rot: torch.Tensor,
+        gate_center: torch.Tensor,
+        gate_rot: torch.Tensor,
+    ) -> torch.Tensor:
+        probe_offsets_base = self.gate_reentry_probe_offsets.to(drone_pos.device)
+        probe_count = probe_offsets_base.shape[0]
+        probe_offsets = probe_offsets_base.unsqueeze(0).expand(
+            env_ids.shape[0], -1, -1
+        )
+        probe_world = quat_rotate(
+            drone_rot.unsqueeze(1).expand(-1, probe_count, -1).reshape(-1, 4),
+            probe_offsets.reshape(-1, 3),
+        ).reshape(-1, probe_count, 3)
+        probe_world = probe_world + drone_pos.unsqueeze(1)
+        return quat_rotate_inverse(
+            gate_rot.unsqueeze(1).expand(-1, probe_count, -1).reshape(-1, 4),
+            (probe_world - gate_center.unsqueeze(1)).reshape(-1, 3),
+        ).reshape(-1, probe_count, 3)
+
+    def _revoke_gate_progress(self, env_ids: torch.Tensor, gate_idx: torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+
+        safe_gate_idx = gate_idx.clamp(0, self.num_course_gates - 1)
+        self.gate_indices[env_ids] = safe_gate_idx
+        self.gate_passed[env_ids] = False
+        self.track_completed[env_ids] = False
+        self.gates_crossed_this_ep[env_ids] = (
+            self.gates_crossed_this_ep[env_ids] - 1
+        ).clamp(min=0)
+
+        current_crosses = self.per_gate_crosses[env_ids, safe_gate_idx]
+        self.per_gate_crosses[env_ids, safe_gate_idx] = (
+            current_crosses - 1
+        ).clamp(min=0)
+        self.last_real_crossed_gate[env_ids] = (
+            safe_gate_idx - 1
+        ).remainder(self.num_course_gates)
+
+        gate_world_pos, gate_world_rot = self.gates.get_world_poses()
+        gate_env_pos, gate_env_rot = self.get_env_poses((gate_world_pos, gate_world_rot))
+        gate_pos = gate_env_pos[env_ids, safe_gate_idx]
+        gate_rot = gate_env_rot[env_ids, safe_gate_idx]
+        gate_center = self._get_gate_center(gate_pos, gate_rot)
+
+        root_state = self.drone.get_state()[..., :13]
+        drone_pos = root_state[..., :3].squeeze(1)[env_ids]
+        self.prev_drone_in_gate_frame[env_ids] = quat_rotate_inverse(
+            gate_rot, drone_pos - gate_center
+        )
+
     def _post_sim_substep(self, tensordict: TensorDictBase, substep: int):
         active_mask = self.gate_reentry_monitor_steps_left > 0
         if not active_mask.any():
@@ -925,31 +1015,67 @@ class DroneRaceEnv(IsaacEnv):
 
         root_state = self.drone.get_state()[..., :13]
         drone_pos = root_state[..., :3].squeeze(1)
+        drone_rot = root_state[..., 3:7].squeeze(1)
+        active_ids = active_mask.nonzero(as_tuple=False).squeeze(-1)
+        monitor_gates = self.gate_reentry_monitor_gate[active_ids].clamp(
+            0, self.num_course_gates - 1
+        )
+        invalidate_mask = self.gate_reentry_invalidate_mask.to(monitor_gates.device)
         rel = quat_rotate_inverse(
-            self.gate_reentry_monitor_rot[active_mask],
-            drone_pos[active_mask] - self.gate_reentry_monitor_center[active_mask],
+            self.gate_reentry_monitor_rot[active_ids],
+            drone_pos[active_ids] - self.gate_reentry_monitor_center[active_ids],
         )
         rel_x = rel[:, 0]
         rel_y = rel[:, 1]
         rel_z = rel[:, 2]
-
-        self.gate_reentry_monitor_cleared[active_mask] |= (
-            rel_x > self.gate_reentry_clearance_x
-        )
+        cleared_now = rel_x > self.gate_reentry_clearance_x
         in_opening = (
             (rel_y.abs() < (self.gate_width / 2.0))
             & (rel_z.abs() < (self.gate_height / 2.0))
         )
-        reentry_local = (
-            self.gate_reentry_monitor_cleared[active_mask]
-            & (rel_x < self.gate_reentry_backtrack_x)
-            & in_opening
-        )
+        strict_invalidation = invalidate_mask[monitor_gates]
+        prev_cleared = self.gate_reentry_monitor_cleared[active_ids].clone()
+        if strict_invalidation.any():
+            strict_env_ids = active_ids[strict_invalidation]
+            probe_rel = self._gate_probe_points_in_frame(
+                strict_env_ids,
+                drone_pos[strict_env_ids],
+                drone_rot[strict_env_ids],
+                self.gate_reentry_monitor_center[strict_env_ids],
+                self.gate_reentry_monitor_rot[strict_env_ids],
+            )
+            cleared_now[strict_invalidation] = (
+                probe_rel[..., 0] > self.gate_reentry_clearance_x
+            ).all(dim=1)
+        new_cleared = prev_cleared | cleared_now
+        self.gate_reentry_monitor_cleared[active_ids] = new_cleared
+        reentry_local = new_cleared & (rel_x < self.gate_reentry_backtrack_x) & in_opening
+        if strict_invalidation.any():
+            probe_in_opening = (
+                (probe_rel[..., 1].abs() < (self.gate_width / 2.0))
+                & (probe_rel[..., 2].abs() < (self.gate_height / 2.0))
+            )
+            probe_backtrack = (
+                (probe_rel[..., 0] < self.gate_reentry_backtrack_x) & probe_in_opening
+            ).any(dim=1)
+            reentry_local[strict_invalidation] = (
+                new_cleared[strict_invalidation] & probe_backtrack
+            )
         if reentry_local.any():
-            active_ids = active_mask.nonzero(as_tuple=False).squeeze(-1)
             env_ids = active_ids[reentry_local]
             self.gate_reentry_event_this_step[env_ids] = True
             self.gate_reentry_event_gate[env_ids] = self.gate_reentry_monitor_gate[env_ids]
+            invalidate_ids = env_ids[
+                invalidate_mask[
+                    self.gate_reentry_monitor_gate[env_ids].clamp(
+                        0, self.num_course_gates - 1
+                    )
+                ]
+            ]
+            if invalidate_ids.numel() > 0:
+                self._revoke_gate_progress(
+                    invalidate_ids, self.gate_reentry_monitor_gate[invalidate_ids]
+                )
             self.gate_reentry_monitor_steps_left[env_ids] = 0
             self.exit_anchor_active[env_ids] = False
             self.exit_anchor_steps_left[env_ids] = 0

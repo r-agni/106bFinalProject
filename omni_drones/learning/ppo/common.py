@@ -36,13 +36,13 @@ class GAE(nn.Module):
     def forward(
         self,
         reward: torch.Tensor,
-        terminated: torch.Tensor,
+        done: torch.Tensor,
         value: torch.Tensor,
         next_value: torch.Tensor
     ):
-        num_steps = terminated.shape[1]
+        num_steps = done.shape[1]
         advantages = torch.zeros_like(reward)
-        not_done = 1 - terminated.float()
+        not_done = 1 - done.float()
         gae = 0
         for step in reversed(range(num_steps)):
             delta = (
@@ -62,4 +62,3 @@ def make_mlp(num_units: Sequence[int,], activation=nn.LeakyReLU):
         layers.append(activation())
         layers.append(nn.LayerNorm(n))
     return nn.Sequential(*layers)
-

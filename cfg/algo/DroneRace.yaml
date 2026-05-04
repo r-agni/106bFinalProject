@@ -1,14 +1,12 @@
 name: ppo
 
-# ---- STUDENT EDIT: PPO training schedule ---------------------------------
-train_every: 32   # <-- EDIT: collect this many env steps before each update
-ppo_epochs: 8     # <-- EDIT: number of gradient epochs per update
-# --------------------------------------------------------------------------
-num_minibatches: 5
+train_every: 64
+ppo_epochs: 6
+num_minibatches: 16
 clip_param: 0.2
-entropy_coef: 0.003
-gae_lambda: 0.95
-gamma: 0.99
+entropy_coef: 0.002
+gae_lambda: 0.97
+gamma: 0.995
 max_grad_norm: 5.0
 
 # whether to use privileged information
@@ -18,25 +16,21 @@ priv_critic: false
 # checkpoint_path: # seems to override CLI arg
 
 actor:
-  # ---- STUDENT EDIT: actor network --------------------------------------
-  lr: 0.0002                # <-- EDIT: learning rate
-  hidden_units: [256, 256]  # <-- EDIT: list of hidden layer sizes, e.g. [256, 256, 256]
-  activation: relu          # <-- EDIT: relu, leaky_relu, elu, gelu, tanh, silu
-  # -----------------------------------------------------------------------
+  lr: 0.0001
+  hidden_units: [2048, 2048, 1024, 1024, 512]
+  activation: silu
   lr_scheduler:
   lr_scheduler_kwargs:
   layer_norm: true
   weight_decay: 0.0
 
 critic:
-  # ---- STUDENT EDIT: critic network -------------------------------------
-  lr: 0.0002                # <-- EDIT: learning rate
-  hidden_units: [256, 256]  # <-- EDIT: list of hidden layer sizes
-  activation: relu          # <-- EDIT: relu, leaky_relu, elu, gelu, tanh, silu
-  # -----------------------------------------------------------------------
+  lr: 0.0001
+  hidden_units: [2048, 2048, 1024, 1024, 512]
+  activation: silu
   lr_scheduler:
   lr_scheduler_kwargs:
   layer_norm: true
   weight_decay: 0.0
-  use_huber_loss: false
+  use_huber_loss: true
   huber_delta: 10.0

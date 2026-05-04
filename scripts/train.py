@@ -17,23 +17,113 @@ from torch.func import vmap
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
-from omni_drones import init_simulation_app
-from torchrl.data import CompositeSpec
 from torchrl.envs.utils import set_exploration_type, ExplorationType
-from omni_drones.utils.torchrl import SyncDataCollector
-from omni_drones.utils.torchrl.transforms import (
-    FromMultiDiscreteAction,
-    FromDiscreteAction,
-    ravel_composite,
-    AttitudeController,
-    RateController,
-)
-from omni_drones.utils.wandb import init_wandb
-from omni_drones.utils.torchrl import RenderCallback, EpisodeStats
-from omni_drones.learning import ALGOS
 
 from setproctitle import setproctitle
 from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
+
+
+def _flat_stat(stats, key):
+    try:
+        value = stats.get(key)
+    except KeyError:
+        return None
+    if value is None:
+        return None
+    return value.float().reshape(-1)
+
+
+def _rate(mask):
+    if mask.numel() == 0:
+        return None
+    return mask.float().mean().item()
+
+
+def summarize_drone_race_stats(stats):
+    """Build stable W&B keys for DroneRace episode batches."""
+    start_gate = _flat_stat(stats, "start_gate_index")
+    gates_passed = _flat_stat(stats, "gates_passed")
+    success = _flat_stat(stats, "success")
+    if start_gate is None or gates_passed is None or success is None:
+        return {}
+
+    info = {}
+    success_mask = success > 0.5
+    full_course_mask = start_gate < 0.5
+    full_success_mask = full_course_mask & success_mask
+
+    for gate_idx in range(13):
+        gate_stat = _flat_stat(stats, f"gate_{gate_idx + 1:02d}_passed")
+        if gate_stat is None:
+            continue
+        eligible = start_gate <= gate_idx
+        if eligible.any():
+            info[f"gates/gate{gate_idx + 1:02d}_completion_rate"] = (
+                gate_stat[eligible] > 0.5
+            ).float().mean().item()
+
+    if full_course_mask.any():
+        info["simple/full_course_completion_rate"] = (
+            full_success_mask.float().sum() / full_course_mask.float().sum()
+        ).item()
+    info["simple/full_course_success_count"] = full_success_mask.float().sum().item()
+    info["simple/avg_gates_passed"] = gates_passed.mean().item()
+
+    if full_success_mask.any():
+        mean_speed = _flat_stat(stats, "mean_speed")
+        max_speed = _flat_stat(stats, "max_speed")
+        lap_time = _flat_stat(stats, "lap_time_sec")
+        if mean_speed is not None:
+            info["simple/mean_speed"] = mean_speed[full_success_mask].mean().item()
+        if max_speed is not None:
+            info["simple/max_speed"] = max_speed[full_success_mask].max().item()
+        if lap_time is not None:
+            info["simple/total_course_completion_time"] = lap_time[full_success_mask].mean().item()
+            info["simple/best_course_completion_time"] = lap_time[full_success_mask].min().item()
+
+    failure_keys = {
+        "wrong_gate": "failure/wrong_gate_rate",
+        "collision": "failure/drone_collision_rate",
+        "payload_collision": "failure/payload_collision_rate",
+        "crashed_bounds": "failure/bounds_rate",
+        "stalled": "failure/stall_rate",
+    }
+    for stat_key, log_key in failure_keys.items():
+        stat = _flat_stat(stats, stat_key)
+        if stat is not None:
+            info[log_key] = (stat > 0.0).float().mean().item()
+
+    payload_keys = {
+        "payload_mean_swing_angle": "payload/mean_swing_angle",
+        "payload_max_swing_angle": "payload/max_swing_angle",
+        "payload_collision": "payload/contact_rate",
+        "payload_miss": "payload/payload_miss_rate",
+    }
+    for stat_key, log_key in payload_keys.items():
+        stat = _flat_stat(stats, stat_key)
+        if stat is None:
+            continue
+        if stat_key in {"payload_collision", "payload_miss"}:
+            info[log_key] = (stat > 0.0).float().mean().item()
+        else:
+            info[log_key] = stat.mean().item()
+
+    return info
+
+
+def launch_simulation_app(cfg):
+    headless = bool(cfg.get("headless", True))
+    config = {
+        "headless": headless,
+        "anti_aliasing": 0 if headless else 1,
+        "disable_viewport_updates": headless,
+        "multi_gpu": False,
+        "active_gpu": 0,
+        "physics_gpu": 0,
+    }
+    from isaacsim import SimulationApp
+
+    return SimulationApp(config)
 
 
 # def set_global_reproducibility(seed: int, deterministic: bool = True):
@@ -69,7 +159,20 @@ def main(cfg):
 
     # set_global_reproducibility(cfg.seed, deterministic=cfg.get("deterministic", True))
 
-    simulation_app = init_simulation_app(cfg)
+    simulation_app = launch_simulation_app(cfg)
+
+    from omni_drones.utils.torchrl import SyncDataCollector
+    from omni_drones.utils.torchrl.transforms import (
+        FromMultiDiscreteAction,
+        FromDiscreteAction,
+        ravel_composite,
+        AttitudeController,
+        RateController,
+    )
+    from omni_drones.utils.wandb import init_wandb
+    from omni_drones.utils.torchrl import RenderCallback, EpisodeStats
+    from omni_drones.learning import ALGOS
+
     run = init_wandb(cfg)
     setproctitle(run.name)
     print(OmegaConf.to_yaml(cfg))
@@ -172,6 +275,10 @@ def main(cfg):
     max_iters = cfg.get("max_iters", -1)
     eval_interval = cfg.get("eval_interval", -1)
     save_interval = cfg.get("save_interval", -1)
+    if eval_interval <= 0 and cfg.task.get("eval_interval", -1) > 0:
+        eval_interval = cfg.task.get("eval_interval")
+    if save_interval <= 0 and cfg.task.get("save_interval", -1) > 0:
+        save_interval = cfg.task.get("save_interval")
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -260,11 +367,13 @@ def main(cfg):
             episode_stats.add(data.to_tensordict())
 
             if len(episode_stats) >= base_env.num_envs:
+                episode_batch_stats = episode_stats.pop()
                 stats = {
                     "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
-                    for k, v in episode_stats.pop().items(True, True)
+                    for k, v in episode_batch_stats.items(True, True)
                 }
                 info.update(stats)
+                info.update(summarize_drone_race_stats(episode_batch_stats))
 
             info.update(policy.train_op(data.to_tensordict()))
 

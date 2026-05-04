@@ -271,13 +271,20 @@ class PPOPolicy(TensorDictModuleBase):
             print("No model loaded, using an random initial policy")
             print(f"--------------------\n\n")
 
-            def init_(module):
+            def init_hidden_(module):
                 if isinstance(module, nn.Linear):
-                    nn.init.orthogonal_(module.weight, 0.01)
+                    nn.init.orthogonal_(module.weight, math.sqrt(2))
                     nn.init.constant_(module.bias, 0.)
 
-            self.actor.apply(init_)
-            self.critic.apply(init_)
+            def init_actor_head_(module):
+                if isinstance(module, Actor):
+                    nn.init.orthogonal_(module.actor_mean.weight, 0.01)
+                    nn.init.constant_(module.actor_mean.bias, 0.)
+                    nn.init.constant_(module.actor_std, -0.5)
+
+            self.actor.apply(init_hidden_)
+            self.critic.apply(init_hidden_)
+            self.actor.apply(init_actor_head_)
 
         self.actor_opt = torch.optim.Adam(
             self.actor.parameters(),

@@ -31,8 +31,17 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), os.path.pardir, "cfg")
 
 def init_simulation_app(cfg):
     # launch the simulator
-    config = {"headless": cfg["headless"], "anti_aliasing": 1}
+    headless = bool(cfg.get("headless", True))
+    config = {
+        "headless": headless,
+        "anti_aliasing": 0 if headless else 1,
+        "disable_viewport_updates": headless,
+        "multi_gpu": False,
+        "active_gpu": 0,
+        "physics_gpu": 0,
+    }
     from isaacsim import SimulationApp
+
     simulation_app = SimulationApp(config)
     return simulation_app
 

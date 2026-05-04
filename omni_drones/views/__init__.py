@@ -86,50 +86,10 @@ class ArticulationView(_ArticulationView):
 
     @require_sim_initialized
     def initialize(self, physics_sim_view: omni.physics.tensors.SimulationView = None) -> None:
-        """Create a physics simulation view if not passed and creates an articulation view using physX tensor api.
-
-        Args:
-            physics_sim_view (omni.physics.tensors.SimulationView, optional): current physics simulation view. Defaults to None.
-        """
-        if physics_sim_view is None:
-            physics_sim_view = omni.physics.tensors.create_simulation_view(self._backend)
-            physics_sim_view.set_subspace_roots("/")
+        """Use the Isaac Sim 6 articulation initializer."""
         carb.log_info("initializing view for {}".format(self._name))
-        # TODO: add a callback to set physics view to None once stop is called
-        self._physics_view = physics_sim_view.create_articulation_view(
-            [x.replace(".*", "*") for x in self._regex_prim_paths]
-        )
-        assert self._physics_view.is_homogeneous
-        self._physics_sim_view = physics_sim_view
-        if not self._is_initialized:
-            self._metadata = self._physics_view.shared_metatype
-            self._num_dof = self._physics_view.max_dofs
-            self._num_bodies = self._physics_view.max_links
-            self._num_shapes = self._physics_view.max_shapes
-            self._num_fixed_tendons = self._physics_view.max_fixed_tendons
-            self._body_names = self._metadata.link_names
-            self._body_indices = dict(zip(self._body_names, range(len(self._body_names))))
-            self._dof_names = self._metadata.dof_names
-            self._dof_indices = self._metadata.dof_indices
-            self._dof_types = self._metadata.dof_types
-            self._dof_paths = self._physics_view.dof_paths
-            self._prim_paths = self._physics_view.prim_paths
-            carb.log_info("Articulation Prim View Device: {}".format(self._device))
-            self._is_initialized = True
-            self._default_kps, self._default_kds = self.get_gains(clone=True)
-            default_actions = self.get_applied_actions(clone=True)
-            # TODO: implement effort part
-            if self.num_dof > 0:
-                if self._default_joints_state is None:
-                    self._default_joints_state = JointsState(positions=None, velocities=None, efforts=None)
-                if self._default_joints_state.positions is None:
-                    self._default_joints_state.positions = default_actions.joint_positions
-                if self._default_joints_state.velocities is None:
-                    self._default_joints_state.velocities = default_actions.joint_velocities
-                if self._default_joints_state.efforts is None:
-                    self._default_joints_state.efforts = self._backend_utils.create_zeros_tensor(
-                        shape=[self.count, self.num_dof], dtype="float32", device=self._device
-                    )
+        super().initialize(physics_sim_view)
+        return
         return
 
     def get_gains(

@@ -22,10 +22,7 @@
 
 
 from .single import Hover, Track, FlyThrough
-try:
-    from .drone_race import DroneRaceEnv
-except ImportError:
-    pass
+from .drone_race import DroneRaceEnv
 from .payload import PayloadHover, PayloadTrack, PayloadFlyThrough
 from .inv_pendulum import InvPendulumHover, InvPendulumTrack, InvPendulumFlyThrough
 from .dragon import DragonHover
@@ -37,7 +34,7 @@ from .isaac_env import IsaacEnv
 
 try:
     from .single import Forest, Pinball, DepthNav
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     print(
         "To run the environments which use `ContactSensor` and `RayCaster`,"
         "please install Isaac Lab (https://github.com/isaac-sim/IsaacLab)."

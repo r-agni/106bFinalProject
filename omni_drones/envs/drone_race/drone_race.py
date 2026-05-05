@@ -601,8 +601,9 @@ class DroneRaceEnv(IsaacEnv):
         # --- Accuracy-first curriculum state ---
         # Phase 0: accuracy-first full laps from gate 0, with shaping support.
         # Phase 1: bridge phase with mild speed shaping still enabled.
-        # Phase 2: reliable-full-lap speed phase with shaping removed.
-        self.curriculum_phase = 0  # 0=accuracy-first, 1=bridge-speed, 2=speed-focus
+        # Phase 2: short speed-search phase with shaping removed.
+        # Phase 3: low-entropy lock-in while preserving speed-focus rewards.
+        self.curriculum_phase = 0  # 0=accuracy-first, 1=bridge-speed, 2=speed-search, 3=lock-in
         self.curriculum_ema_alpha = cfg.task.get("curriculum_ema_alpha", 0.01)
         self.lap_completion_rate_ema = 0.0
         self.furthest_gate_ema = 0.0
@@ -1701,7 +1702,7 @@ class DroneRaceEnv(IsaacEnv):
             # Angular penalty decay (scalar, same for all envs)
             "ang_penalty_decay_frac": Unbounded(1),
             # Curriculum phase tracking
-            "curriculum_phase": Unbounded(1),   # 0=accuracy-first, 1=bridge-speed, 2=speed-focus
+            "curriculum_phase": Unbounded(1),   # 0=accuracy-first, 1=bridge-speed, 2=speed-search, 3=lock-in
             "curriculum_accuracy_ema": Unbounded(1),   # EMA full-lap completion rate used to unlock speed shaping
             "curriculum_furthest_ema": Unbounded(1),   # EMA furthest gate reached, kept as a diagnostic
             "episode_start_gate": Unbounded(1),        # actual start gate index for this episode

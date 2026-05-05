@@ -18,7 +18,14 @@ adaptive_entropy:
   phase1_coef_min: 0.0005
   phase1_min_coef: 0.006
   phase2_min_coef: 0.002
+  phase2_plateau_base_coef: 0.0045
+  phase2_plateau_gain: 0.0030
+  phase2_plateau_max_coef: 0.0075
+  phase2_plateau_max_increase_per_update: 0.0005
   recovery_coef: 0.010
+  phase3_lock_coef: 0.0018
+  phase3_max_decrease_per_update: 0.0010
+  phase3_max_increase_per_update: 0.00025
   speed_ema_alpha: 0.05
   speed_signal_low: 0.05
   speed_signal_high: 0.60

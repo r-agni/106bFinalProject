@@ -259,6 +259,15 @@ controller_phase2_panic_step: 0.18             # hard rollback when high-speed b
 controller_phase2_plateau_start_pressure: 0.45 # only start structured line-search once speed pressure is meaningfully high
 controller_completion_drop_recover: 0.10       # detect real performance collapses quickly from recent history
 controller_min_phase_frames: 0                 # no extra dwell once the 90%+ stability window is satisfied; unlock speed mode quickly on strong resumes
+controller_phase3_lock_speed_pressure: 0.95    # only enter final lock-in after the fast regime has already been explored
+controller_phase3_lock_plateau_windows: 12     # require a short but real phase-2 search window before cooling down
+controller_phase3_lock_completion_target: 0.80 # acceptable completion floor for locking in a fast final policy
+controller_phase3_lock_final_gate_target: 0.78 # keep late-gate quality healthy before disabling further search
+controller_phase3_lock_crash_target: 0.22      # only lock in when aggressive search is still reasonably controlled
+controller_phase3_completion_floor: 0.74       # if convergence cool-down hurts completion too much, reopen mild search
+controller_phase3_final_gate_floor: 0.72       # late-gate failures are the first sign that lock-in was premature
+controller_phase3_crash_recover: 0.30          # excessive crashes during lock-in should send training back to mild search
+controller_phase3_completion_drop_recover: 0.12 # catch abrupt performance drops while cooling entropy
 speed_budget_a_lat_conservative: 4.5
 speed_budget_a_lat_aggressive: 9.5
 speed_budget_vertical_discount: 0.90

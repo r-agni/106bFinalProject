@@ -142,6 +142,13 @@ def main(cfg):
     run.summary["curriculum/phase2_accuracy_gate_threshold"] = float(
         cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
     )
+    run.summary["curriculum/phase3_trigger_rule"] = (
+        "controller-driven: phase==2, high speed pressure, stable plateau, "
+        "acceptable completion/final-gate/crash metrics, and valid t20"
+    )
+    run.summary["curriculum/phase3_trigger_threshold"] = float(
+        cfg.task.get("controller_phase3_lock_plateau_windows", 12)
+    )
     run.summary["gates_human/finish_line_note"] = (
         "G13 is the finish line; full-lap success requires crossing it."
     )
@@ -307,11 +314,32 @@ def main(cfg):
             adaptive_entropy_cfg.get("phase1_coef_min", 0.002),
         )
     )
+    phase2_plateau_base_coef = float(
+        adaptive_entropy_cfg.get("phase2_plateau_base_coef", 0.0045)
+    )
+    phase2_plateau_gain = float(
+        adaptive_entropy_cfg.get("phase2_plateau_gain", 0.0030)
+    )
+    phase2_plateau_max_coef = float(
+        adaptive_entropy_cfg.get("phase2_plateau_max_coef", 0.0075)
+    )
+    phase2_plateau_max_increase_step = float(
+        adaptive_entropy_cfg.get("phase2_plateau_max_increase_per_update", 0.0005)
+    )
     recovery_coef = float(
         adaptive_entropy_cfg.get(
             "recovery_coef",
             adaptive_entropy_cfg.get("phase1_rebump_coef", 0.010),
         )
+    )
+    phase3_lock_coef = float(
+        adaptive_entropy_cfg.get("phase3_lock_coef", 0.0018)
+    )
+    phase3_max_decrease_step = float(
+        adaptive_entropy_cfg.get("phase3_max_decrease_per_update", 0.0010)
+    )
+    phase3_max_increase_step = float(
+        adaptive_entropy_cfg.get("phase3_max_increase_per_update", 0.00025)
     )
     entropy_increase_step = float(
         adaptive_entropy_cfg.get(
@@ -420,6 +448,34 @@ def main(cfg):
     )
     controller_phase2_plateau_start_pressure = float(
         cfg.task.get("controller_phase2_plateau_start_pressure", 0.45)
+    )
+    controller_phase3_lock_speed_pressure = float(
+        cfg.task.get("controller_phase3_lock_speed_pressure", 0.95)
+    )
+    controller_phase3_lock_plateau_windows = max(
+        int(cfg.task.get("controller_phase3_lock_plateau_windows", 12)),
+        1,
+    )
+    controller_phase3_lock_completion_target = float(
+        cfg.task.get("controller_phase3_lock_completion_target", 0.80)
+    )
+    controller_phase3_lock_final_gate_target = float(
+        cfg.task.get("controller_phase3_lock_final_gate_target", 0.78)
+    )
+    controller_phase3_lock_crash_target = float(
+        cfg.task.get("controller_phase3_lock_crash_target", 0.22)
+    )
+    controller_phase3_completion_floor = float(
+        cfg.task.get("controller_phase3_completion_floor", 0.74)
+    )
+    controller_phase3_final_gate_floor = float(
+        cfg.task.get("controller_phase3_final_gate_floor", 0.72)
+    )
+    controller_phase3_crash_recover = float(
+        cfg.task.get("controller_phase3_crash_recover", 0.30)
+    )
+    controller_phase3_completion_drop_recover = float(
+        cfg.task.get("controller_phase3_completion_drop_recover", 0.12)
     )
     controller_completion_drop_recover = float(
         cfg.task.get("controller_completion_drop_recover", 0.10)
@@ -618,6 +674,8 @@ def main(cfg):
     phase2_started_env_frames = None
     phase2_started_iter = None
     phase2_started_accuracy_ema = None
+    phase3_started_env_frames = None
+    phase3_started_iter = None
     if loaded_trainer_resume_state:
         logged_curriculum_phase = int(
             loaded_trainer_resume_state.get(
@@ -647,6 +705,20 @@ def main(cfg):
             run.summary["curriculum/phase2_started_accuracy_ema"] = (
                 phase2_started_accuracy_ema
             )
+        phase3_started_env_frames = loaded_trainer_resume_state.get(
+            "phase3_started_env_frames", phase3_started_env_frames
+        )
+        if phase3_started_env_frames is not None:
+            phase3_started_env_frames = int(phase3_started_env_frames)
+            run.summary["curriculum/phase3_started_env_frames"] = (
+                phase3_started_env_frames
+            )
+        phase3_started_iter = loaded_trainer_resume_state.get(
+            "phase3_started_iter", phase3_started_iter
+        )
+        if phase3_started_iter is not None:
+            phase3_started_iter = int(phase3_started_iter)
+            run.summary["curriculum/phase3_started_iter"] = phase3_started_iter
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -729,6 +801,8 @@ def main(cfg):
                 "phase2_started_env_frames": phase2_started_env_frames,
                 "phase2_started_iter": phase2_started_iter,
                 "phase2_started_accuracy_ema": phase2_started_accuracy_ema,
+                "phase3_started_env_frames": phase3_started_env_frames,
+                "phase3_started_iter": phase3_started_iter,
             },
         }
         if hasattr(base_env, "get_resume_state"):
@@ -802,6 +876,7 @@ def main(cfg):
             env.reset()
 
     loop_exception = None
+    phase2_plateau_floor = 0.0
     try:
         logging.info(
             f"Starting training loop: frames_per_batch={frames_per_batch}, "
@@ -824,6 +899,8 @@ def main(cfg):
             if hasattr(policy, "entropy_coef"):
                 info["entropy/current_coef"] = current_entropy_coef
                 info["entropy/target_coef"] = target_entropy_coef
+                info["entropy/phase2_plateau_floor"] = phase2_plateau_floor
+                info["entropy/phase3_lock_active"] = float(controller_phase >= 3)
             info["controller/phase"] = float(controller_phase)
             info["controller/speed_pressure"] = controller_speed_pressure
             info["controller/exploration_pressure"] = controller_exploration_pressure
@@ -1118,53 +1195,72 @@ def main(cfg):
                 phase2_accuracy_threshold = float(
                     cfg.task.get("phase2_speed_focus_accuracy_rate", 0.40)
                 )
-                if curriculum_phase is not None:
-                    current_phase = int(round(float(curriculum_phase)))
-                    phase2_active = current_phase >= 2
-                    phase2_just_unlocked = logged_curriculum_phase < 2 <= current_phase
-                    derived["curriculum/phase2_active"] = float(phase2_active)
-                    derived["curriculum/phase2_just_unlocked"] = float(phase2_just_unlocked)
-                    if curriculum_accuracy is not None:
-                        derived["curriculum/phase2_accuracy_gate_threshold"] = (
-                            phase2_accuracy_threshold
+                current_phase = int(controller_phase)
+                phase2_active = current_phase >= 2
+                phase2_just_unlocked = logged_curriculum_phase < 2 <= current_phase
+                phase3_just_locked = logged_curriculum_phase < 3 <= current_phase
+                derived["curriculum/phase2_active"] = float(phase2_active)
+                derived["curriculum/phase2_just_unlocked"] = float(phase2_just_unlocked)
+                if curriculum_accuracy is not None:
+                    derived["curriculum/phase2_accuracy_gate_threshold"] = (
+                        phase2_accuracy_threshold
+                    )
+                    derived["curriculum/phase2_accuracy_gate_met"] = float(
+                        curriculum_accuracy >= phase2_accuracy_threshold
+                    )
+                    derived["curriculum/phase2_accuracy_gate_margin"] = (
+                        curriculum_accuracy - phase2_accuracy_threshold
+                    )
+                if phase2_just_unlocked and phase2_started_env_frames is None:
+                    phase2_started_env_frames = int(collector._frames)
+                    phase2_started_iter = int(i)
+                    phase2_started_accuracy_ema = (
+                        float(curriculum_accuracy)
+                        if curriculum_accuracy is not None
+                        else None
+                    )
+                    run.summary["curriculum/phase2_started_env_frames"] = phase2_started_env_frames
+                    run.summary["curriculum/phase2_started_iter"] = phase2_started_iter
+                    if phase2_started_accuracy_ema is not None:
+                        run.summary["curriculum/phase2_started_accuracy_ema"] = (
+                            phase2_started_accuracy_ema
                         )
-                        derived["curriculum/phase2_accuracy_gate_met"] = float(
-                            curriculum_accuracy >= phase2_accuracy_threshold
+                    logging.info(
+                        "Curriculum entered phase 2 at env_frames=%s iteration=%s "
+                        "accuracy_ema=%s after the controller unlock rule was satisfied",
+                        phase2_started_env_frames,
+                        phase2_started_iter,
+                        phase2_started_accuracy_ema,
+                    )
+                if phase3_just_locked and phase3_started_env_frames is None:
+                    phase3_started_env_frames = int(collector._frames)
+                    phase3_started_iter = int(i)
+                    run.summary["curriculum/phase3_started_env_frames"] = (
+                        phase3_started_env_frames
+                    )
+                    run.summary["curriculum/phase3_started_iter"] = phase3_started_iter
+                    logging.info(
+                        "Curriculum entered phase 3 lock-in at env_frames=%s iteration=%s",
+                        phase3_started_env_frames,
+                        phase3_started_iter,
+                    )
+                if phase2_started_env_frames is not None:
+                    derived["curriculum/phase2_started_env_frames"] = float(
+                        phase2_started_env_frames
+                    )
+                    derived["curriculum/phase2_started_iter"] = float(phase2_started_iter)
+                    if phase2_started_accuracy_ema is not None:
+                        derived["curriculum/phase2_started_accuracy_ema"] = (
+                            phase2_started_accuracy_ema
                         )
-                        derived["curriculum/phase2_accuracy_gate_margin"] = (
-                            curriculum_accuracy - phase2_accuracy_threshold
-                        )
-                    if phase2_just_unlocked:
-                        phase2_started_env_frames = int(collector._frames)
-                        phase2_started_iter = int(i)
-                        phase2_started_accuracy_ema = (
-                            float(curriculum_accuracy)
-                            if curriculum_accuracy is not None
-                            else None
-                        )
-                        run.summary["curriculum/phase2_started_env_frames"] = phase2_started_env_frames
-                        run.summary["curriculum/phase2_started_iter"] = phase2_started_iter
-                        if phase2_started_accuracy_ema is not None:
-                            run.summary["curriculum/phase2_started_accuracy_ema"] = (
-                                phase2_started_accuracy_ema
-                            )
-                        logging.info(
-                            "Curriculum entered phase 2 at env_frames=%s iteration=%s "
-                            "accuracy_ema=%s after the controller unlock rule was satisfied",
-                            phase2_started_env_frames,
-                            phase2_started_iter,
-                            phase2_started_accuracy_ema,
-                        )
-                    if phase2_started_env_frames is not None:
-                        derived["curriculum/phase2_started_env_frames"] = float(
-                            phase2_started_env_frames
-                        )
-                        derived["curriculum/phase2_started_iter"] = float(phase2_started_iter)
-                        if phase2_started_accuracy_ema is not None:
-                            derived["curriculum/phase2_started_accuracy_ema"] = (
-                                phase2_started_accuracy_ema
-                            )
-                    logged_curriculum_phase = current_phase
+                if phase3_started_env_frames is not None:
+                    derived["curriculum/phase3_started_env_frames"] = float(
+                        phase3_started_env_frames
+                    )
+                    derived["curriculum/phase3_started_iter"] = float(
+                        phase3_started_iter
+                    )
+                logged_curriculum_phase = current_phase
                 speed_phase_scale = 0.0
                 if curriculum_phase is not None:
                     if curriculum_phase >= 2.0:
@@ -1289,8 +1385,17 @@ def main(cfg):
                     and final_gate_reliability >= controller_phase2_final_gate_target
                     and controller_crash_signal <= controller_phase2_crash_target
                 )
+                phase3_lock_window = (
+                    controller_phase == 2
+                    and controller_speed_pressure >= controller_phase3_lock_speed_pressure
+                    and controller_completion_signal
+                    >= controller_phase3_lock_completion_target
+                    and final_gate_reliability
+                    >= controller_phase3_lock_final_gate_target
+                    and controller_crash_signal <= controller_phase3_lock_crash_target
+                )
 
-                if (stabilize_window or phase2_operating_window) and t20_valid:
+                if (stabilize_window or phase2_operating_window or phase3_lock_window) and t20_valid:
                     if controller_t20_best_stable_lap_time_sec is None:
                         controller_t20_best_stable_lap_time_sec = controller_t20_lap_time_sec
                         controller_plateau_count = 0
@@ -1323,6 +1428,12 @@ def main(cfg):
                     or controller_crash_signal > controller_phase2_crash_recover
                     or completion_drop_5 < -controller_completion_drop_recover
                 )
+                phase3_fallback_conditions = (
+                    controller_completion_signal < controller_phase3_completion_floor
+                    or final_gate_reliability < controller_phase3_final_gate_floor
+                    or controller_crash_signal > controller_phase3_crash_recover
+                    or completion_drop_5 < -controller_phase3_completion_drop_recover
+                )
                 phase1_unlock = (
                     gate0_success_count > 0 or controller_completion_signal >= 0.35
                 )
@@ -1336,7 +1447,38 @@ def main(cfg):
                         controller_phase1_initial_speed_pressure,
                     )
 
-                if controller_phase >= 2 and phase2_collapse_conditions:
+                phase3_lock_conditions = (
+                    phase3_lock_window
+                    and controller_plateau_count >= controller_phase3_lock_plateau_windows
+                    and t20_valid
+                )
+                if controller_phase >= 3 and phase3_fallback_conditions:
+                    controller_phase = 2
+                    controller_phase_start_frames = collector._frames
+                    controller_phase2_ready_count = 0
+                    controller_plateau_count = 0
+                    controller_exploration_pressure = 0.0
+                elif phase3_lock_conditions:
+                    controller_phase = 3
+                    controller_phase_start_frames = collector._frames
+                    controller_phase2_ready_count = 0
+                    controller_exploration_pressure = 0.0
+                    target_entropy_coef = phase3_lock_coef
+                    if phase3_started_env_frames is None:
+                        phase3_started_env_frames = int(collector._frames)
+                        phase3_started_iter = int(i)
+                        run.summary["curriculum/phase3_started_env_frames"] = (
+                            phase3_started_env_frames
+                        )
+                        run.summary["curriculum/phase3_started_iter"] = (
+                            phase3_started_iter
+                        )
+                        logging.info(
+                            "Entering phase 3 lock-in at env_frames=%s iteration=%s",
+                            phase3_started_env_frames,
+                            phase3_started_iter,
+                        )
+                elif controller_phase == 2 and phase2_collapse_conditions:
                     controller_phase = 1
                     controller_phase_start_frames = collector._frames
                     controller_phase2_ready_count = 0
@@ -1366,6 +1508,31 @@ def main(cfg):
                         controller_speed_pressure,
                         controller_phase2_initial_speed_pressure,
                     )
+                    if phase2_started_env_frames is None:
+                        phase2_started_env_frames = int(collector._frames)
+                        phase2_started_iter = int(i)
+                        phase2_started_accuracy_ema = (
+                            float(curriculum_accuracy)
+                            if curriculum_accuracy is not None
+                            else None
+                        )
+                        run.summary["curriculum/phase2_started_env_frames"] = (
+                            phase2_started_env_frames
+                        )
+                        run.summary["curriculum/phase2_started_iter"] = (
+                            phase2_started_iter
+                        )
+                        if phase2_started_accuracy_ema is not None:
+                            run.summary["curriculum/phase2_started_accuracy_ema"] = (
+                                phase2_started_accuracy_ema
+                            )
+                        logging.info(
+                            "Curriculum entered phase 2 at env_frames=%s iteration=%s "
+                            "accuracy_ema=%s after the controller unlock rule was satisfied",
+                            phase2_started_env_frames,
+                            phase2_started_iter,
+                            phase2_started_accuracy_ema,
+                        )
 
                 phase2_operating_window = (
                     controller_phase >= 2
@@ -1374,7 +1541,17 @@ def main(cfg):
                     and final_gate_reliability >= controller_phase2_final_gate_target
                     and controller_crash_signal <= controller_phase2_crash_target
                 )
-                if controller_phase >= 2:
+                if controller_phase >= 3:
+                    controller_collapse_active = phase3_fallback_conditions
+                    slack = min(
+                        controller_completion_signal
+                        - controller_phase3_lock_completion_target,
+                        final_gate_reliability
+                        - controller_phase3_lock_final_gate_target,
+                        controller_phase3_lock_crash_target
+                        - controller_crash_signal,
+                    )
+                elif controller_phase >= 2:
                     controller_collapse_active = phase2_collapse_conditions
                     slack = min(
                         controller_completion_signal - controller_phase2_completion_target,
@@ -1389,10 +1566,14 @@ def main(cfg):
                         and phase1_collapse_conditions
                     )
                     slack = min(
-                        controller_completion_signal - controller_stabilize_completion_target,
-                        hard_gate_reliability - controller_stabilize_hard_gate_target,
-                        final_gate_reliability - controller_stabilize_final_gate_target,
-                        controller_stabilize_crash_target - controller_crash_signal,
+                        controller_completion_signal
+                        - controller_stabilize_completion_target,
+                        hard_gate_reliability
+                        - controller_stabilize_hard_gate_target,
+                        final_gate_reliability
+                        - controller_stabilize_final_gate_target,
+                        controller_stabilize_crash_target
+                        - controller_crash_signal,
                     )
 
                 if controller_phase < 1:
@@ -1413,7 +1594,7 @@ def main(cfg):
                     if controller_collapse_active:
                         updated_speed_pressure -= controller_speed_panic_step
                     controller_speed_pressure = _clamp01(updated_speed_pressure)
-                else:
+                elif controller_phase == 2:
                     updated_speed_pressure = max(
                         controller_speed_pressure,
                         controller_phase2_initial_speed_pressure,
@@ -1425,9 +1606,11 @@ def main(cfg):
                     if controller_collapse_active:
                         updated_speed_pressure -= controller_phase2_panic_step
                     controller_speed_pressure = _clamp01(updated_speed_pressure)
+                else:
+                    controller_speed_pressure = _clamp01(controller_speed_pressure)
 
                 plateau_active = (
-                    controller_phase >= 2
+                    controller_phase == 2
                     and phase2_operating_window
                     and t20_valid
                     and controller_t20_best_stable_lap_time_sec is not None
@@ -1435,19 +1618,29 @@ def main(cfg):
                     and controller_speed_pressure >= controller_phase2_plateau_start_pressure
                 )
                 exploration_target = 0.0
-                if plateau_active:
-                    exploration_target = _clamp01(slack / 0.08)
-                controller_exploration_pressure = _clamp01(
-                    _slew_toward_asymmetric(
-                        controller_exploration_pressure,
-                        exploration_target,
-                        max_increase=0.05,
-                        max_decrease=0.15,
+                phase2_plateau_floor = 0.0
+                if controller_phase >= 3:
+                    controller_exploration_pressure = 0.0
+                else:
+                    if plateau_active:
+                        exploration_target = _clamp01(slack / 0.08)
+                    controller_exploration_pressure = _clamp01(
+                        _slew_toward_asymmetric(
+                            controller_exploration_pressure,
+                            exploration_target,
+                            max_increase=0.05,
+                            max_decrease=0.15,
+                        )
                     )
-                )
 
                 if entropy_controller_enabled:
-                    if controller_completion_ema < 0.20:
+                    entropy_max_increase = entropy_increase_step
+                    entropy_max_decrease = entropy_decrease_step
+                    if controller_phase >= 3:
+                        target_entropy_coef = phase3_lock_coef
+                        entropy_max_increase = phase3_max_increase_step
+                        entropy_max_decrease = phase3_max_decrease_step
+                    elif controller_completion_ema < 0.20:
                         target_entropy_coef = phase0_coef_max
                     elif controller_collapse_active:
                         target_entropy_coef = recovery_coef
@@ -1458,16 +1651,26 @@ def main(cfg):
                         target_entropy_coef = entropy_floor + (
                             1.0 - controller_speed_pressure
                         ) * (phase0_coef_max - entropy_floor)
-                        if controller_phase >= 2:
+                        if plateau_active:
+                            phase2_plateau_floor = min(
+                                phase2_plateau_max_coef,
+                                phase2_plateau_base_coef
+                                + phase2_plateau_gain
+                                * controller_exploration_pressure,
+                            )
                             target_entropy_coef = max(
                                 target_entropy_coef,
-                                0.008 + 0.010 * controller_exploration_pressure,
+                                phase2_plateau_floor,
+                            )
+                            entropy_max_increase = min(
+                                entropy_max_increase,
+                                phase2_plateau_max_increase_step,
                             )
                     current_entropy_coef = _slew_toward_asymmetric(
                         current_entropy_coef,
                         target_entropy_coef,
-                        max_increase=entropy_increase_step,
-                        max_decrease=entropy_decrease_step,
+                        max_increase=entropy_max_increase,
+                        max_decrease=entropy_max_decrease,
                     )
                     policy.entropy_coef = current_entropy_coef
 
@@ -1579,6 +1782,10 @@ def main(cfg):
                     derived["entropy/phase"] = float(controller_phase)
                     derived["entropy/speed_pressure"] = controller_speed_pressure
                     derived["entropy/exploration_pressure"] = controller_exploration_pressure
+                    derived["entropy/phase2_plateau_floor"] = phase2_plateau_floor
+                    derived["entropy/phase3_lock_active"] = float(
+                        controller_phase >= 3
+                    )
 
                 controller_window_metrics = base_env.consume_controller_window_metrics()
                 controller_gate_count = int(getattr(base_env, "num_course_gates", required_gate_count))

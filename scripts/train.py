@@ -195,19 +195,13 @@ def main(cfg):
     
     save_config_early()
     
-    # Set up signal handler to ensure config is saved on Ctrl+C
-    # The finally block will handle wandb.finish() and simulation_app.close()
+    # Only handle SIGTERM (SLURM preemption) — Isaac Sim sends SIGINT internally
+    # during its own lifecycle so we must not intercept it.
     def signal_handler(sig, frame):
-        try:
-            sig_name = signal.Signals(sig).name
-        except Exception:
-            sig_name = str(sig)
-        logging.warning(f"Received signal {sig_name} ({sig}). Saving config and exiting...")
-        save_config_early()  # Save config immediately before cleanup
-        # Let the exception propagate to trigger finally block
+        logging.warning(f"Received SIGTERM. Saving config and exiting...")
+        save_config_early()
         raise KeyboardInterrupt
-    
-    signal.signal(signal.SIGINT, signal_handler)
+
     signal.signal(signal.SIGTERM, signal_handler)
 
     from omni_drones.envs.isaac_env import IsaacEnv
@@ -353,6 +347,56 @@ def main(cfg):
 
         return info
 
+    # Checkpoint tracking state
+    # We keep at most 2 checkpoints on disk:
+    #   1. "fastest speed that is >= 80% of best reward" checkpoint
+    #   2. "latest" checkpoint
+    # "best reward" is tracked purely to set the 80% threshold — that file is
+    # not kept on disk unless it also happens to be the fastest or latest.
+    ckpt_dir = "/tmp/106b_checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    best_reward = None        # highest mean return seen so far
+    best_speed_ckpt = None    # (path, speed, reward) for the kept speed-champion
+    latest_ckpt = None        # path of the most-recently saved checkpoint
+
+    def _delete_if_exists(path):
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _save_checkpoint(frames, reward, speed):
+        """Save a checkpoint and update tracking state. Returns the new path."""
+        path = os.path.join(ckpt_dir, f"checkpoint_{frames}.pt")
+        torch.save(policy.state_dict(), path)
+        logging.info(f"Saved checkpoint to {path}")
+        return path
+
+    def _maybe_update_speed_ckpt(new_path, new_speed, new_reward, frames):
+        nonlocal best_speed_ckpt, best_reward
+        threshold = 0.8 * best_reward
+        if new_reward < threshold:
+            # Does not meet quality bar — only delete if it's not also latest
+            if new_path != latest_ckpt:
+                _delete_if_exists(new_path)
+            return
+        if best_speed_ckpt is None or new_speed > best_speed_ckpt[1]:
+            old_path = best_speed_ckpt[0] if best_speed_ckpt else None
+            best_speed_ckpt = (new_path, new_speed, new_reward)
+            # Only delete the old speed ckpt if it's not also the latest
+            if old_path and old_path != latest_ckpt:
+                _delete_if_exists(old_path)
+            logging.info(
+                f"New fastest-quality checkpoint: speed={new_speed:.2f}, "
+                f"reward={new_reward:.3f} (threshold={threshold:.3f}), frames={frames}"
+            )
+        else:
+            # Not faster than current speed champion — only delete if it's not also latest
+            if new_path != latest_ckpt:
+                _delete_if_exists(new_path)
+
     loop_exception = None
     try:
         logging.info(
@@ -366,6 +410,8 @@ def main(cfg):
             info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
             episode_stats.add(data.to_tensordict())
 
+            current_reward = None
+            current_speed = None
             if len(episode_stats) >= base_env.num_envs:
                 episode_batch_stats = episode_stats.pop()
                 stats = {
@@ -374,6 +420,18 @@ def main(cfg):
                 }
                 info.update(stats)
                 info.update(summarize_drone_race_stats(episode_batch_stats))
+
+                # Auto-advance curriculum based on per-gate and full-course pass rates
+                gate_pass_rates = {}
+                for key, val in info.items():
+                    if key.startswith("gates/gate") and key.endswith("_completion_rate"):
+                        idx_str = key[len("gates/gate"):key.index("_completion_rate", len("gates/gate"))]
+                        gate_pass_rates[int(idx_str)] = float(val)
+                full_course_rate = info.get("simple/full_course_completion_rate", None)
+                info.update(base_env.update_curriculum(gate_pass_rates, full_course_rate, env_frames=info.get("env_frames")))
+
+                current_reward = info.get("train/stats.return", None)
+                current_speed = info.get("simple/mean_speed", None)
 
             info.update(policy.train_op(data.to_tensordict()))
 
@@ -386,9 +444,25 @@ def main(cfg):
 
             if save_interval > 0 and i % save_interval == 0:
                 try:
-                    ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
-                    torch.save(policy.state_dict(), ckpt_path)
-                    logging.info(f"Saved checkpoint to {str(ckpt_path)}")
+                    reward = current_reward if current_reward is not None else 0.0
+                    speed = current_speed if current_speed is not None else 0.0
+
+                    # Update best reward
+                    if best_reward is None or reward > best_reward:
+                        best_reward = reward
+
+                    new_path = _save_checkpoint(collector._frames, reward, speed)
+
+                    # Update latest: delete old latest if it's not also the speed ckpt
+                    old_latest = latest_ckpt
+                    latest_ckpt = new_path
+                    if old_latest and old_latest != (best_speed_ckpt[0] if best_speed_ckpt else None):
+                        _delete_if_exists(old_latest)
+
+                    # Check if this is also eligible to be the speed champion
+                    if best_reward is not None and speed > 0:
+                        _maybe_update_speed_ckpt(new_path, speed, reward, collector._frames)
+
                 except AttributeError:
                     logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
@@ -408,20 +482,24 @@ def main(cfg):
         # run.log(info)
 
         try:
-            ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
-            torch.save(policy.state_dict(), ckpt_path)
+            # Upload the two kept checkpoints as W&B artifacts
+            kept_paths = set()
+            if latest_ckpt and os.path.exists(latest_ckpt):
+                kept_paths.add(latest_ckpt)
+            if best_speed_ckpt and os.path.exists(best_speed_ckpt[0]):
+                kept_paths.add(best_speed_ckpt[0])
 
-            model_artifact = wandb.Artifact(
-                f"{cfg.task.name}-{cfg.algo.name.lower()}",
-                type="model",
-                description=f"{cfg.task.name}-{cfg.algo.name.lower()}",
-                metadata=dict(cfg))
-
-            model_artifact.add_file(ckpt_path)
-            wandb.save(ckpt_path)
-            run.log_artifact(model_artifact)
-
-            logging.info(f"Saved checkpoint to {str(ckpt_path)}")
+            for ckpt_path in kept_paths:
+                label = "latest" if ckpt_path == latest_ckpt else "fastest_quality"
+                model_artifact = wandb.Artifact(
+                    f"{cfg.task.name}-{cfg.algo.name.lower()}-{label}",
+                    type="model",
+                    description=f"{cfg.task.name}-{cfg.algo.name.lower()} ({label})",
+                    metadata=dict(cfg),
+                )
+                model_artifact.add_file(ckpt_path)
+                run.log_artifact(model_artifact)
+                logging.info(f"Uploaded {label} checkpoint: {ckpt_path}")
         except AttributeError:
             logging.warning(f"Policy {policy} does not implement `.state_dict()`")
     except BaseException as e:

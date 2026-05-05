@@ -94,8 +94,14 @@ class DroneRaceEnv(IsaacEnv):
         self.start_distance = float(cfg.task.get("start_distance", 2.0))
         self.start_lateral_noise = float(cfg.task.get("start_lateral_noise", 0.0))
         self.start_vertical_noise = float(cfg.task.get("start_vertical_noise", 0.0))
-        self.curriculum_stage = int(cfg.task.get("curriculum_stage", 3))
+        self.curriculum_stage = int(cfg.task.get("curriculum_stage", 1))
         self.random_start_prob = float(cfg.task.get("random_start_prob", 0.0))
+        self.gate_pass_thresh = float(cfg.task.get("curriculum_gate_pass_threshold", 0.80))
+        self.course_pass_thresh = float(cfg.task.get("curriculum_course_pass_threshold", 0.80))
+        self.ema_alpha = float(cfg.task.get("curriculum_ema_alpha", 0.05))
+        # Phase 0 parameters: uniform random starts until mean gate EMA ≥ threshold or frames exceeded
+        self.curriculum_phase0_threshold = float(cfg.task.get("curriculum_phase0_threshold", 0.15))
+        self.curriculum_phase0_frames = int(cfg.task.get("curriculum_phase0_frames", 30_000_000))
         payload_cfg = cfg.task.get("payload", {}) or {}
         self.payload_enabled = bool(payload_cfg.get("enabled", False))
         self.payload_bar_length = float(payload_cfg.get("bar_length", 1.0))
@@ -226,6 +232,10 @@ class DroneRaceEnv(IsaacEnv):
         # Gate crossing detection: drone position in centered gate frame from previous step
         self.prev_drone_in_gate_frame = torch.zeros(self.num_envs, 3, device=self.device)
         self.prev_payload_in_gate_frame = torch.zeros(self.num_envs, 3, device=self.device)
+        # Anti-cheat: drone must approach from behind gate (x < -waypoint_offset) before crossing counts
+        self.gate_approach_confirmed = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        # Per-gate EMA pass rates for curriculum tracking (shape: [num_gates])
+        self.gate_ema_pass_rate = torch.zeros(self.num_gates, device=self.device)
         self.last_action = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device)
         self.effort = torch.zeros(self.num_envs, 1, self.drone.action_spec.shape[-1], device=self.device) 
         self.current_gate_frame_pos = torch.zeros(self.num_envs, 3, device=self.device)
@@ -525,28 +535,88 @@ class DroneRaceEnv(IsaacEnv):
         self.stats = stats_spec.zero()
 
     def _sample_start_gate_indices(self, env_ids: torch.Tensor) -> torch.Tensor:
-        if self.curriculum_stage <= 1:
-            random_start_prob = 1.0
-        elif self.curriculum_stage == 2:
-            random_start_prob = self.random_start_prob
-        else:
-            random_start_prob = 0.0
-
         count = len(env_ids)
-        start_indices = torch.zeros(count, dtype=torch.long, device=self.device)
-        if random_start_prob <= 0.0:
-            return start_indices
+        if self.curriculum_stage >= 2:
+            return torch.zeros(count, dtype=torch.long, device=self.device)
 
-        random_mask = torch.rand(count, device=self.device) < random_start_prob
-        max_start_gate = max(self.num_gates - 1, 1)
-        random_indices = torch.randint(
-            low=0,
-            high=max_start_gate,
-            size=(count,),
-            device=self.device,
-            dtype=torch.long,
-        )
-        return torch.where(random_mask, random_indices, start_indices)
+        # Stage 0: pure uniform random across all gates — no bias toward gate 0
+        if self.curriculum_stage == 0:
+            return torch.randint(0, self.num_gates, (count,), device=self.device)
+
+        # Stage 1: 60% gate 0 / 30% weakest-gate weighted / 10% uniform random
+        r = torch.rand(count, device=self.device)
+        result = torch.zeros(count, dtype=torch.long, device=self.device)
+
+        # 30% band: sample from weak gates weighted by shortfall
+        mid_band = (r >= 0.60) & (r < 0.90)
+        if mid_band.any():
+            weak_mask = self.gate_ema_pass_rate < self.gate_pass_thresh
+            if weak_mask.any():
+                shortfall = (self.gate_pass_thresh - self.gate_ema_pass_rate).clamp(min=0)
+                shortfall = shortfall * weak_mask.float()
+                n_mid = int(mid_band.sum().item())
+                weak_indices = torch.multinomial(
+                    shortfall.unsqueeze(0).expand(n_mid, -1),
+                    num_samples=1,
+                ).squeeze(1)
+                result[mid_band] = weak_indices
+            # else: all gates mastered — keep gate 0 for this band
+
+        # 10% band: uniform random across all gates
+        high_band = r >= 0.90
+        if high_band.any():
+            result[high_band] = torch.randint(
+                0, self.num_gates, (int(high_band.sum().item()),), device=self.device
+            )
+
+        return result
+
+    def update_curriculum(self, gate_pass_rates: dict, full_course_rate, env_frames: int = None) -> dict:
+        """Update per-gate EMA pass rates and auto-advance curriculum stage.
+
+        Args:
+            gate_pass_rates: {gate_index (int): pass_rate (float)} for gates 1..N (1-indexed keys from stats).
+            full_course_rate: fraction of envs completing a full lap this batch, or None.
+            env_frames: total environment frames processed so far, used for phase 0 time-based fallback.
+        Returns:
+            Dict of curriculum metrics to merge into the W&B log dict.
+        """
+        alpha = self.ema_alpha
+        for gate_idx, rate in gate_pass_rates.items():
+            i = int(gate_idx) - 1  # stats keys are 1-indexed (gate01..gate13)
+            if 0 <= i < self.num_gates:
+                self.gate_ema_pass_rate[i] = (
+                    (1 - alpha) * self.gate_ema_pass_rate[i] + alpha * float(rate)
+                )
+
+        mean_ema = self.gate_ema_pass_rate.mean().item()
+        transitioned = False
+        if self.curriculum_stage == 0:
+            # Advance to stage 1 when mean gate EMA hits threshold OR frame budget exhausted
+            frames_exceeded = env_frames is not None and env_frames >= self.curriculum_phase0_frames
+            if mean_ema >= self.curriculum_phase0_threshold or frames_exceeded:
+                self.curriculum_stage = 1
+                transitioned = True
+        elif self.curriculum_stage == 1:
+            if (self.gate_ema_pass_rate >= self.gate_pass_thresh).all():
+                self.curriculum_stage = 2
+                transitioned = True
+        elif self.curriculum_stage == 2:
+            if full_course_rate is not None and float(full_course_rate) >= self.course_pass_thresh:
+                self.curriculum_stage = 3
+                transitioned = True
+
+        metrics = {
+            "curriculum/stage": self.curriculum_stage,
+            "curriculum/transition": int(transitioned),
+            "curriculum/mean_ema_rate": mean_ema,
+            "curriculum/num_weak_gates": int(
+                (self.gate_ema_pass_rate < self.gate_pass_thresh).sum().item()
+            ),
+        }
+        for i in range(self.num_gates):
+            metrics[f"curriculum/gate{i + 1:02d}_ema_rate"] = self.gate_ema_pass_rate[i].item()
+        return metrics
 
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids)
@@ -560,6 +630,7 @@ class DroneRaceEnv(IsaacEnv):
         self.gate_passed[env_ids] = False
         self.gate_completion_flags[env_ids] = False
         self.track_completed[env_ids] = False
+        self.gate_approach_confirmed[env_ids] = False
         self.last_action[env_ids] = 0.0
         self.effort[env_ids] = 0.0
         self.action_smoothness[env_ids] = 0.0
@@ -1112,6 +1183,10 @@ class DroneRaceEnv(IsaacEnv):
         payload_missed = torch.zeros_like(target_missed)
         payload_first = torch.zeros_like(target_missed)
 
+        # Approach confirmed when drone is behind the gate (x < -waypoint_offset)
+        approach_zone = curr_in_gate[..., 0] < -self.waypoint_offset
+        self.gate_approach_confirmed = self.gate_approach_confirmed | approach_zone
+
         if self.payload_enabled:
             two_body = detect_two_body_gate_completion(
                 prev_in_gate,
@@ -1122,14 +1197,14 @@ class DroneRaceEnv(IsaacEnv):
                 self.gate_height,
                 self.gate_passed,
             )
-            drone_entry_this_step = two_body["drone_valid"] & (~self.gate_passed)
-            gate_passed_this_step = two_body["gate_completed"]
+            drone_entry_this_step = two_body["drone_valid"] & (~self.gate_passed) & self.gate_approach_confirmed
+            gate_passed_this_step = two_body["gate_completed"] & self.gate_approach_confirmed
             target_missed = two_body["aperture_missed"]
             payload_missed = two_body["payload_crossed"] & (~two_body["payload_inside"])
             payload_first = two_body["payload_first"]
-            self.gate_passed[two_body["drone_entered"]] = True
+            self.gate_passed[two_body["drone_entered"] & self.gate_approach_confirmed] = True
         else:
-            gate_passed_this_step = drone_valid_target & (~self.gate_passed)
+            gate_passed_this_step = drone_valid_target & (~self.gate_passed) & self.gate_approach_confirmed
             drone_entry_this_step = gate_passed_this_step
             self.gate_passed[gate_passed_this_step] = True
 
@@ -1198,6 +1273,8 @@ class DroneRaceEnv(IsaacEnv):
         )
         gate_index_changed = self.gate_indices != old_gate_indices
         self.gate_passed[gate_index_changed] = False
+        # Reset approach flag for the new gate
+        self.gate_approach_confirmed[gate_index_changed] = False
 
         new_gate_pos = gate_env_pos[batch_indices, self.gate_indices]
         new_gate_rot = gate_env_rot[batch_indices, self.gate_indices]

@@ -4,7 +4,7 @@ train_every: 64
 ppo_epochs: 6
 num_minibatches: 16
 clip_param: 0.2
-entropy_coef: 0.002
+entropy_coef: 0.008
 gae_lambda: 0.97
 gamma: 0.995
 max_grad_norm: 5.0
@@ -16,8 +16,8 @@ priv_critic: false
 # checkpoint_path: # seems to override CLI arg
 
 actor:
-  lr: 0.0001
-  hidden_units: [2048, 2048, 1024, 1024, 512]
+  lr: 0.0003
+  hidden_units: [512, 512, 512]
   activation: silu
   lr_scheduler:
   lr_scheduler_kwargs:
@@ -25,8 +25,8 @@ actor:
   weight_decay: 0.0
 
 critic:
-  lr: 0.0001
-  hidden_units: [2048, 2048, 1024, 1024, 512]
+  lr: 0.0003
+  hidden_units: [512, 512, 512]
   activation: silu
   lr_scheduler:
   lr_scheduler_kwargs:

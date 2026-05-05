@@ -10,7 +10,7 @@ defaults:
 ppo_cfg: DroneRace.yaml
 
 env:
-  num_envs: 2048
+  num_envs: 4096
   env_spacing: 45
   max_episode_length: 2500
 
@@ -144,12 +144,18 @@ payload:
   mass: 0.30
   radius: 0.04
 
-# Curriculum stage:
-#   1: random gate starts
-#   2: mixed starts, controlled by random_start_prob
-#   3: gate-0-only full laps
-curriculum_stage: 1
-random_start_prob: 0.7
+# Curriculum stage (auto-managed at runtime):
+#   0: 100% uniform random gate starts; advances when mean gate EMA ≥ phase0_threshold OR frames ≥ phase0_frames
+#   1: mixed starts — 60% gate 0 / 30% weakest gate / 10% random; advances when all gate EMA ≥ threshold
+#   2: 100% gate 0; advances when full_course_completion_rate EMA ≥ threshold
+#   3: 100% gate 0, terminal (speed optimization)
+curriculum_stage: 0
+random_start_prob: 0.0
+curriculum_gate_pass_threshold: 0.40
+curriculum_course_pass_threshold: 0.60
+curriculum_ema_alpha: 0.10
+curriculum_phase0_threshold: 0.15   # mean gate EMA to exit phase 0
+curriculum_phase0_frames: 40_000_000  # fallback: exit phase 0 after this many frames
 
 reward_progress_scale: 4.0
 reward_centerline_scale: 0.7
@@ -164,7 +170,7 @@ reward_action_smoothness_weight: 0.01
 reward_payload_swing_weight: 0.08
 reward_payload_lateral_velocity_weight: 0.02
 reward_crash: 80.0
-reward_wrong_gate: 120.0
+reward_wrong_gate: 50.0
 reward_payload_miss: 120.0
 reward_stall: 30.0
 

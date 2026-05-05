@@ -64,6 +64,11 @@ def init_wandb(cfg):
     Otherwise, start a fresh new run.
 
     """
+    # Store all wandb local files in /tmp so nothing persists on disk
+    os.environ["WANDB_DIR"] = "/tmp"
+    os.environ["WANDB_CACHE_DIR"] = "/tmp/wandb_cache"
+    os.environ["WANDB_DATA_DIR"] = "/tmp/wandb_data"
+
     wandb_cfg = cfg.wandb
     time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
     run_name = f"{wandb_cfg.run_name}/{time_str}"

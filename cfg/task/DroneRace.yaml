@@ -264,6 +264,8 @@ controller_phase3_lock_plateau_windows: 12     # require a short but real phase-
 controller_phase3_lock_completion_target: 0.80 # acceptable completion floor for locking in a fast final policy
 controller_phase3_lock_final_gate_target: 0.78 # keep late-gate quality healthy before disabling further search
 controller_phase3_lock_crash_target: 0.22      # only lock in when aggressive search is still reasonably controlled
+controller_phase3_fallback_patience_windows: 3 # require several consecutive bad windows before reopening search from the lock-in phase
+controller_phase3_sticky_after_first_lock: true # once phase 3 has been reached, never fall all the way back to phase 1
 controller_phase3_completion_floor: 0.74       # if convergence cool-down hurts completion too much, reopen mild search
 controller_phase3_final_gate_floor: 0.72       # late-gate failures are the first sign that lock-in was premature
 controller_phase3_crash_recover: 0.30          # excessive crashes during lock-in should send training back to mild search

@@ -1073,6 +1073,7 @@ def main(cfg):
                 rew_centering    = _mean("reward_centering")
                 rew_gate_reentry = _mean("reward_gate_reentry")
                 rew_exit_anchor  = _mean("reward_exit_anchor")
+                rew_guided_exit  = _mean("reward_guided_exit")
                 curriculum_phase = _mean("curriculum_phase")
                 curriculum_accuracy = _mean("curriculum_accuracy_ema")
                 curriculum_furthest = _mean("curriculum_furthest_ema")
@@ -1080,11 +1081,21 @@ def main(cfg):
                 reset_from_gate0 = _mean("reset_from_gate0")
                 reset_from_prev_gate = _mean("reset_from_prev_gate")
                 reset_from_random_gate = _mean("reset_from_random_gate")
+                cheating_events = _mean("cheating")
+                cheating_values = _stats_tensor("cheating")
+                cheating_rate = None
+                if cheating_values is not None:
+                    cheating_rate = cheating_values.gt(0).float().mean().item()
                 reentry_events = _mean("gate_reentry")
                 reentry_values = _stats_tensor("gate_reentry")
                 reentry_rate = None
                 if reentry_values is not None:
                     reentry_rate = reentry_values.gt(0).float().mean().item()
+                guided_exit_events = _mean("guided_exit_failures")
+                guided_exit_values = _stats_tensor("guided_exit_failures")
+                guided_exit_rate = None
+                if guided_exit_values is not None:
+                    guided_exit_rate = guided_exit_values.gt(0).float().mean().item()
 
                 derived = {}
 
@@ -1183,17 +1194,29 @@ def main(cfg):
                         and derived["race_objective/full_lap_time_sec_mean"]
                         <= race_objective_lap_time_target_sec
                     )
+                if cheating_rate is not None:
+                    derived["cheating/episode_rate"] = cheating_rate
+                if cheating_events is not None:
+                    derived["cheating/events_per_episode"] = cheating_events
                 if reentry_rate is not None:
                     derived["simple/gate_reentry"] = reentry_rate
                     derived["reentry/episode_rate"] = reentry_rate
                 if reentry_events is not None:
                     derived["reentry/events_per_episode"] = reentry_events
+                if guided_exit_rate is not None:
+                    derived["guided_exit/episode_rate"] = guided_exit_rate
+                if guided_exit_events is not None:
+                    derived["guided_exit/events_per_episode"] = guided_exit_events
+                    derived["fixes/guided_exit_failures"] = guided_exit_events
                 if rew_gate_reentry is not None:
                     derived["reentry/reward_gate_reentry"] = rew_gate_reentry
                     derived["fixes/reward_gate_reentry"] = rew_gate_reentry
                 if rew_exit_anchor is not None:
                     derived["reentry/reward_exit_anchor"] = rew_exit_anchor
                     derived["fixes/reward_exit_anchor"] = rew_exit_anchor
+                if rew_guided_exit is not None:
+                    derived["guided_exit/reward_guided_exit"] = rew_guided_exit
+                    derived["fixes/reward_guided_exit"] = rew_guided_exit
                 if furthest_gate is not None:
                     derived["race/furthest_gate_reached"] = furthest_gate
                     derived["race/furthest_gate_number"] = furthest_gate + 1.0
@@ -1226,6 +1249,7 @@ def main(cfg):
                 if rew_altitude  is not None: derived["reward/altitude_cumul"]  = rew_altitude
                 if rew_approach  is not None: derived["reward/approach_cumul"]  = rew_approach
                 if rew_centering is not None: derived["reward/centering_cumul"] = rew_centering
+                if rew_guided_exit is not None: derived["reward/guided_exit_cumul"] = rew_guided_exit
                 if rew_return    is not None: derived["reward/total_return"]    = rew_return
                 if rew_progress is not None and rew_return is not None and abs(rew_return) > 1e-6:
                     derived["reward/progress_fraction"] = rew_progress / rew_return
@@ -1242,6 +1266,7 @@ def main(cfg):
                     if rew_altitude  is not None: derived["reward/altitude_fraction"]  = rew_altitude / rew_return
                     if rew_approach  is not None: derived["reward/approach_fraction"]  = rew_approach / rew_return
                     if rew_centering is not None: derived["reward/centering_fraction"] = rew_centering / rew_return
+                    if rew_guided_exit is not None: derived["reward/guided_exit_fraction"] = rew_guided_exit / rew_return
                     if rew_penalties is not None: derived["reward/penalty_fraction"]   = rew_penalties / rew_return
 
                 # Behaviour diagnostics
@@ -1949,6 +1974,30 @@ def main(cfg):
                 )
 
                 for gi in range(logged_gate_count):
+                    v = _mean(f"cheating_gate_{gi}")
+                    if v is not None:
+                        derived[f"cheating/gate_{gi:02d}_events"] = v
+                        derived[f"cheating_human/gate_{gi + 1:02d}_events"] = v
+
+                cheating_gate_counts = [
+                    _mean(f"cheating_gate_{gi}") or 0.0
+                    for gi in range(logged_gate_count)
+                ]
+                cheating_gate_table = wandb.Table(
+                    columns=["gate", "repeat_events"],
+                    data=[
+                        [label, val]
+                        for label, val in zip(gate_labels, cheating_gate_counts)
+                    ],
+                )
+                derived["cheating/gate_distribution"] = wandb.plot.bar(
+                    cheating_gate_table,
+                    "gate",
+                    "repeat_events",
+                    title="Consecutive Same-Gate Repeat Events",
+                )
+
+                for gi in range(logged_gate_count):
                     v = _mean(f"gate_reentry_gate_{gi}")
                     if v is not None:
                         derived[f"reentry/gate_{gi:02d}_events"] = v
@@ -1985,6 +2034,43 @@ def main(cfg):
                     "gate",
                     "reentry_events",
                     title="Gate Re-entry Events",
+                )
+
+                for gi in range(logged_gate_count):
+                    v = _mean(f"guided_exit_failure_gate_{gi}")
+                    if v is not None:
+                        derived[f"guided_exit/gate_{gi:02d}_failures"] = v
+                        derived[f"guided_exit_human/gate_{gi + 1:02d}_failures"] = v
+
+                guided_exit_target_aliases = {
+                    11: "12",
+                }
+                for zero_based_gate_idx, human_gate_label in guided_exit_target_aliases.items():
+                    v = _mean(f"guided_exit_failure_gate_{zero_based_gate_idx}")
+                    if v is not None:
+                        derived[f"fixes/gate_{human_gate_label}_guided_exit_failures"] = v
+                        derived[f"fixes/human_gate_{human_gate_label}_guided_exit_failures"] = v
+                    v = _mean(f"cheating_gate_{zero_based_gate_idx}")
+                    if v is not None:
+                        derived[f"fixes/gate_{human_gate_label}_cheating_events"] = v
+                        derived[f"fixes/human_gate_{human_gate_label}_cheating_events"] = v
+
+                guided_exit_gate_counts = [
+                    _mean(f"guided_exit_failure_gate_{gi}") or 0.0
+                    for gi in range(logged_gate_count)
+                ]
+                guided_exit_gate_table = wandb.Table(
+                    columns=["gate", "guided_exit_failures"],
+                    data=[
+                        [label, val]
+                        for label, val in zip(gate_labels, guided_exit_gate_counts)
+                    ],
+                )
+                derived["guided_exit/gate_distribution"] = wandb.plot.bar(
+                    guided_exit_gate_table,
+                    "gate",
+                    "guided_exit_failures",
+                    title="Guided Exit Failures",
                 )
 
                 info.update(derived)

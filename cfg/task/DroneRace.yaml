@@ -165,6 +165,9 @@ reward_approach_scale: 0.5        # penalty for moving away from the gate when a
 reward_gate_centering_scale: 0.03 # bounded per-step penalty for missing the gate centerline near any gate
 reward_gate_reentry_scale: 35.0   # one-shot penalty when the drone backs back into the same monitored gate opening after crossing
 reward_exit_anchor_scale: 6.0     # local post-gate reward that nudges the drone onto the next segment after monitored gates
+reward_guided_exit_curve_scale: 1.0 # gate-specific local progress reward multiplier for the custom curved exit guide on the lower final stacked gate
+reward_guided_exit_straight_scale: 1.5 # bonus for aligning the guided exit velocity with the next-gate direction after the curve
+reward_guided_exit_backtrack_scale: 18.0 # extra penalty if the guided lower stacked gate exit curls back toward the same opening
 
 # Penalties and crash termination thresholds.
 reward_angular_penalty: 0.1       # penalize squared angular rates
@@ -204,10 +207,18 @@ gate_reentry_target_gates: [4, 5, 11] # zero-based gates G5, G6, G12; monitor th
 gate_reentry_monitor_substeps: 200     # keep watching the crossed gate for ~0.4 s after scoring it
 gate_reentry_clearance_x: 0.05         # require a small forward commit before a later negative-x sample counts as a re-entry
 gate_reentry_backtrack_x: -0.05        # backing back through the monitored gate opening beyond this plane triggers the penalty
-exit_anchor_target_gates: [4, 5, 11]   # zero-based gates that get a short-lived downstream exit anchor reward
+exit_anchor_target_gates: [4, 5]       # zero-based gates that get the generic short-lived downstream exit anchor reward
 exit_anchor_distance: 1.5              # meters downstream of the crossed gate along the next-gate segment
 exit_anchor_radius: 0.6                # once the drone gets this close to the exit anchor, the local reward turns off
 exit_anchor_max_steps: 30              # keep the exit anchor alive for ~0.3 s after the monitored gate crossing
+guided_exit_paths:
+  "11":
+    points_local:
+      - [0.90, -0.75, 0.00]
+      - [1.80, -0.35, 0.00]
+    point_radius: 0.45
+    max_steps: 45
+    reward_scale: 8.0
 sparse_only_gate_indices: [6, 7, 10, 11] # zero-based target gates in the stacked sections; dense shaping is disabled here
 sparse_disable_smoothness_penalties: true # allow harsher maneuvers inside sparse-only stacked-gate sections
 reward_speed_scale_phase2: 1.10        # stronger dense speed reward once reliable full laps are achieved

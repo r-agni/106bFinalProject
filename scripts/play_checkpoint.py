@@ -156,6 +156,46 @@ def main(cfg):
             "Disabled reset curriculum for playback; episodes will start from gate 0."
         )
 
+    play_focus_gate_human = cfg.get("play_focus_gate_human", None)
+    if play_focus_gate_human is not None:
+        focus_gate_human = int(play_focus_gate_human)
+        num_course_gates = int(getattr(base_env, "num_course_gates", 0))
+        if num_course_gates <= 0:
+            raise ValueError(
+                "play_focus_gate_human requires an environment with num_course_gates."
+            )
+        if not 2 <= focus_gate_human <= num_course_gates:
+            raise ValueError(
+                f"play_focus_gate_human must be in [2, {num_course_gates}] so playback "
+                "can restart one gate earlier and approach the focus gate naturally."
+            )
+        if not all(
+            hasattr(base_env, attr)
+            for attr in (
+                "reset_curriculum_enabled",
+                "active_reset_curriculum_gate",
+                "reset_curriculum_gate0_prob",
+                "reset_curriculum_prev_gate_prob",
+                "reset_curriculum_random_gate_prob",
+            )
+        ):
+            raise ValueError(
+                "play_focus_gate_human requires DroneRace reset curriculum controls."
+            )
+
+        # Reuse the existing previous-gate practice reset path so inspection
+        # playback can start one gate before the requested human-numbered gate.
+        base_env.reset_curriculum_enabled = True
+        base_env.active_reset_curriculum_gate = focus_gate_human - 1
+        base_env.reset_curriculum_gate0_prob = 0.0
+        base_env.reset_curriculum_prev_gate_prob = 1.0
+        base_env.reset_curriculum_random_gate_prob = 0.0
+        logging.info(
+            "Focused playback around human gate %s; each reset will start from human gate %s.",
+            focus_gate_human,
+            focus_gate_human - 1,
+        )
+
     transforms = [InitTracker()]
 
     # A CompositeSpec is by default processed by an entity-based encoder.

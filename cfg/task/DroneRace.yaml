@@ -164,6 +164,7 @@ reward_altitude_scale: 0.5        # bounded penalty for altitude mismatch at ele
 reward_approach_scale: 0.5        # penalty for moving away from the gate when already within 6m
 reward_gate_centering_scale: 0.03 # bounded per-step penalty for missing the gate centerline near any gate
 reward_gate_reentry_scale: 35.0   # one-shot penalty when the drone backs back into the same monitored gate opening after crossing
+reward_gate_12_hard_reentry_scale: 360.0 # gate-12-specific hard-fail penalty; must overpower the provisional gate-pass reward if the drone skims back out
 reward_exit_anchor_scale: 6.0     # local post-gate reward that nudges the drone onto the next segment after monitored gates
 reward_guided_exit_curve_scale: 1.0 # gate-specific local progress reward multiplier for the custom curved exit guide on the lower final stacked gate
 reward_guided_exit_straight_scale: 1.5 # bonus for aligning the guided exit velocity with the next-gate direction after the curve
@@ -207,6 +208,8 @@ gate_reentry_target_gates: [4, 5, 11] # zero-based gates G5, G6, G12; monitor th
 gate_reentry_monitor_substeps: 200     # keep watching the crossed gate for ~0.4 s after scoring it
 gate_reentry_clearance_x: 0.05         # require a small forward commit before a later negative-x sample counts as a re-entry
 gate_reentry_backtrack_x: -0.05        # backing back through the monitored gate opening beyond this plane triggers the penalty
+gate_12_commit_x: 0.30                 # gate-12 pass is provisional until all body probes are at least this far downstream of the gate plane
+gate_12_commit_timeout_substeps: 80    # terminate gate-12 skims that never fully commit downstream within ~0.16 s
 exit_anchor_target_gates: [4, 5]       # zero-based gates that get the generic short-lived downstream exit anchor reward
 exit_anchor_distance: 1.5              # meters downstream of the crossed gate along the next-gate segment
 exit_anchor_radius: 0.6                # once the drone gets this close to the exit anchor, the local reward turns off
@@ -214,10 +217,10 @@ exit_anchor_max_steps: 30              # keep the exit anchor alive for ~0.3 s a
 guided_exit_paths:
   "11":
     points_local:
-      - [0.90, -0.75, 0.00]
-      - [1.80, -0.35, 0.00]
-    point_radius: 0.45
-    max_steps: 45
+      - [1.25, -1.55, 0.00]
+      - [2.80, -1.00, 0.00]
+    point_radius: 0.35
+    max_steps: 55
     reward_scale: 8.0
 sparse_only_gate_indices: [6, 7, 10, 11] # zero-based target gates in the stacked sections; dense shaping is disabled here
 sparse_disable_smoothness_penalties: true # allow harsher maneuvers inside sparse-only stacked-gate sections

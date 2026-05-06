@@ -110,6 +110,7 @@ class DroneRaceEnv(IsaacEnv):
         "reward_approach_scale",
         "reward_gate_centering_scale",
         "reward_gate_reentry_scale",
+        "reward_gate_12_hard_reentry_scale",
         "reward_exit_anchor_scale",
         "reward_guided_exit_curve_scale",
         "reward_guided_exit_straight_scale",
@@ -376,6 +377,11 @@ class DroneRaceEnv(IsaacEnv):
                 ),
             }
         self.guided_exit_target_gates = tuple(sorted(self.guided_exit_path_specs.keys()))
+        self.gate_12_commit_gate_idx = 11 if self.num_course_gates > 11 else -1
+        self.gate_12_commit_x = float(cfg.task.get("gate_12_commit_x", 0.30))
+        self.gate_12_commit_timeout_substeps = int(
+            cfg.task.get("gate_12_commit_timeout_substeps", 80)
+        )
         self.gate_reentry_probe_body_length = float(
             cfg.task.get("play_body_shell_length", 0.28)
         )
@@ -574,6 +580,30 @@ class DroneRaceEnv(IsaacEnv):
         )
         self.gate_reentry_event_gate = torch.full(
             (self.num_envs,), -1, device=self.device, dtype=torch.long
+        )
+        self.gate_12_pending_commit = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.gate_12_commit_steps_left = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.gate_12_hard_reentry_fail_this_step = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.gate_12_commit_timeout_fail_this_step = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.gate_12_hard_reentry_failures_this_ep = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.gate_12_commit_timeout_failures_this_ep = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.gate_12_commit_successes_this_ep = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self.gate_12_commit_attempts_this_ep = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
         )
         self.exit_anchor_active = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
@@ -1021,6 +1051,16 @@ class DroneRaceEnv(IsaacEnv):
         self.gate_reentry_monitor_cleared[env_ids] = False
         self.gate_reentry_event_this_step[env_ids] = False
         self.gate_reentry_event_gate[env_ids] = -1
+        if self.gate_12_commit_gate_idx >= 0:
+            gate_12_env_ids = env_ids[
+                crossed_gate_idx[env_ids] == self.gate_12_commit_gate_idx
+            ]
+            if gate_12_env_ids.numel() > 0:
+                self.gate_12_pending_commit[gate_12_env_ids] = True
+                self.gate_12_commit_steps_left[gate_12_env_ids] = (
+                    self.gate_12_commit_timeout_substeps
+                )
+                self.gate_12_commit_attempts_this_ep[gate_12_env_ids] += 1
 
     def _arm_exit_anchor(
         self,
@@ -1044,6 +1084,46 @@ class DroneRaceEnv(IsaacEnv):
         )
         self.exit_anchor_steps_left[env_ids] = self.exit_anchor_max_steps
 
+    def _clear_gate_12_commit_state(self, env_ids: torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        self.gate_12_pending_commit[env_ids] = False
+        self.gate_12_commit_steps_left[env_ids] = 0
+
+    def _record_gate_12_commit_success(self, env_ids: torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        self.gate_12_commit_successes_this_ep[env_ids] += 1
+        self._clear_gate_12_commit_state(env_ids)
+        self.gate_reentry_monitor_steps_left[env_ids] = 0
+        self.gate_reentry_monitor_gate[env_ids] = -1
+        self.gate_reentry_monitor_cleared[env_ids] = False
+
+    def _fail_gate_12_commit(self, env_ids: torch.Tensor, timeout: bool):
+        if env_ids.numel() == 0:
+            return
+        failure_gate = torch.full(
+            (env_ids.numel(),),
+            self.gate_12_commit_gate_idx,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if timeout:
+            self.gate_12_commit_timeout_fail_this_step[env_ids] = True
+            self.gate_12_commit_timeout_failures_this_ep[env_ids] += 1
+        else:
+            self.gate_12_hard_reentry_fail_this_step[env_ids] = True
+            self.gate_12_hard_reentry_failures_this_ep[env_ids] += 1
+        self._revoke_gate_progress(env_ids, failure_gate)
+        self.gate_reentry_monitor_steps_left[env_ids] = 0
+        self.gate_reentry_monitor_gate[env_ids] = -1
+        self.gate_reentry_monitor_cleared[env_ids] = False
+        self.exit_anchor_active[env_ids] = False
+        self.exit_anchor_steps_left[env_ids] = 0
+        self.exit_anchor_gate[env_ids] = -1
+        self._clear_gate_12_commit_state(env_ids)
+        self._clear_guided_exit(env_ids)
+
     def _clear_guided_exit(self, env_ids: torch.Tensor):
         if env_ids.numel() == 0:
             return
@@ -1056,6 +1136,23 @@ class DroneRaceEnv(IsaacEnv):
         self.guided_exit_reward_scale[env_ids] = 0.0
         self.guided_exit_prev_dist[env_ids] = 0.0
         self.guided_exit_steps_left[env_ids] = 0
+
+    def _log_guided_exit_failure(
+        self, env_ids: torch.Tensor, gate_idx: torch.Tensor
+    ):
+        if env_ids.numel() == 0:
+            return
+        safe_gate_idx = gate_idx.clamp(
+            0, self.guided_exit_failure_crosses.shape[1] - 1
+        )
+        guided_failure_update = torch.zeros_like(self.guided_exit_failure_crosses)
+        guided_failure_update.scatter_add_(
+            1,
+            safe_gate_idx.unsqueeze(1),
+            torch.ones_like(safe_gate_idx, dtype=guided_failure_update.dtype).unsqueeze(1),
+        )
+        self.guided_exit_failure_crosses += guided_failure_update
+        self.guided_exit_failures_this_ep[env_ids] += 1
 
     def _arm_guided_exit(
         self,
@@ -1173,6 +1270,10 @@ class DroneRaceEnv(IsaacEnv):
 
         expired_ids = env_ids[self.guided_exit_steps_left[env_ids] <= 0]
         if expired_ids.numel() > 0:
+            expired_gate_idx = self.guided_exit_gate[expired_ids].clone()
+            # If the guide times out before all waypoints are reached, count that as
+            # a curve-following failure instead of silently clearing the state.
+            self._log_guided_exit_failure(expired_ids, expired_gate_idx)
             self._clear_guided_exit(expired_ids)
 
         return guided_curve_reward, guided_straight_reward, guided_backtrack_penalty
@@ -1278,6 +1379,7 @@ class DroneRaceEnv(IsaacEnv):
         strict_invalidation = invalidate_mask[monitor_gates]
         prev_cleared = self.gate_reentry_monitor_cleared[active_ids].clone()
         probe_backtrack = None
+        gate_12_pending_strict = None
         if strict_invalidation.any():
             strict_env_ids = active_ids[strict_invalidation]
             probe_rel = self._gate_probe_points_in_frame(
@@ -1290,6 +1392,7 @@ class DroneRaceEnv(IsaacEnv):
             cleared_now[strict_invalidation] = (
                 probe_rel[..., 0] > self.gate_reentry_clearance_x
             ).all(dim=1)
+            gate_12_pending_strict = self.gate_12_pending_commit[strict_env_ids]
         new_cleared = prev_cleared | cleared_now
         self.gate_reentry_monitor_cleared[active_ids] = new_cleared
         reentry_local = new_cleared & (rel_x < self.gate_reentry_backtrack_x) & in_opening
@@ -1301,9 +1404,25 @@ class DroneRaceEnv(IsaacEnv):
             probe_backtrack = (
                 (probe_rel[..., 0] < self.gate_reentry_backtrack_x) & probe_in_opening
             ).any(dim=1)
-            reentry_local[strict_invalidation] = (
-                new_cleared[strict_invalidation] & probe_backtrack
+            strict_reentry_local = new_cleared[strict_invalidation] & probe_backtrack
+            gate_12_commit_success = gate_12_pending_strict & (
+                probe_rel[..., 0] > self.gate_12_commit_x
+            ).all(dim=1)
+            gate_12_hard_fail = (
+                gate_12_pending_strict
+                & (rel_x[strict_invalidation] < self.gate_reentry_backtrack_x)
+                & probe_backtrack
             )
+            if gate_12_commit_success.any():
+                self._record_gate_12_commit_success(
+                    strict_env_ids[gate_12_commit_success]
+                )
+            if gate_12_hard_fail.any():
+                self._fail_gate_12_commit(
+                    strict_env_ids[gate_12_hard_fail], timeout=False
+                )
+            strict_reentry_local[gate_12_pending_strict] = False
+            reentry_local[strict_invalidation] = strict_reentry_local
         guided_failure_local = (
             self.guided_exit_active[active_ids]
             & (self.guided_exit_point_index[active_ids] == 0)
@@ -1318,6 +1437,7 @@ class DroneRaceEnv(IsaacEnv):
             guided_failure_local[strict_invalidation] = (
                 guided_failure_local[strict_invalidation] & probe_backtrack
             )
+            guided_failure_local[strict_invalidation] &= ~gate_12_pending_strict
         if guided_failure_local.any():
             env_ids = active_ids[guided_failure_local]
             self.guided_exit_failure_this_step[env_ids] = True
@@ -1361,6 +1481,17 @@ class DroneRaceEnv(IsaacEnv):
         expired = self.gate_reentry_monitor_steps_left <= 0
         self.gate_reentry_monitor_gate[expired] = -1
         self.gate_reentry_monitor_cleared[expired] = False
+
+        pending_commit_ids = (
+            self.gate_12_pending_commit & (self.gate_12_commit_steps_left > 0)
+        ).nonzero(as_tuple=False).squeeze(-1)
+        if pending_commit_ids.numel() > 0:
+            self.gate_12_commit_steps_left[pending_commit_ids] -= 1
+            timeout_ids = pending_commit_ids[
+                self.gate_12_commit_steps_left[pending_commit_ids] <= 0
+            ]
+            if timeout_ids.numel() > 0:
+                self._fail_gate_12_commit(timeout_ids, timeout=True)
 
     def _get_controller_base_gate_targets(self):
         targets = torch.zeros(self.num_course_gates, device=self.device)
@@ -1476,6 +1607,7 @@ class DroneRaceEnv(IsaacEnv):
         c = self._track_cam_center_local + central
         span = float(self._track_cam_span)
         camera_mode = str(self.cfg.get("play_camera_mode", "track")).lower()
+        self._apply_viewport_env_visibility(camera_mode)
         if camera_mode == "fixed":
             # Respect cfg.viewer.eye/lookat from IsaacEnv without applying the
             # course-framing camera override.
@@ -1492,6 +1624,45 @@ class DroneRaceEnv(IsaacEnv):
             target = c + np.array([0.0, 0.0, 0.25 * span], dtype=np.float64)
         set_camera_view(eye=eye, target=target)
 
+    def _apply_viewport_env_visibility(self, camera_mode: str):
+        """Optionally hide non-central env clones so the viewer shows one race."""
+        if not getattr(self, "enable_viewport", False):
+            return
+        if not hasattr(self, "envs_prim_paths"):
+            return
+
+        isolate_follow_envs = bool(self.cfg.get("play_isolate_follow_envs", True))
+        visible_env_idx = (
+            int(self.central_env_idx)
+            if camera_mode == "follow" and isolate_follow_envs
+            else None
+        )
+
+        if getattr(self, "_viewer_visible_env_idx", object()) == visible_env_idx:
+            return
+
+        stage = stage_utils.get_current_stage()
+        if stage is None:
+            return
+
+        for env_idx, env_path in enumerate(self.envs_prim_paths):
+            env_prim = stage.GetPrimAtPath(env_path)
+            if env_prim is None or not env_prim.IsValid():
+                continue
+            imageable = UsdGeom.Imageable(env_prim)
+            if not imageable:
+                continue
+            if visible_env_idx is None or env_idx == visible_env_idx:
+                imageable.MakeVisible()
+            else:
+                imageable.MakeInvisible()
+
+        self._viewer_visible_env_idx = visible_env_idx
+        if visible_env_idx is None:
+            print("[DroneRaceEnv] Viewport showing all env clones.")
+        else:
+            print(f"[DroneRaceEnv] Viewport isolating env_{visible_env_idx} for follow camera.")
+
     def _update_follow_viewport_camera(self, force: bool = False):
         """Track the central drone with a smoothed chase camera during playback."""
         if not getattr(self, "enable_viewport", False):
@@ -1506,6 +1677,7 @@ class DroneRaceEnv(IsaacEnv):
             self.drone.get_state()
         except Exception:
             pass
+        self._apply_viewport_env_visibility("follow")
 
         env_idx = int(self.central_env_idx)
         env_offset = self.envs_positions[env_idx].detach().cpu().numpy()
@@ -2055,6 +2227,10 @@ class DroneRaceEnv(IsaacEnv):
             "guided_exit_failure_gate_10": Unbounded(1),
             "guided_exit_failure_gate_11": Unbounded(1),
             "guided_exit_failure_gate_12": Unbounded(1),
+            "gate_12_hard_reentry_failures": Unbounded(1),
+            "gate_12_commit_timeout_failures": Unbounded(1),
+            "gate_12_commit_successes": Unbounded(1),
+            "gate_12_commit_attempts": Unbounded(1),
             "wrong_side_gate_0": Unbounded(1),
             "wrong_side_gate_1": Unbounded(1),
             "wrong_side_gate_2": Unbounded(1),
@@ -2185,6 +2361,14 @@ class DroneRaceEnv(IsaacEnv):
         self.gate_reentry_monitor_cleared[env_ids] = False
         self.gate_reentry_event_this_step[env_ids] = False
         self.gate_reentry_event_gate[env_ids] = -1
+        self.gate_12_pending_commit[env_ids] = False
+        self.gate_12_commit_steps_left[env_ids] = 0
+        self.gate_12_hard_reentry_fail_this_step[env_ids] = False
+        self.gate_12_commit_timeout_fail_this_step[env_ids] = False
+        self.gate_12_hard_reentry_failures_this_ep[env_ids] = 0
+        self.gate_12_commit_timeout_failures_this_ep[env_ids] = 0
+        self.gate_12_commit_successes_this_ep[env_ids] = 0
+        self.gate_12_commit_attempts_this_ep[env_ids] = 0
         self.exit_anchor_active[env_ids] = False
         self.exit_anchor_gate[env_ids] = -1
         self.exit_anchor_pos[env_ids] = 0.0
@@ -2348,6 +2532,10 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["cheating"][env_ids] = 0.
         self.stats["gate_reentry"][env_ids] = 0.
         self.stats["guided_exit_failures"][env_ids] = 0.
+        self.stats["gate_12_hard_reentry_failures"][env_ids] = 0.
+        self.stats["gate_12_commit_timeout_failures"][env_ids] = 0.
+        self.stats["gate_12_commit_successes"][env_ids] = 0.
+        self.stats["gate_12_commit_attempts"][env_ids] = 0.
         self.stats["controller_speed_pressure"][env_ids] = float(self.controller_speed_pressure)
         self.stats["controller_exploration_pressure"][env_ids] = float(self.controller_exploration_pressure)
         self.stats["controller_collapse_active"][env_ids] = float(self.controller_collapse_active)
@@ -2820,6 +3008,18 @@ class DroneRaceEnv(IsaacEnv):
         guided_exit_failure_gate_idx = self.guided_exit_failure_gate.clone()
         self.guided_exit_failure_this_step.zero_()
         self.guided_exit_failure_gate.fill_(-1)
+        gate_12_hard_reentry_fail_this_step = (
+            self.gate_12_hard_reentry_fail_this_step.clone()
+        )
+        gate_12_commit_timeout_fail_this_step = (
+            self.gate_12_commit_timeout_fail_this_step.clone()
+        )
+        self.gate_12_hard_reentry_fail_this_step.zero_()
+        self.gate_12_commit_timeout_fail_this_step.zero_()
+        gate_12_special_failure = (
+            gate_12_hard_reentry_fail_this_step
+            | gate_12_commit_timeout_fail_this_step
+        )
 
         clamped_crossed_gate_idx = crossed_gate_idx.clamp(0, self.num_course_gates - 1)
         reentry_target_cross_mask = (
@@ -3024,6 +3224,11 @@ class DroneRaceEnv(IsaacEnv):
             - guided_backtrack_penalty
         )
         reward += guided_exit_reward
+        gate_12_hard_reentry_penalty = (
+            self.reward_gate_12_hard_reentry_scale
+            * gate_12_special_failure.float()
+        )
+        reward -= gate_12_hard_reentry_penalty
 
         # 3. Sparse gate passage bonus.
         gate_reward = self.reward_gate_passage * gate_passed_this_step.float()
@@ -3272,14 +3477,20 @@ class DroneRaceEnv(IsaacEnv):
             self.wrong_side_violation_latched & self.wrong_side_violation_ends_episode
         )
         crashed = phys_crash | ground_crash | dist_crash | wrong_side_crash
+        penalized_crash = crashed & (~gate_12_special_failure)
 
         # Apply crash penalty to reward.
-        reward -= self.reward_crash_scale * crashed.float()
+        reward -= self.reward_crash_scale * penalized_crash.float()
 
         # ----- END STUDENT CODE -----
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
         completed_task = self.track_completed
-        done = truncated | completed_task.unsqueeze(-1) | crashed.unsqueeze(-1)
+        done = (
+            truncated
+            | completed_task.unsqueeze(-1)
+            | crashed.unsqueeze(-1)
+            | gate_12_special_failure.unsqueeze(-1)
+        )
 
         # Record gate-cross diagnostics before any terminal EMA updates so the
         # final gate on a completed lap is visible to the curriculum/controller
@@ -3429,7 +3640,7 @@ class DroneRaceEnv(IsaacEnv):
         # Reward component breakdown (cumulative)
         gate_reward_total = gate_reward + sequence_reward + lap_reward + hard_turn_bonus_reward  # (N,) includes ordered streak + lap bonuses
         penalty_reward = angular_penalty + action_smooth_penalty  # (N,)
-        crash_reward = self.reward_crash_scale * crashed.float()  # (N,)
+        crash_reward = self.reward_crash_scale * penalized_crash.float()  # (N,)
         self.stats["reward_progress"].add_((progress_reward + hard_turn_direction_reward).unsqueeze(-1))
         self.stats["reward_speed"].add_(speed_reward_total.unsqueeze(-1))
         self.stats["reward_gates"].add_(gate_reward_total.unsqueeze(-1))
@@ -3440,7 +3651,9 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_altitude"].add_((-altitude_penalty).unsqueeze(-1))
         self.stats["reward_approach"].add_((-approach_penalty).unsqueeze(-1))
         self.stats["reward_centering"].add_((-centering_penalty).unsqueeze(-1))
-        self.stats["reward_gate_reentry"].add_((-gate_reentry_penalty).unsqueeze(-1))
+        self.stats["reward_gate_reentry"].add_(
+            (-(gate_reentry_penalty + gate_12_hard_reentry_penalty)).unsqueeze(-1)
+        )
         self.stats["reward_exit_anchor"].add_(exit_anchor_reward.unsqueeze(-1))
         self.stats["reward_guided_exit"].add_(guided_exit_reward.unsqueeze(-1))
         self.stats["reward_crash"].add_(crash_reward.unsqueeze(-1))
@@ -3507,6 +3720,18 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["cheating"][:] = self.repeat_gate_events_this_ep.float().unsqueeze(1)
         self.stats["gate_reentry"][:] = self.gate_reentry_events_this_ep.float().unsqueeze(1)
         self.stats["guided_exit_failures"][:] = self.guided_exit_failures_this_ep.float().unsqueeze(1)
+        self.stats["gate_12_hard_reentry_failures"][:] = (
+            self.gate_12_hard_reentry_failures_this_ep.float().unsqueeze(1)
+        )
+        self.stats["gate_12_commit_timeout_failures"][:] = (
+            self.gate_12_commit_timeout_failures_this_ep.float().unsqueeze(1)
+        )
+        self.stats["gate_12_commit_successes"][:] = (
+            self.gate_12_commit_successes_this_ep.float().unsqueeze(1)
+        )
+        self.stats["gate_12_commit_attempts"][:] = (
+            self.gate_12_commit_attempts_this_ep.float().unsqueeze(1)
+        )
         self.stats["wrong_side_violation"][:] = self.wrong_side_violation_events_this_ep.float().unsqueeze(1)
 
         # Curriculum phase (0=accuracy-first, 1=bridge-speed, 2=speed-focus).

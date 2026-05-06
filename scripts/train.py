@@ -1096,6 +1096,20 @@ def main(cfg):
                 guided_exit_rate = None
                 if guided_exit_values is not None:
                     guided_exit_rate = guided_exit_values.gt(0).float().mean().item()
+                gate_12_hard_reentry_failures = _mean("gate_12_hard_reentry_failures")
+                gate_12_commit_timeout_failures = _mean("gate_12_commit_timeout_failures")
+                gate_12_commit_successes = _mean("gate_12_commit_successes")
+                gate_12_commit_attempts = _mean("gate_12_commit_attempts")
+                gate_12_commit_success_rate = None
+                if (
+                    gate_12_commit_successes is not None
+                    and gate_12_commit_attempts is not None
+                    and gate_12_commit_attempts > 0
+                ):
+                    gate_12_commit_success_rate = (
+                        gate_12_commit_successes
+                        / max(gate_12_commit_attempts, 1e-6)
+                    )
 
                 derived = {}
 
@@ -1208,6 +1222,15 @@ def main(cfg):
                 if guided_exit_events is not None:
                     derived["guided_exit/events_per_episode"] = guided_exit_events
                     derived["fixes/guided_exit_failures"] = guided_exit_events
+                if gate_12_hard_reentry_failures is not None:
+                    derived["fixes/gate_12_hard_reentry_failures"] = gate_12_hard_reentry_failures
+                    derived["fixes/human_gate_12_hard_reentry_failures"] = gate_12_hard_reentry_failures
+                if gate_12_commit_timeout_failures is not None:
+                    derived["fixes/gate_12_commit_timeout_failures"] = gate_12_commit_timeout_failures
+                    derived["fixes/human_gate_12_commit_timeout_failures"] = gate_12_commit_timeout_failures
+                if gate_12_commit_success_rate is not None:
+                    derived["fixes/gate_12_commit_success_rate"] = gate_12_commit_success_rate
+                    derived["fixes/human_gate_12_commit_success_rate"] = gate_12_commit_success_rate
                 if rew_gate_reentry is not None:
                     derived["reentry/reward_gate_reentry"] = rew_gate_reentry
                     derived["fixes/reward_gate_reentry"] = rew_gate_reentry
@@ -2054,6 +2077,12 @@ def main(cfg):
                     if v is not None:
                         derived[f"fixes/gate_{human_gate_label}_cheating_events"] = v
                         derived[f"fixes/human_gate_{human_gate_label}_cheating_events"] = v
+                if gate_12_hard_reentry_failures is not None:
+                    derived["guided_exit_human/gate_12_hard_reentry_failures"] = gate_12_hard_reentry_failures
+                if gate_12_commit_timeout_failures is not None:
+                    derived["guided_exit_human/gate_12_commit_timeout_failures"] = gate_12_commit_timeout_failures
+                if gate_12_commit_success_rate is not None:
+                    derived["guided_exit_human/gate_12_commit_success_rate"] = gate_12_commit_success_rate
 
                 guided_exit_gate_counts = [
                     _mean(f"guided_exit_failure_gate_{gi}") or 0.0

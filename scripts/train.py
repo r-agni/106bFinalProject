@@ -335,6 +335,10 @@ def main(cfg):
     phase3_lock_coef = float(
         adaptive_entropy_cfg.get("phase3_lock_coef", 0.0018)
     )
+    phase3_rebound_cap = max(
+        float(adaptive_entropy_cfg.get("phase3_rebound_cap", recovery_coef)),
+        phase3_lock_coef,
+    )
     phase3_max_decrease_step = float(
         adaptive_entropy_cfg.get("phase3_max_decrease_per_update", 0.0010)
     )
@@ -465,6 +469,13 @@ def main(cfg):
     controller_phase3_lock_crash_target = float(
         cfg.task.get("controller_phase3_lock_crash_target", 0.22)
     )
+    controller_phase3_fallback_patience_windows = max(
+        int(cfg.task.get("controller_phase3_fallback_patience_windows", 1)),
+        1,
+    )
+    controller_phase3_sticky_after_first_lock = bool(
+        cfg.task.get("controller_phase3_sticky_after_first_lock", False)
+    )
     controller_phase3_completion_floor = float(
         cfg.task.get("controller_phase3_completion_floor", 0.74)
     )
@@ -498,6 +509,8 @@ def main(cfg):
     controller_t20_best_stable_lap_time_sec = None
     controller_phase2_ready_count = 0
     controller_plateau_count = 0
+    controller_phase3_has_locked = False
+    controller_phase3_bad_window_count = 0
     controller_completion_history = deque(maxlen=6)
     controller_completion_recent = deque(maxlen=controller_metric_window)
     controller_gate0_crash_recent = deque(maxlen=controller_metric_window)
@@ -558,6 +571,20 @@ def main(cfg):
             loaded_trainer_resume_state.get(
                 "controller_plateau_count", controller_plateau_count
             )
+        )
+        controller_phase3_has_locked = bool(
+            loaded_trainer_resume_state.get(
+                "controller_phase3_has_locked", controller_phase >= 3
+            )
+        )
+        controller_phase3_bad_window_count = max(
+            int(
+                loaded_trainer_resume_state.get(
+                    "controller_phase3_bad_window_count",
+                    controller_phase3_bad_window_count,
+                )
+            ),
+            0,
         )
         controller_phase_start_frames = int(
             loaded_trainer_resume_state.get(
@@ -719,6 +746,33 @@ def main(cfg):
         if phase3_started_iter is not None:
             phase3_started_iter = int(phase3_started_iter)
             run.summary["curriculum/phase3_started_iter"] = phase3_started_iter
+    if (
+        controller_phase >= 3
+        or phase3_started_env_frames is not None
+        or logged_curriculum_phase >= 3
+    ):
+        controller_phase3_has_locked = True
+    if controller_phase < 3:
+        controller_phase3_bad_window_count = 0
+    if controller_phase3_has_locked:
+        current_entropy_coef = min(current_entropy_coef, phase3_rebound_cap)
+        target_entropy_coef = min(target_entropy_coef, phase3_rebound_cap)
+    if (
+        controller_phase3_sticky_after_first_lock
+        and controller_phase3_has_locked
+        and controller_phase < 2
+    ):
+        controller_phase = 2
+        controller_exploration_pressure = 0.0
+    base_env.set_constrained_speed_controller(
+        phase=controller_phase,
+        speed_pressure=controller_speed_pressure,
+        exploration_pressure=controller_exploration_pressure,
+        collapse_active=controller_collapse_active,
+        entropy_target=target_entropy_coef,
+    )
+    if hasattr(policy, "entropy_coef"):
+        policy.entropy_coef = current_entropy_coef
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -789,6 +843,10 @@ def main(cfg):
                 ),
                 "controller_phase2_ready_count": int(controller_phase2_ready_count),
                 "controller_plateau_count": int(controller_plateau_count),
+                "controller_phase3_has_locked": bool(controller_phase3_has_locked),
+                "controller_phase3_bad_window_count": int(
+                    controller_phase3_bad_window_count
+                ),
                 "controller_phase_start_frames": int(controller_phase_start_frames),
                 "controller_completion_history": list(controller_completion_history),
                 "controller_completion_recent": list(controller_completion_recent),
@@ -877,6 +935,7 @@ def main(cfg):
 
     loop_exception = None
     phase2_plateau_floor = 0.0
+    phase3_rebound_cap_active = False
     try:
         logging.info(
             f"Starting training loop: frames_per_batch={frames_per_batch}, "
@@ -901,9 +960,18 @@ def main(cfg):
                 info["entropy/target_coef"] = target_entropy_coef
                 info["entropy/phase2_plateau_floor"] = phase2_plateau_floor
                 info["entropy/phase3_lock_active"] = float(controller_phase >= 3)
+                info["entropy/phase3_rebound_cap_active"] = float(
+                    phase3_rebound_cap_active
+                )
             info["controller/phase"] = float(controller_phase)
             info["controller/speed_pressure"] = controller_speed_pressure
             info["controller/exploration_pressure"] = controller_exploration_pressure
+            info["controller/phase3_has_locked"] = float(
+                controller_phase3_has_locked
+            )
+            info["controller/phase3_bad_window_count"] = float(
+                controller_phase3_bad_window_count
+            )
             episode_stats.add(data.to_tensordict())
 
             if len(episode_stats) >= base_env.num_envs:
@@ -1434,6 +1502,13 @@ def main(cfg):
                     or controller_crash_signal > controller_phase3_crash_recover
                     or completion_drop_5 < -controller_phase3_completion_drop_recover
                 )
+                if controller_phase >= 3:
+                    if phase3_fallback_conditions:
+                        controller_phase3_bad_window_count += 1
+                    else:
+                        controller_phase3_bad_window_count = 0
+                else:
+                    controller_phase3_bad_window_count = 0
                 phase1_unlock = (
                     gate0_success_count > 0 or controller_completion_signal >= 0.35
                 )
@@ -1452,16 +1527,25 @@ def main(cfg):
                     and controller_plateau_count >= controller_phase3_lock_plateau_windows
                     and t20_valid
                 )
-                if controller_phase >= 3 and phase3_fallback_conditions:
+                phase3_fallback_ready = (
+                    controller_phase >= 3
+                    and phase3_fallback_conditions
+                    and controller_phase3_bad_window_count
+                    >= controller_phase3_fallback_patience_windows
+                )
+                if phase3_fallback_ready:
                     controller_phase = 2
                     controller_phase_start_frames = collector._frames
                     controller_phase2_ready_count = 0
                     controller_plateau_count = 0
+                    controller_phase3_bad_window_count = 0
                     controller_exploration_pressure = 0.0
                 elif phase3_lock_conditions:
                     controller_phase = 3
                     controller_phase_start_frames = collector._frames
                     controller_phase2_ready_count = 0
+                    controller_phase3_has_locked = True
+                    controller_phase3_bad_window_count = 0
                     controller_exploration_pressure = 0.0
                     target_entropy_coef = phase3_lock_coef
                     if phase3_started_env_frames is None:
@@ -1479,11 +1563,15 @@ def main(cfg):
                             phase3_started_iter,
                         )
                 elif controller_phase == 2 and phase2_collapse_conditions:
-                    controller_phase = 1
                     controller_phase_start_frames = collector._frames
                     controller_phase2_ready_count = 0
                     controller_plateau_count = 0
                     controller_exploration_pressure = 0.0
+                    if not (
+                        controller_phase3_sticky_after_first_lock
+                        and controller_phase3_has_locked
+                    ):
+                        controller_phase = 1
 
                 phase_frames = max(collector._frames - controller_phase_start_frames, 0)
                 phase2_ready_window = (
@@ -1634,6 +1722,7 @@ def main(cfg):
                     )
 
                 if entropy_controller_enabled:
+                    phase3_rebound_cap_active = False
                     entropy_max_increase = entropy_increase_step
                     entropy_max_decrease = entropy_decrease_step
                     if controller_phase >= 3:
@@ -1666,6 +1755,20 @@ def main(cfg):
                                 entropy_max_increase,
                                 phase2_plateau_max_increase_step,
                             )
+                    # Once phase 3 has locked at least once, keep recovery search mild.
+                    if controller_phase3_has_locked:
+                        current_entropy_coef = min(
+                            current_entropy_coef,
+                            phase3_rebound_cap,
+                        )
+                        clamped_target_entropy_coef = min(
+                            target_entropy_coef,
+                            phase3_rebound_cap,
+                        )
+                        phase3_rebound_cap_active = (
+                            clamped_target_entropy_coef + 1e-12 < target_entropy_coef
+                        )
+                        target_entropy_coef = clamped_target_entropy_coef
                     current_entropy_coef = _slew_toward_asymmetric(
                         current_entropy_coef,
                         target_entropy_coef,
@@ -1698,6 +1801,12 @@ def main(cfg):
                     getattr(base_env, "controller_explore_episode_rate", 0.0)
                 )
                 derived["controller/collapse_active"] = float(controller_collapse_active)
+                derived["controller/phase3_has_locked"] = float(
+                    controller_phase3_has_locked
+                )
+                derived["controller/phase3_bad_window_count"] = float(
+                    controller_phase3_bad_window_count
+                )
                 derived["controller/stabilize_window"] = float(stabilize_window)
                 derived["controller/phase2_ready_window"] = float(phase2_ready_window)
                 derived["controller/phase2_operating_window"] = float(phase2_operating_window)
@@ -1707,6 +1816,9 @@ def main(cfg):
                 derived["controller/plateau_count"] = float(controller_plateau_count)
                 derived["controller/plateau_windows"] = float(controller_plateau_windows)
                 derived["controller/min_phase_frames"] = float(controller_min_phase_frames)
+                derived["controller/phase3_fallback_patience_windows"] = float(
+                    controller_phase3_fallback_patience_windows
+                )
                 derived["controller/stabilize_completion_target"] = (
                     controller_stabilize_completion_target
                 )
@@ -1783,6 +1895,10 @@ def main(cfg):
                     derived["entropy/speed_pressure"] = controller_speed_pressure
                     derived["entropy/exploration_pressure"] = controller_exploration_pressure
                     derived["entropy/phase2_plateau_floor"] = phase2_plateau_floor
+                    derived["entropy/phase3_rebound_cap"] = phase3_rebound_cap
+                    derived["entropy/phase3_rebound_cap_active"] = float(
+                        phase3_rebound_cap_active
+                    )
                     derived["entropy/phase3_lock_active"] = float(
                         controller_phase >= 3
                     )

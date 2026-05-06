@@ -24,6 +24,7 @@ adaptive_entropy:
   phase2_plateau_max_increase_per_update: 0.0005
   recovery_coef: 0.010
   phase3_lock_coef: 0.0018
+  phase3_rebound_cap: 0.006
   phase3_max_decrease_per_update: 0.0010
   phase3_max_increase_per_update: 0.00025
   speed_ema_alpha: 0.05

@@ -115,6 +115,7 @@ class DroneRaceEnv(IsaacEnv):
         "reward_guided_exit_curve_scale",
         "reward_guided_exit_straight_scale",
         "reward_guided_exit_backtrack_scale",
+        "reward_gate_12_commit_stall_scale",
     )
     TERMINATION_CONFIG_KEYS = (
         "crash_dist_threshold",
@@ -381,6 +382,9 @@ class DroneRaceEnv(IsaacEnv):
         self.gate_12_commit_x = float(cfg.task.get("gate_12_commit_x", 0.30))
         self.gate_12_commit_timeout_substeps = int(
             cfg.task.get("gate_12_commit_timeout_substeps", 80)
+        )
+        self.gate_12_commit_stall_vel_threshold = float(
+            cfg.task.get("gate_12_commit_stall_vel_threshold", 0.5)
         )
         self.gate_reentry_probe_body_length = float(
             cfg.task.get("play_body_shell_length", 0.28)
@@ -1095,9 +1099,10 @@ class DroneRaceEnv(IsaacEnv):
             return
         self.gate_12_commit_successes_this_ep[env_ids] += 1
         self._clear_gate_12_commit_state(env_ids)
-        self.gate_reentry_monitor_steps_left[env_ids] = 0
-        self.gate_reentry_monitor_gate[env_ids] = -1
-        self.gate_reentry_monitor_cleared[env_ids] = False
+        # Intentionally keep the gate reentry monitor alive so post-commit
+        # backtracking through gate 12 is still caught (guided_failure_local
+        # detection and the 360pt hard-fail path both require the monitor gate
+        # to remain set).
 
     def _fail_gate_12_commit(self, env_ids: torch.Tensor, timeout: bool):
         if env_ids.numel() == 0:
@@ -1444,16 +1449,32 @@ class DroneRaceEnv(IsaacEnv):
             self.guided_exit_failure_gate[env_ids] = self.gate_reentry_monitor_gate[
                 env_ids
             ]
-            self._revoke_gate_progress(
-                env_ids, self.gate_reentry_monitor_gate[env_ids]
-            )
-            self.gate_reentry_monitor_steps_left[env_ids] = 0
-            self.gate_reentry_monitor_gate[env_ids] = -1
-            self.gate_reentry_monitor_cleared[env_ids] = False
-            self.exit_anchor_active[env_ids] = False
-            self.exit_anchor_steps_left[env_ids] = 0
-            self.exit_anchor_gate[env_ids] = -1
-            self._clear_guided_exit(env_ids)
+            # Gate 12 post-commit backtracking: escalate to the 360pt hard-fail
+            # path (episode termination + gate revocation) instead of the weaker
+            # guided-exit failure which only revokes the gate.
+            if self.gate_12_commit_gate_idx >= 0:
+                g12_post_commit = (
+                    self.gate_reentry_monitor_gate[env_ids]
+                    == self.gate_12_commit_gate_idx
+                ) & ~self.gate_12_pending_commit[env_ids]
+                if g12_post_commit.any():
+                    self._fail_gate_12_commit(
+                        env_ids[g12_post_commit], timeout=False
+                    )
+                other_env_ids = env_ids[~g12_post_commit]
+            else:
+                other_env_ids = env_ids
+            if other_env_ids.numel() > 0:
+                self._revoke_gate_progress(
+                    other_env_ids, self.gate_reentry_monitor_gate[other_env_ids]
+                )
+                self.gate_reentry_monitor_steps_left[other_env_ids] = 0
+                self.gate_reentry_monitor_gate[other_env_ids] = -1
+                self.gate_reentry_monitor_cleared[other_env_ids] = False
+                self.exit_anchor_active[other_env_ids] = False
+                self.exit_anchor_steps_left[other_env_ids] = 0
+                self.exit_anchor_gate[other_env_ids] = -1
+                self._clear_guided_exit(other_env_ids)
             reentry_local[guided_failure_local] = False
         if reentry_local.any():
             env_ids = active_ids[reentry_local]
@@ -2231,6 +2252,7 @@ class DroneRaceEnv(IsaacEnv):
             "gate_12_commit_timeout_failures": Unbounded(1),
             "gate_12_commit_successes": Unbounded(1),
             "gate_12_commit_attempts": Unbounded(1),
+            "reward_gate_12_stall_penalty": Unbounded(1),
             "wrong_side_gate_0": Unbounded(1),
             "wrong_side_gate_1": Unbounded(1),
             "wrong_side_gate_2": Unbounded(1),
@@ -2536,6 +2558,7 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["gate_12_commit_timeout_failures"][env_ids] = 0.
         self.stats["gate_12_commit_successes"][env_ids] = 0.
         self.stats["gate_12_commit_attempts"][env_ids] = 0.
+        self.stats["reward_gate_12_stall_penalty"][env_ids] = 0.
         self.stats["controller_speed_pressure"][env_ids] = float(self.controller_speed_pressure)
         self.stats["controller_exploration_pressure"][env_ids] = float(self.controller_exploration_pressure)
         self.stats["controller_collapse_active"][env_ids] = float(self.controller_collapse_active)
@@ -3230,6 +3253,21 @@ class DroneRaceEnv(IsaacEnv):
         )
         reward -= gate_12_hard_reentry_penalty
 
+        # Stall penalty: penalize low gate-frame forward velocity during the gate 12
+        # commit window to discourage hovering or backing before committing 0.30 m.
+        gate_12_stall_penalty = torch.zeros(self.num_envs, device=self.device)
+        stall_mask = self.gate_12_pending_commit & (self.gate_12_commit_steps_left > 0)
+        if stall_mask.any():
+            gate_fwd_vel = quat_rotate_inverse(
+                self.gate_reentry_monitor_rot[stall_mask],
+                lin_vel_world[stall_mask],
+            )[:, 0]
+            gate_12_stall_penalty[stall_mask] = (
+                self.reward_gate_12_commit_stall_scale
+                * (gate_fwd_vel < self.gate_12_commit_stall_vel_threshold).float()
+            )
+        reward -= gate_12_stall_penalty
+
         # 3. Sparse gate passage bonus.
         gate_reward = self.reward_gate_passage * gate_passed_this_step.float()
         reward += gate_reward
@@ -3653,6 +3691,9 @@ class DroneRaceEnv(IsaacEnv):
         self.stats["reward_centering"].add_((-centering_penalty).unsqueeze(-1))
         self.stats["reward_gate_reentry"].add_(
             (-(gate_reentry_penalty + gate_12_hard_reentry_penalty)).unsqueeze(-1)
+        )
+        self.stats["reward_gate_12_stall_penalty"].add_(
+            (-gate_12_stall_penalty).unsqueeze(-1)
         )
         self.stats["reward_exit_anchor"].add_(exit_anchor_reward.unsqueeze(-1))
         self.stats["reward_guided_exit"].add_(guided_exit_reward.unsqueeze(-1))

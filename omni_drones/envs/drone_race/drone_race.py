@@ -1427,6 +1427,21 @@ class DroneRaceEnv(IsaacEnv):
                     strict_env_ids[gate_12_hard_fail], timeout=False
                 )
             strict_reentry_local[gate_12_pending_strict] = False
+            # Post-commit gate 12 backtracking via strict probe detection: escalate
+            # to the 360pt hard-fail path regardless of guided_exit_point_index.
+            if self.gate_12_commit_gate_idx >= 0:
+                is_g12_strict = (
+                    self.gate_reentry_monitor_gate[strict_env_ids]
+                    == self.gate_12_commit_gate_idx
+                )
+                post_commit_g12_strict = (
+                    strict_reentry_local & is_g12_strict & ~gate_12_pending_strict
+                )
+                if post_commit_g12_strict.any():
+                    self._fail_gate_12_commit(
+                        strict_env_ids[post_commit_g12_strict], timeout=False
+                    )
+                    strict_reentry_local &= ~post_commit_g12_strict
             reentry_local[strict_invalidation] = strict_reentry_local
         guided_failure_local = (
             self.guided_exit_active[active_ids]

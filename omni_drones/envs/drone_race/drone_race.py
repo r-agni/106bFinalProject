@@ -639,7 +639,9 @@ class DroneRaceEnv(IsaacEnv):
             self.num_envs, 13, device=self.device, dtype=torch.long
         )
         self.episode_start_gate = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.episode_reset_bucket = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.episode_reset_bucket = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.long
+        )
         self.reset_gate_pass_ema = torch.ones(self.num_course_gates, device=self.device)
         self.active_reset_curriculum_gate = -1
         # Furthest gate index reached this episode
@@ -2088,6 +2090,47 @@ class DroneRaceEnv(IsaacEnv):
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
 
+    def _set_drone_pose_for_reset(
+        self,
+        positions: torch.Tensor,
+        orientations: torch.Tensor,
+        env_ids: torch.Tensor,
+    ) -> None:
+        use_safe_play_reset = bool(self.cfg.get("play_safe_reset", False))
+        if use_safe_play_reset:
+            was_playing = False
+            if hasattr(self, "sim") and self.sim is not None:
+                try:
+                    was_playing = self.sim.is_playing()
+                except Exception:
+                    was_playing = False
+                if was_playing:
+                    self.sim.stop()
+            try:
+                XFormPrimView.set_world_poses(
+                    self.drone._view,
+                    positions=positions.reshape(-1, 3),
+                    orientations=orientations.reshape(-1, 4),
+                    indices=env_ids,
+                    usd=True,
+                )
+            finally:
+                if was_playing:
+                    self.sim.play()
+            return
+
+        use_usd_pose_reset = bool(self.cfg.get("play_force_usd_pose_reset", False))
+        if use_usd_pose_reset:
+            XFormPrimView.set_world_poses(
+                self.drone._view,
+                positions=positions.reshape(-1, 3),
+                orientations=orientations.reshape(-1, 4),
+                indices=env_ids,
+                usd=True,
+            )
+        else:
+            self.drone.set_world_poses(positions, orientations, env_ids)
+
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids)
 
@@ -2097,42 +2140,53 @@ class DroneRaceEnv(IsaacEnv):
         # to the earliest weak gate's lead-in and a small random-gate coverage bucket.
         start_gates = torch.zeros(n, device=self.device, dtype=torch.long)
         reset_bucket = torch.zeros(n, device=self.device, dtype=torch.long)
-        curriculum_active = (
-            self.reset_curriculum_enabled
-            and 0 <= self.active_reset_curriculum_gate < self.num_course_gates
-        )
-        if curriculum_active:
-            random_draw = torch.rand(n, device=self.device)
-            prev_bucket = (
-                (random_draw >= self.reset_curriculum_gate0_prob)
-                & (
+        forced_start_gate = self.cfg.get("play_start_gate", None)
+        if forced_start_gate is not None:
+            forced_start_gate = int(forced_start_gate)
+            if forced_start_gate < 0 or forced_start_gate >= self.num_course_gates:
+                raise ValueError(
+                    f"play_start_gate={forced_start_gate} is out of range for "
+                    f"{self.num_course_gates} course gates."
+                )
+            reset_bucket.fill_(-1)
+            start_gates.fill_(forced_start_gate)
+        else:
+            curriculum_active = (
+                self.reset_curriculum_enabled
+                and 0 <= self.active_reset_curriculum_gate < self.num_course_gates
+            )
+            if curriculum_active:
+                random_draw = torch.rand(n, device=self.device)
+                prev_bucket = (
+                    (random_draw >= self.reset_curriculum_gate0_prob)
+                    & (
+                        random_draw
+                        < self.reset_curriculum_gate0_prob + self.reset_curriculum_prev_gate_prob
+                    )
+                )
+                random_bucket = (
                     random_draw
-                    < self.reset_curriculum_gate0_prob + self.reset_curriculum_prev_gate_prob
+                    >= self.reset_curriculum_gate0_prob + self.reset_curriculum_prev_gate_prob
                 )
-            )
-            random_bucket = (
-                random_draw
-                >= self.reset_curriculum_gate0_prob + self.reset_curriculum_prev_gate_prob
-            )
-            prev_gate = (self.active_reset_curriculum_gate - 1) % self.num_course_gates
-            if (
-                self.reset_curriculum_excluded_start_gate is not None
-                and prev_gate == self.reset_curriculum_excluded_start_gate
-            ):
-                prev_gate = 0
-            start_gates[prev_bucket] = prev_gate
-            if random_bucket.any():
-                random_start_gate_count = self.num_course_gates
-                if self.reset_curriculum_excluded_start_gate == self.num_course_gates - 1:
-                    random_start_gate_count = max(self.num_course_gates - 1, 1)
-                start_gates[random_bucket] = torch.randint(
-                    0,
-                    random_start_gate_count,
-                    (int(random_bucket.sum().item()),),
-                    device=self.device,
-                )
-            reset_bucket[prev_bucket] = 1
-            reset_bucket[random_bucket] = 2
+                prev_gate = (self.active_reset_curriculum_gate - 1) % self.num_course_gates
+                if (
+                    self.reset_curriculum_excluded_start_gate is not None
+                    and prev_gate == self.reset_curriculum_excluded_start_gate
+                ):
+                    prev_gate = 0
+                start_gates[prev_bucket] = prev_gate
+                if random_bucket.any():
+                    random_start_gate_count = self.num_course_gates
+                    if self.reset_curriculum_excluded_start_gate == self.num_course_gates - 1:
+                        random_start_gate_count = max(self.num_course_gates - 1, 1)
+                    start_gates[random_bucket] = torch.randint(
+                        0,
+                        random_start_gate_count,
+                        (int(random_bucket.sum().item()),),
+                        device=self.device,
+                    )
+                reset_bucket[prev_bucket] = 1
+                reset_bucket[random_bucket] = 2
 
         explore_mask = torch.zeros(n, device=self.device, dtype=torch.bool)
         self.controller_gate_target_jitter[env_ids] = 0.0
@@ -2253,21 +2307,11 @@ class DroneRaceEnv(IsaacEnv):
 
                 drone_start_pos_with_agent = drone_start_pos.unsqueeze(1)             # (n, 1, 3)
                 env_positions_with_agent = self.envs_positions[env_ids].unsqueeze(1)  # (n, 1, 3)
-
-                use_usd_pose_reset = bool(self.cfg.get("play_force_usd_pose_reset", False))
-                if use_usd_pose_reset:
-                    XFormPrimView.set_world_poses(
-                        self.drone._view,
-                        positions=(drone_start_pos_with_agent + env_positions_with_agent).reshape(-1, 3),
-                        orientations=drone_rot.reshape(-1, 4),
-                        indices=env_ids,
-                        usd=True,
-                    )
-                else:
-                    self.drone.set_world_poses(
-                        drone_start_pos_with_agent + env_positions_with_agent,
-                        drone_rot, env_ids
-                    )
+                self._set_drone_pose_for_reset(
+                    drone_start_pos_with_agent + env_positions_with_agent,
+                    drone_rot,
+                    env_ids,
+                )
 
             # Store prev_drone_pos for path-projection reward
             self.prev_drone_pos[env_ids] = drone_start_pos

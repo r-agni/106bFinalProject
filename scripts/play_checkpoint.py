@@ -70,6 +70,7 @@ def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    cfg.play_safe_reset = bool(cfg.get("play_safe_reset", True))
 
     # Match train.py: merge cfg/algo/<ppo_cfg> when the task specifies it (e.g. DroneRace).
     ppo_cfg_name = cfg.task.get("ppo_cfg", None)

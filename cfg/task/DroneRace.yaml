@@ -210,7 +210,9 @@ gate_reentry_clearance_x: 0.05         # require a small forward commit before a
 gate_reentry_backtrack_x: -0.05        # backing back through the monitored gate opening beyond this plane triggers the penalty
 gate_12_commit_x: 0.30                 # gate-12 pass is provisional until all body probes are at least this far downstream of the gate plane
 gate_12_commit_timeout_substeps: 80    # terminate gate-12 skims that never fully commit downstream within ~0.16 s
-exit_anchor_target_gates: [4, 5]       # zero-based gates that get the generic short-lived downstream exit anchor reward
+reward_gate_12_commit_stall_scale: 2.0  # per-step penalty for low gate-frame forward velocity during commit window
+gate_12_commit_stall_vel_threshold: 0.5 # m/s in gate frame; below this counts as stalling during the commit window
+exit_anchor_target_gates: [4, 5, 11]   # zero-based gates that get the generic short-lived downstream exit anchor reward; 11 = human gate 12
 exit_anchor_distance: 1.5              # meters downstream of the crossed gate along the next-gate segment
 exit_anchor_radius: 0.6                # once the drone gets this close to the exit anchor, the local reward turns off
 exit_anchor_max_steps: 30              # keep the exit anchor alive for ~0.3 s after the monitored gate crossing

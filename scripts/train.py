@@ -1074,6 +1074,7 @@ def main(cfg):
                 rew_gate_reentry = _mean("reward_gate_reentry")
                 rew_exit_anchor  = _mean("reward_exit_anchor")
                 rew_guided_exit  = _mean("reward_guided_exit")
+                rew_gate_12_stall = _mean("reward_gate_12_stall_penalty")
                 curriculum_phase = _mean("curriculum_phase")
                 curriculum_accuracy = _mean("curriculum_accuracy_ema")
                 curriculum_furthest = _mean("curriculum_furthest_ema")
@@ -1240,6 +1241,8 @@ def main(cfg):
                 if rew_guided_exit is not None:
                     derived["guided_exit/reward_guided_exit"] = rew_guided_exit
                     derived["fixes/reward_guided_exit"] = rew_guided_exit
+                if rew_gate_12_stall is not None:
+                    derived["fixes/reward_gate_12_stall_penalty"] = rew_gate_12_stall
                 if furthest_gate is not None:
                     derived["race/furthest_gate_reached"] = furthest_gate
                     derived["race/furthest_gate_number"] = furthest_gate + 1.0
@@ -2073,10 +2076,9 @@ def main(cfg):
                     if v is not None:
                         derived[f"fixes/gate_{human_gate_label}_guided_exit_failures"] = v
                         derived[f"fixes/human_gate_{human_gate_label}_guided_exit_failures"] = v
-                    v = _mean(f"cheating_gate_{zero_based_gate_idx}")
-                    if v is not None:
-                        derived[f"fixes/gate_{human_gate_label}_cheating_events"] = v
-                        derived[f"fixes/human_gate_{human_gate_label}_cheating_events"] = v
+                    # cheating_gate_* is the old consecutive-repeat detection and is
+                    # no longer the right signal for gate 12; gate_reentry_gate_* is
+                    # already logged above as fixes/gate_12_reentry_events.
                 if gate_12_hard_reentry_failures is not None:
                     derived["guided_exit_human/gate_12_hard_reentry_failures"] = gate_12_hard_reentry_failures
                 if gate_12_commit_timeout_failures is not None:

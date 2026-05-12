@@ -14,7 +14,7 @@ This guide covers **training** a drone racing policy from scratch and **playing 
 ### Quick start
 
 ```bash
-cd c:/Users/agni_/Documents/106bFinalProject/scripts
+cd scripts
 python train.py task=DroneRace wandb.mode=disabled
 ```
 
@@ -44,7 +44,7 @@ WANDB_PROJECT=droneRacing
 Then train:
 
 ```bash
-cd c:/Users/agni_/Documents/106bFinalProject/scripts
+cd scripts
 python train.py task=DroneRace
 ```
 
@@ -62,9 +62,9 @@ If `reward/gates_cumul` is still 0 at 5 M frames, something is wrong with gate d
 ### Resume a stopped run
 
 ```bash
-cd c:/Users/agni_/Documents/106bFinalProject/scripts
+cd scripts
 python train.py task=DroneRace \
-  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/wandb/run-<id>/files/checkpoint_<frames>.pt
+  algo.checkpoint_path=wandb/run-<id>/files/checkpoint_<frames>.pt
 ```
 
 ### Faster experiment (reduced environments, fewer frames)
@@ -72,7 +72,7 @@ python train.py task=DroneRace \
 For a quick sanity check that training is working (not expected to produce a racing policy):
 
 ```bash
-cd c:/Users/agni_/Documents/106bFinalProject/scripts
+cd scripts
 python train.py task=DroneRace \
   task.env.num_envs=100 \
   total_frames=50_000_000 \
@@ -101,8 +101,8 @@ With **Isaac Sim 6.x installed via pip** into **Anaconda**, the Python package a
 
 | What | Path on this PC |
 |------|-----------------|
-| **`isaacsim` Python package** | `C:\Users\agni_\anaconda3\Lib\site-packages\isaacsim` |
-| **Kit / binaries / exts** (typical) | `C:\Users\agni_\anaconda3\Lib\site-packages\isaacsim\kit` |
+| **`isaacsim` Python package** | `<conda-env>\Lib\site-packages\isaacsim` |
+| **Kit / binaries / exts** (typical) | `<conda-env>\Lib\site-packages\isaacsim\kit` |
 
 To **print the folder for whatever `python` you use**:
 
@@ -125,7 +125,7 @@ If you use another conda env or venv, run those commands **after** `conda activa
 From the **repository root** (folder that contains `setup.py` and `omni_drones/`):
 
 ```bash
-cd c:/Users/agni_/Documents/106bFinalProject
+cd <repo root>
 pip install -e .
 ```
 
@@ -166,9 +166,9 @@ A well-trained checkpoint requires at least **~300 M frames** of `DroneRace` tra
 `play.py` loads the same **task-specific PPO config** as `train.py`: if [`cfg/task/DroneRace.yaml`](cfg/task/DroneRace.yaml) sets `ppo_cfg: DroneRace.yaml`, [`cfg/algo/DroneRace.yaml`](cfg/algo/DroneRace.yaml) is merged into `cfg.algo` **before** the policy is built (network width, `train_every`, etc.), so checkpoints trained with DroneRace match the loaded policy.
 
 ```bash
-cd c:/Users/agni_/Documents/106bFinalProject/scripts
+cd scripts
 python play.py task=DroneRace headless=false task.env.num_envs=1 \
-  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/wandb/run-<id>/files/checkpoint_final.pt \
+  algo.checkpoint_path=wandb/run-<id>/files/checkpoint_final.pt \
   wandb.mode=disabled
 ```
 
@@ -183,12 +183,12 @@ python play.py task=DroneRace headless=false task.env.num_envs=1 \
 Recording needs a **viewport** and **Omniverse Replicator** RGB. With **`record_video=true`**, `play.py` forces **`headless=false`**.
 
 ```bash
-cd c:/Users/agni_/Documents/106bFinalProject/scripts
+cd scripts
 python play.py task=DroneRace record_video=true task.env.num_envs=1 \
   record_video_max_steps=3000 video_frame_interval=2 \
-  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/wandb/run-<id>/files/checkpoint_final.pt \
+  algo.checkpoint_path=wandb/run-<id>/files/checkpoint_final.pt \
   wandb.mode=disabled \
-  video_path=c:/Users/agni_/Documents/106bFinalProject/race_playback.mp4
+  video_path=race_playback.mp4
 ```
 
 `record_video_max_steps=3000` captures about 30 seconds at 100 Hz — enough to show several gate crossings and at least one full lap from a well-trained policy.
@@ -209,12 +209,12 @@ python play.py task=DroneRace record_video=true task.env.num_envs=1 \
 If you copied the final weights to the repo root as `files_checkpoint_final.pt`:
 
 ```bash
-cd c:/Users/agni_/Documents/106bFinalProject/scripts
+cd scripts
 python play.py task=DroneRace task.env.num_envs=1 total_frames=2048 ^
   record_video=true record_video_max_steps=800 video_frame_interval=2 ^
-  algo.checkpoint_path=c:/Users/agni_/Documents/106bFinalProject/files_checkpoint_final.pt ^
+  algo.checkpoint_path=files_checkpoint_final.pt ^
   wandb.mode=disabled ^
-  video_path=c:/Users/agni_/Documents/106bFinalProject/drone_race_playback.mp4
+  video_path=drone_race_playback.mp4
 ```
 
 (Bash: replace `^` with `\` at end of lines.) Ensure the `.pt` file exists at that path. Use a **finite** `total_frames` for a bounded first run; increase `record_video_max_steps` if you need a longer clip. Tune `viewer.eye` / `viewer.lookat` if the default camera does not frame the whole track.

@@ -2,6 +2,11 @@
 
 This guide covers **training** a drone racing policy from scratch and **playing back** a trained checkpoint, on a Windows machine with a local NVIDIA GPU.
 
+## Demo
+
+- [EE106B Final Drone Video — Following v0](https://www.youtube.com/watch?v=9IYmnmxADD8)
+- [Drone Race Final v1](https://www.youtube.com/watch?v=n71n0GXzz90) · [Gates 0-7](https://www.youtube.com/watch?v=GFoEPthydjU)
+
 ---
 
 ## Training the Drone Racing Policy

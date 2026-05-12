@@ -103,8 +103,9 @@ class IsaacEnv(EnvBase):
         print(f"dt: {self.cfg.sim.dt}")
         print("--------------------------------")
         
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+        deterministic = bool(self.cfg.get("deterministic", False))
+        torch.backends.cudnn.benchmark = not deterministic
+        torch.backends.cudnn.deterministic = deterministic
 
         # check that simulation is running
         if stage_utils.get_current_stage() is None:
@@ -285,6 +286,7 @@ class IsaacEnv(EnvBase):
         for substep in range(self.substeps):
             self._pre_sim_step(tensordict)
             self.sim.step(self._should_render(substep))
+            self._post_sim_substep(tensordict, substep)
 
         self._post_sim_step(tensordict)
         self.progress_buf += 1
@@ -298,6 +300,9 @@ class IsaacEnv(EnvBase):
         pass
 
     def _post_sim_step(self, tensordict: TensorDictBase):
+        pass
+
+    def _post_sim_substep(self, tensordict: TensorDictBase, substep: int):
         pass
 
     @abc.abstractmethod
@@ -324,7 +329,10 @@ class IsaacEnv(EnvBase):
         carb_settings_iface = carb.settings.get_settings()
         # enable hydra scene-graph instancing
         # note: this allows rendering of instanceable assets on the GUI
-        carb_settings_iface.set_bool("/persistent/omnihydra/useSceneGraphInstancing", True)
+        carb_settings_iface.set_bool(
+            "/persistent/omnihydra/useSceneGraphInstancing",
+            bool(self.cfg.get("use_scene_graph_instancing", True)),
+        )
         # change dispatcher to use the default dispatcher in PhysX SDK instead of carb tasking
         # note: dispatcher handles how threads are launched for multi-threaded physics
         carb_settings_iface.set_bool("/physics/physxDispatcher", True)

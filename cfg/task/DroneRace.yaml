@@ -29,12 +29,14 @@ drone_model:
   controller: RateController
 
 total_frames: 800_000_000
-save_interval: 100 
+save_interval: 10  # keep resumes from going too long between checkpoints
 # seed: 0
 
 # Track configuration: config-based track with custom gate positions and orientations
 # Gate's local x axis is perpendicular to surface. Center is on the bottom middle. 
-# IMPORTANT: The last gate should be the exact same pos and yaw as the first gate. 
+# IMPORTANT: Gate 13 should be the exact same pos and yaw as gate 1.
+# It is the finish line, and a full lap is only completed after the drone
+# legally crosses this final gate.
 
 # Circular track (disabled — using Race track below)
 # track_config:
@@ -78,66 +80,65 @@ save_interval: 100
 #     pos: [0.0, 0.0, 1.0]
 #     yaw: 1.57
 
-# Race track — 13 gates (original EECS106B positions).
-# Gate 13 = Gate 1 (lap closure). Elevated gates at 7 and 11 (z=3.0).
-# Sharp turns at gates 5→6 and 7→8 (180° reversal).
+# Race track — 13 YAML gate entries (original EECS106B positions).
+# Race track
 track_config:
   "1":
-    pos: [14.0, 34.0, 1.0]
-    yaw: 0.0
-
-  "2":
-    pos: [20.0, 30.0, 1.0]
-    yaw: -0.78
-
-  "3":
-    pos: [21.0, 22.0, 1.0]
-    yaw: -1.049
-
-  "4":
-    pos: [24.0, 12.0, 1.0]
-    yaw: -1.57
-
-  "5":
-    pos: [19.0, 6.0, 1.0]
-    yaw: 2.97
-
-  "6":
-    pos: [14.0, 14.0, 1.0]
+    pos: [12.5, 2.0, 1.0]
     yaw: 3.14
 
+  "2":
+    pos: [6.5, 6.0, 1.0]
+    yaw: 2.36
+
+  "3":
+    pos: [5.5, 14.0, 1.0]
+    yaw: 2.093
+
+  "4":
+    pos: [2.5, 24.0, 1.0]
+    yaw: 1.57
+
+  "5":
+    pos: [7.5, 30.0, 1.0]
+    yaw: 6.11
+
+  "6":
+    pos: [12.2, 22.0, 1.0]
+    yaw: 6.28
+
   "7":
-    pos: [9.0, 6.0, 3.0]     # elevated gate — climb here
-    yaw: 4.54
+    pos: [17.5, 30.0, 3.0]
+    yaw: 7.68
 
   "8":
-    pos: [9.0, 6.0, 1.0]     # same XY as gate 7, drop back to z=1; 180° reversal
-    yaw: 1.40
+    pos: [17.5, 30.0, 1.0]
+    yaw: 4.54
 
   "9":
-    pos: [8.0, 14.0, 1.0]
-    yaw: 1.74
+    pos: [18.0, 22.0, 1.0]
+    yaw: 4.88
 
   "10":
-    pos: [6.0, 22.0, 1.0]
-    yaw: 1.40
+    pos: [20.5, 14.0, 1.0]
+    yaw: 4.54
 
   "11":
-    pos: [8.0, 30.0, 3.0]    # elevated gate — climb here
-    yaw: 0.78
+    pos: [18.5, 6.0, 3.0]
+    yaw: 3.92
 
   "12":
-    pos: [8.0, 30.0, 1.0]    # same XY as gate 11, drop back to z=1; yaw reversed 180° so crossing detection works
-    yaw: 3.921               # = 0.78 + pi; must face OPPOSITE to gate 11 (same as gate 7/8 design)
+    pos: [18.5, 6.0, 1.0]
+    yaw: 3.92
 
   "13":
-    pos: [14.0, 34.0, 1.0]   # lap closure = gate 1
-    yaw: 0.0
+    pos: [12.5, 2.0, 1.0]
+    yaw: 3.14
     
 # Gate settings
 gate_scale: 1.0
-gate_height: 1.5   # original gate design — do not change
-gate_width: 1.5    # original gate design — do not change 
+gate_height: 2.5
+gate_width: 2.5
 
 # ---- Reward hyperparameters (tuned for the 13-gate race track) ----
 # Phase 0: learn the ordered lap with gate / sequence rewards plus light guidance.
@@ -155,13 +156,19 @@ reward_stacked_clear_bonus: 30.0    # extra sparse bonus for actually clearing t
 # Sparse bonuses for correct ordered course completion.
 reward_gate_passage: 60.0         # per-gate reward; crossing gates should dominate phase-0 learning
 reward_gate_sequence_scale: 20.0  # stronger bonus for longer ordered gate streaks within the episode
-reward_lap_completion: 500.0      # make finishing the full course the primary objective
-reward_lap_speed_bonus: 300.0     # extra bonus scaled by episode time remaining; enabled only after unlock
+reward_lap_completion: 530.0      # safely restore the old accidental lap-closure bonus without corrupting gate-11 bookkeeping
+reward_lap_speed_bonus: 600.0     # larger sparse incentive for completing fast clean laps once the course is learned
 
 # Auxiliary penalties for local mistakes.
 reward_altitude_scale: 0.5        # bounded penalty for altitude mismatch at elevated gates 7 and 11
 reward_approach_scale: 0.5        # penalty for moving away from the gate when already within 6m
 reward_gate_centering_scale: 0.03 # bounded per-step penalty for missing the gate centerline near any gate
+reward_gate_reentry_scale: 35.0   # one-shot penalty when the drone backs back into the same monitored gate opening after crossing
+reward_gate_12_hard_reentry_scale: 360.0 # gate-12-specific hard-fail penalty; must overpower the provisional gate-pass reward if the drone skims back out
+reward_exit_anchor_scale: 6.0     # local post-gate reward that nudges the drone onto the next segment after monitored gates
+reward_guided_exit_curve_scale: 1.0 # gate-specific local progress reward multiplier for the custom curved exit guide on the lower final stacked gate
+reward_guided_exit_straight_scale: 1.5 # bonus for aligning the guided exit velocity with the next-gate direction after the curve
+reward_guided_exit_backtrack_scale: 18.0 # extra penalty if the guided lower stacked gate exit curls back toward the same opening
 
 # Penalties and crash termination thresholds.
 reward_angular_penalty: 0.1       # penalize squared angular rates
@@ -171,26 +178,121 @@ crash_dist_threshold: 25.0        # terminate if the drone diverges too far from
 crash_z_min: 0.15                 # terminate if the drone drops below this altitude
 
 # Accuracy-first curriculum.
-phase_speed_unlock_on_first_success: true # enable dense speed shaping after the first successful full lap
+phase_speed_unlock_on_first_success: false # keep speed shaping off until lap completion is reliable, not just lucky once
 phase_speed_unlock_accuracy_rate: 0.40 # fallback EMA-based unlock when first-success unlock is disabled
+phase1_unlock_gate_index: 5            # zero-based gate bottleneck that must be solved before speed shaping unlocks
+phase1_unlock_gate_pass_rate: 0.70     # require reliable gate-5 passage from gate-0 starts before phase 1
 phase2_speed_focus_accuracy_rate: 0.40 # once full laps are reliable, switch to a speed-focused phase with shaping removed
 curriculum_min_phase_frames: 2_000_000 # minimum frames before the speed phase can unlock
 curriculum_ema_alpha: 0.01             # EMA smoothing for curriculum metrics
 reset_curriculum_enabled: true         # allocate some resets to the earliest unsolved gate bottleneck once gate-0-start passage drops below threshold
 reset_curriculum_gate_pass_threshold: 0.90 # activate practice resets when the earliest gate-0-start passage EMA falls below this
-reset_curriculum_gate0_prob: 0.70      # majority of episodes still start from gate 0
-reset_curriculum_prev_gate_prob: 0.20  # focused practice starts from the gate immediately before the active weak gate
+reset_curriculum_gate0_prob: 0.70      # bias the speed run toward true gate-0 full laps once the course is learned
+reset_curriculum_prev_gate_prob: 0.20  # keep some bottleneck practice, but do not let it dominate the speed-focused stage
 reset_curriculum_random_gate_prob: 0.10 # small amount of broad coverage from uniformly random real course gates
 reset_curriculum_metric_alpha: 0.01    # EMA smoothing for gate-0-start per-gate passage reliability
+hard_turn_target_gates: []             # no gate-specific hard-turn shaping in the original-track scratch baseline
+wrong_side_penalty_target_gates: []    # disable previous-track wrong-side targeting for the original-track scratch baseline
+reward_hard_turn_direction_scale: 0.0  # disable gate-5/6-specific corridor shaping for the original-track scratch baseline
+reward_hard_turn_clear_bonus: 0.0      # disable gate-5/6-specific sparse bonus for the original-track scratch baseline
+hard_turn_corridor_x_min: -10.0        # start guiding the drone earlier on the gate-5 approach
+hard_turn_corridor_x_max: 4.0
+hard_turn_corridor_halfwidth: 4.5      # allow a wide turning arc before centering penalties fully apply
+hard_turn_corridor_height: 3.0
+reward_hard_turn_wrong_side_scale: 0.0 # disable previous-track wrong-side shaping for the original-track scratch baseline
+hard_turn_wrong_side_x_min: 0.25       # ignore tiny post-plane jitter; focus on real backside approaches
+hard_turn_wrong_side_x_max: 3.0        # only punish the local gate neighborhood, not the far downstream path
+wrong_side_violation_ends_episode: false # keep wrong-side termination off until this track's bottlenecks are re-measured
+hard_turn_penalty_scale: 1.0           # restore default near-gate penalties for the original-track scratch baseline
+gate_reentry_target_gates: [4, 5, 11] # zero-based gates G5, G6, G12; monitor these for post-cross backing through the same opening
+gate_reentry_monitor_substeps: 200     # keep watching the crossed gate for ~0.4 s after scoring it
+gate_reentry_clearance_x: 0.05         # require a small forward commit before a later negative-x sample counts as a re-entry
+gate_reentry_backtrack_x: -0.05        # backing back through the monitored gate opening beyond this plane triggers the penalty
+gate_12_commit_x: 0.30                 # gate-12 pass is provisional until all body probes are at least this far downstream of the gate plane
+gate_12_commit_timeout_substeps: 80    # terminate gate-12 skims that never fully commit downstream within ~0.16 s
+reward_gate_12_commit_stall_scale: 2.0  # per-step penalty for low gate-frame forward velocity during commit window
+gate_12_commit_stall_vel_threshold: 0.5 # m/s in gate frame; below this counts as stalling during the commit window
+exit_anchor_target_gates: [4, 5, 11]   # zero-based gates that get the generic short-lived downstream exit anchor reward; 11 = human gate 12
+exit_anchor_distance: 1.5              # meters downstream of the crossed gate along the next-gate segment
+exit_anchor_radius: 0.6                # once the drone gets this close to the exit anchor, the local reward turns off
+exit_anchor_max_steps: 30              # keep the exit anchor alive for ~0.3 s after the monitored gate crossing
+guided_exit_paths:
+  "11":
+    points_local:
+      - [1.25, -1.55, 0.00]
+      - [2.80, -1.00, 0.00]
+    point_radius: 0.35
+    max_steps: 55
+    reward_scale: 8.0
 sparse_only_gate_indices: [6, 7, 10, 11] # zero-based target gates in the stacked sections; dense shaping is disabled here
 sparse_disable_smoothness_penalties: true # allow harsher maneuvers inside sparse-only stacked-gate sections
-reward_speed_scale_phase2: 0.75        # stronger dense speed reward once reliable full laps are achieved
-reward_speed_target_ms_phase2: 8.0     # higher speed target for the final speed-focused phase
-phase2_disable_dense_shaping: true     # turn off dense shaping / penalty helpers in the final speed phase
+reward_speed_scale_phase2: 1.10        # stronger dense speed reward once reliable full laps are achieved
+reward_speed_target_ms_phase2: 10.0    # higher speed target for the final speed-focused phase
+phase2_disable_dense_shaping: false    # keep dense shaping on during the speed run so the policy gets cleaner lap-time gradients
+phase2_disable_wrong_side_penalty: false # keep the wrong-side gate-entry penalty on during the final speed phase
 stacked_reversal_entry_gates: [6, 10]     # elevated stacked gates that transition into the hard lower reversal gates
 stacked_reversal_target_gates: [7, 11]    # lower stacked gates that need extra local credit assignment
 stacked_reversal_dist_threshold: 35.0     # allow wider divergence while recovering through the stacked reversal
 stacked_reversal_grace_steps: 220         # suppress distance-crash briefly after entering the stacked reversal window
+
+# Constrained speed-mode controller.
+controller_completion_target: 0.78
+controller_completion_floor: 0.70
+controller_completion_recover: 0.60
+controller_hard_gate_target: 0.82
+controller_final_gate_target: 0.78
+controller_crash_target: 0.40
+controller_crash_recover: 0.60
+controller_speed_up_step: 0.015
+controller_speed_down_step: 0.08
+controller_speed_panic_step: 0.20
+controller_plateau_windows: 8
+controller_plateau_improvement_eps: 0.01
+controller_success_min_for_t20: 32
+controller_explore_episode_rate_max: 0.5
+controller_easy_gate_jitter_lo: -0.05
+controller_easy_gate_jitter_hi: 0.15
+controller_hard_gate_indices: [6, 7, 10, 11]
+controller_final_gate_indices: [10, 11]
+controller_metric_alpha: 0.08              # speed-controller EMA/window smoothing; much faster than the curriculum EMA
+controller_metric_window: 8                # number of recent controller windows used for speed decisions
+controller_stabilize_completion_target: 0.75 # unlock speed mode earlier once gate-0 full-lap completion is solid
+controller_stabilize_hard_gate_target: 0.75  # allow hard-gate stability to trigger speed mode sooner
+controller_stabilize_final_gate_target: 0.75 # allow late-gate stability to trigger speed mode sooner
+controller_stabilize_crash_target: 0.20      # phase-1 unlock requires low crash rate, not just high completion
+controller_phase2_completion_target: 0.84    # once unlocked, keep pushing speed as long as completion stays comfortably high
+controller_phase2_hard_gate_target: 0.86     # preserve stacked-gate quality while minimizing lap time
+controller_phase2_final_gate_target: 0.84    # preserve late-gate quality while minimizing lap time
+controller_phase2_completion_floor: 0.73     # tolerate a small completion dip before panicking during the speed push
+controller_phase2_final_gate_floor: 0.78     # late gates are the first collapse signal during high-speed training
+controller_phase2_crash_target: 0.18         # acceptable crash rate while aggressively searching for faster lines
+controller_phase2_crash_recover: 0.28        # panic threshold for high-speed collapse recovery
+controller_phase1_initial_speed_pressure: 0.10 # mild speed pressure as soon as the course is learned
+controller_phase2_initial_speed_pressure: 0.55 # start phase 2 closer to an actually fast regime instead of rebuilding pressure slowly
+controller_phase2_speed_up_step: 0.045         # accelerate speed pressure more aggressively in lap-time mode
+controller_phase2_speed_down_step: 0.045       # soften the rollback so the controller keeps searching for faster lines
+controller_phase2_panic_step: 0.18             # hard rollback when high-speed behavior destabilizes
+controller_phase2_plateau_start_pressure: 0.45 # only start structured line-search once speed pressure is meaningfully high
+controller_completion_drop_recover: 0.10       # detect real performance collapses quickly from recent history
+controller_min_phase_frames: 0                 # no extra dwell once the 90%+ stability window is satisfied; unlock speed mode quickly on strong resumes
+controller_phase3_lock_speed_pressure: 0.95    # only enter final lock-in after the fast regime has already been explored
+controller_phase3_lock_plateau_windows: 12     # require a short but real phase-2 search window before cooling down
+controller_phase3_lock_completion_target: 0.80 # acceptable completion floor for locking in a fast final policy
+controller_phase3_lock_final_gate_target: 0.78 # keep late-gate quality healthy before disabling further search
+controller_phase3_lock_crash_target: 0.22      # only lock in when aggressive search is still reasonably controlled
+controller_phase3_fallback_patience_windows: 3 # require several consecutive bad windows before reopening search from the lock-in phase
+controller_phase3_sticky_after_first_lock: true # once phase 3 has been reached, never fall all the way back to phase 1
+controller_phase3_completion_floor: 0.74       # if convergence cool-down hurts completion too much, reopen mild search
+controller_phase3_final_gate_floor: 0.72       # late-gate failures are the first sign that lock-in was premature
+controller_phase3_crash_recover: 0.30          # excessive crashes during lock-in should send training back to mild search
+controller_phase3_completion_drop_recover: 0.12 # catch abrupt performance drops while cooling entropy
+speed_budget_a_lat_conservative: 4.5
+speed_budget_a_lat_aggressive: 9.5
+speed_budget_vertical_discount: 0.90
+speed_budget_entry_discount: 0.92
+speed_budget_target_discount: 0.90
+speed_budget_v_min: 3.5
+speed_budget_v_max: 13.0
 
 # Safety / penalty schedule.
 angular_penalty_decay_frames: 100_000_000 # keep angular damping active through the early learning stages

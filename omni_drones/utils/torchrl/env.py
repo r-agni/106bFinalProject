@@ -85,9 +85,11 @@ class AgentSpec:
 
 class RenderCallback:
 
-    def __init__(self, interval: int=2):
+    def __init__(self, interval: int = 2, writer=None):
         self.interval = interval
-        self.frames = []
+        self.writer = writer
+        self.frames = [] if writer is None else None
+        self.captured_frames = 0
         self.i = 0
         self.t = tqdm(desc="Rendering")
         self._viewport_warning_shown = False
@@ -125,7 +127,11 @@ class RenderCallback:
             else:
                 try:
                     frame = env.render(mode="rgb_array")
-                    self.frames.append(frame)
+                    if self.writer is None:
+                        self.frames.append(frame)
+                    else:
+                        self.writer.append_data(frame)
+                    self.captured_frames += 1
                     self.t.update(self.interval)
                 except RuntimeError as e:
                     error_msg = str(e)
@@ -141,8 +147,13 @@ class RenderCallback:
         self.i += 1
         return self.i
 
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
     def get_video_array(self, axes: str = "t c h w"):
-        if len(self.frames) == 0:
+        if self.frames is None or len(self.frames) == 0:
             return None
         return einops.rearrange(np.stack(self.frames), "t h w c -> " + axes)
 
@@ -170,4 +181,3 @@ class EpisodeStats:
 
     def __len__(self):
         return len(self._stats)
-

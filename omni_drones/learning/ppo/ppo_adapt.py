@@ -256,8 +256,12 @@ class PPOAdaptivePolicy(TensorDictModuleBase):
             self._get_context(next_tensordict)
             next_values = self.critic(next_tensordict)["state_value"]
         rewards = tensordict[("next", "agents", "reward")]
+        terminal_done = (
+            tensordict[("next", "done")]
+            & ~tensordict[("next", "truncated")]
+        )
         dones = (
-            tensordict[("next", "terminated")]
+            terminal_done
             .expand(-1, -1, self.n_agents)
             .unsqueeze(-1)
         )

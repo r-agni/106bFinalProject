@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -128,6 +128,42 @@ def _resolve_scheduler(name: str):
     if hasattr(lr_scheduler, name):
         return getattr(lr_scheduler, name)
     raise ValueError(f"Unknown lr scheduler: {name}")
+
+
+def _adapt_checkpoint_state_dict(
+    current_state_dict: dict,
+    loaded_state_dict: dict,
+):
+    adapted_state_dict = {}
+    for key, loaded_value in loaded_state_dict.items():
+        current_value = current_state_dict.get(key)
+        if not isinstance(loaded_value, torch.Tensor) or current_value is None:
+            adapted_state_dict[key] = loaded_value
+            continue
+        if loaded_value.shape == current_value.shape:
+            adapted_state_dict[key] = loaded_value.to(
+                device=current_value.device,
+                dtype=current_value.dtype,
+            )
+            continue
+        if (
+            loaded_value.ndim == 2
+            and current_value.ndim == 2
+            and loaded_value.shape[0] == current_value.shape[0]
+        ):
+            adapted_tensor = current_value.detach().clone()
+            adapted_tensor.zero_()
+            cols_to_copy = min(loaded_value.shape[1], current_value.shape[1])
+            adapted_tensor[:, :cols_to_copy] = loaded_value[
+                :, :cols_to_copy
+            ].to(device=current_value.device, dtype=current_value.dtype)
+            adapted_state_dict[key] = adapted_tensor
+            continue
+        adapted_state_dict[key] = loaded_value.to(
+            device=current_value.device,
+            dtype=current_value.dtype,
+        )
+    return adapted_state_dict
 
 
 class Actor(nn.Module):
@@ -304,8 +340,26 @@ class PPOPolicy(TensorDictModuleBase):
         self.critic(fake_input)
 
         if self.cfg.checkpoint_path is not None:
-            state_dict = torch.load(self.cfg.checkpoint_path)
-            self.load_state_dict(state_dict, strict=False)
+            state_dict = torch.load(self.cfg.checkpoint_path, map_location=self.device)
+            state_dict = _adapt_checkpoint_state_dict(self.state_dict(), state_dict)
+            incompatible = self.load_state_dict(state_dict, strict=False)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                logging.warning(
+                    "Checkpoint %s loaded with %d missing keys and %d unexpected keys.",
+                    self.cfg.checkpoint_path,
+                    len(incompatible.missing_keys),
+                    len(incompatible.unexpected_keys),
+                )
+                if incompatible.missing_keys:
+                    logging.warning(
+                        "Missing keys (first 20): %s",
+                        incompatible.missing_keys[:20],
+                    )
+                if incompatible.unexpected_keys:
+                    logging.warning(
+                        "Unexpected keys (first 20): %s",
+                        incompatible.unexpected_keys[:20],
+                    )
         else:
             print(f"\n\n--------------------")
             print("No model loaded, using an random initial policy")
@@ -354,8 +408,12 @@ class PPOPolicy(TensorDictModuleBase):
         with torch.no_grad():
             next_values = self.critic(next_tensordict)["state_value"]
         rewards = tensordict[("next", "agents", "reward")]
+        terminal_done = (
+            tensordict[("next", "done")]
+            & ~tensordict[("next", "truncated")]
+        )
         dones = einops.repeat(
-            tensordict[("next", "terminated")],
+            terminal_done,
             "t e 1 -> t e a 1",
             a=self.n_agents
         )
